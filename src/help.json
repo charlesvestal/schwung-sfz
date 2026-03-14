@@ -34,6 +34,10 @@
             "sfzinstruments.",
             "  github.io",
             "",
+            "drolez.com/blog/",
+            "  music/ has free",
+            "  synth sample packs",
+            "",
             "Each instrument is a",
             "folder containing",
             ".sfz file(s) and",
@@ -43,20 +47,18 @@
         {
           "title": "Browsing",
           "lines": [
-            "In standalone mode:",
-            " Jog: scroll presets",
-            " L/R: prev/next",
-            " Shift+L/R: switch",
-            "  instrument folder",
+            "Jog wheel scrolls",
+            "through instrument",
+            "folders (presets).",
             "",
-            "In Signal Chain:",
-            " Use the menu to",
-            " browse instruments",
-            " and presets.",
+            "If an instrument has",
+            "multiple .sfz files,",
+            "use the menu to pick",
+            "a variant.",
             "",
-            "Each folder can have",
-            "multiple .sfz files",
-            "shown as presets."
+            "Last-used variant is",
+            "remembered per",
+            "instrument."
           ]
         },
         {
@@ -118,9 +120,8 @@
             "sustain pedal, etc.",
             "",
             "Program Change:",
-            " Switches preset",
-            " (.sfz file) within",
-            " current instrument"
+            " Switches instrument",
+            " folder"
           ]
         }
       ]

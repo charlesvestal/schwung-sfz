@@ -14,8 +14,9 @@ New `move-anything-sfz` module providing SFZ format sample playback using the [s
 
 - `instruments/` directory on device
 - Each subfolder = one instrument (folder name = display name)
-- Multiple `.sfz` files within a folder = presets
-- Shift+L/R switches instruments, preset nav switches .sfz files within
+- Multiple `.sfz` files within a folder = variants (selected from menu)
+- Jog wheel browses instrument folders, menu selects variant
+- Last-used variant remembered per instrument
 
 ## File Structure
 
@@ -41,16 +42,21 @@ move-anything-sfz/
 
 | Parameter | R/W | Description |
 |---|---|---|
-| instrument_index | RW | Current instrument folder index |
-| instrument_count | R | Number of instrument folders |
-| instrument_name | R | Current folder name |
+| preset / instrument_index | RW | Current instrument folder index (preset browser) |
+| preset_count / instrument_count | R | Number of instrument folders |
+| preset_name / instrument_name | R | Current folder name |
 | instrument_list | R | JSON array of folder names |
-| preset | RW | Current .sfz index within instrument |
-| preset_count | R | Number of .sfz files in instrument |
-| preset_name | R | Current .sfz filename (sans ext) |
+| variant | RW | Current .sfz index within instrument |
+| variant_count | R | Number of .sfz files in instrument |
+| variant_name | R | Current .sfz filename (sans ext) |
+| variant_list | R | JSON array of variant names |
 | gain | RW | Output level 0.0-2.0 |
 | octave_transpose | RW | -4 to +4 |
 | state | RW | Full JSON state for save/restore |
+
+## Sample Path Resolution
+
+When loading `.sfz` files from a subdirectory (e.g. `presets/`), sample paths are first resolved relative to the `.sfz` file directory. If no samples are found, the loader retries with the instrument root folder as the base path. This handles packs like drolez/SHLD that put `.sfz` files in `presets/` but samples in `Samples/` at the root.
 
 ## Build
 

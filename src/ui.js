@@ -2,16 +2,16 @@
  * SFZ Player Module UI
  *
  * Uses shared sound generator UI base.
- * Bank switching (Shift+L/R) handled by base using 'instrument_index' param.
+ * Preset browser (jog wheel) navigates instrument folders.
+ * Variants (.sfz files within a folder) selected from menu.
  */
 
 /* Shared utilities - absolute path for module location independence */
 import { createSoundGeneratorUI } from '/data/UserData/move-anything/shared/sound_generator_ui.mjs';
 
-/* Create the UI - SFZ uses 'instrument_index' for bank switching */
+/* Create the UI - no bank switching, preset browser handles instrument folders */
 const ui = createSoundGeneratorUI({
     moduleName: 'SFZ',
-    bankParamName: 'instrument_index',
     showPolyphony: true,
     showOctave: true,
 });

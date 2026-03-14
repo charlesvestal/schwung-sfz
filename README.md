@@ -5,13 +5,15 @@ Polyphonic SFZ and DecentSampler instrument player for Move Everything using [sf
 ## Features
 
 - Load SFZ (.sfz) and DecentSampler (.dspreset) instruments
-- Multiple instruments with preset browsing
+- Browse instrument folders with jog wheel
+- Multiple .sfz files per folder shown as variants (selectable from menu)
 - Velocity layers, round robin, key switching
 - Octave transpose (-4 to +4)
 - Gain control
 - Full polyphony with voice stealing
 - Pitch bend, aftertouch, CC support
 - Signal Chain compatible
+- Debounced browsing for smooth jog wheel navigation
 
 ## Prerequisites
 
@@ -56,23 +58,25 @@ instruments/
       C3.wav
       D3.wav
       ...
-  AnotherInstrument/
-    Programs/          ← nested structures supported
-      preset1.sfz
-      preset2.sfz
+  MiniFreak/
+    presets/             ← .sfz files can be in subdirectories
+      VerdantMeadows.sfz
+      SereneLake.sfz
     Samples/
-      ...
+      Recorded/
+        ...
 ```
 
-The scanner automatically finds `.sfz` files in subdirectories like `Programs/`, so instruments from sfzinstruments.github.io work as-is without restructuring.
+The scanner automatically finds `.sfz` files in subdirectories like `presets/` or `Programs/`, so instruments from sfzinstruments.github.io and drolez.com work as-is without restructuring.
+
+If sample paths don't resolve from the `.sfz` file's directory, the player automatically retries from the instrument root folder.
 
 ## Controls
 
 | Control | Action |
 |---------|--------|
-| **Jog wheel** | Browse presets within instrument |
-| **Left/Right** | Previous/next preset |
-| **Shift + Left/Right** | Switch instrument folder |
+| **Jog wheel** | Browse instrument folders |
+| **Menu** | Choose variant (.sfz file) within instrument |
 | **Knob 1** | Octave transpose (-4 to +4) |
 | **Knob 2** | Gain (0.0 to 2.0) |
 | **Pads** | Play notes (velocity sensitive) |
@@ -82,6 +86,7 @@ The scanner automatically finds `.sfz` files in subdirectories like `Programs/`,
 Free SFZ instruments are available from:
 - https://sfzinstruments.github.io/ — curated collection of free SFZ instruments
 - https://github.com/sfzinstruments — GitHub repositories with samples included
+- https://drolez.com/blog/music/ableton-free-sound-packs.php — free synth sample packs (MiniFreak, Pro-1, etc.) with SFZ presets
 
 **Included categories:** Pianos, bass, guitars, drums/percussion, strings, brass/winds, synths/organs, folk/world instruments, melodic percussion.
 

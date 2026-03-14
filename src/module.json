@@ -2,7 +2,7 @@
   "id": "sfz",
   "name": "SFZ Player",
   "abbrev": "SZ",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "SFZ and DecentSampler (.dspreset) player using sfizz engine",
   "author": "sfizz by sfztools (port: charlesvestal)",
   "license": "BSD-2-Clause",
@@ -24,7 +24,7 @@
           "params": [
             {
               "key": "preset",
-              "label": "Preset",
+              "label": "Instrument",
               "type": "int",
               "min": 0,
               "max_param": "preset_count",
@@ -69,6 +69,6 @@
   },
   "defaults": {
     "instrument_index": 0,
-    "preset": 0
+    "variant": 0
   }
 }

@@ -2,9 +2,9 @@
  * SFZ Player DSP Plugin
  *
  * Uses sfizz to render SFZ and DecentSampler (.dspreset) instruments.
- * Instruments are organized as folders under instruments/.
- * Each folder = one preset (navigated by preset browser).
- * Multiple .sfz files within a folder = variants (selected from menu).
+ * Instruments are organized under instruments/:
+ *   - Folders containing .sfz files = one preset per folder (with variants)
+ *   - Loose .sfz files = one preset each (samples in adjacent folders)
  *
  * V2 API only - instance-based for multi-instance support.
  */
@@ -66,6 +66,7 @@ typedef struct {
     char path[MAX_PATH_LEN];    /* Path where .sfz files live (may be subdir) */
     char root[MAX_PATH_LEN];    /* Instrument root folder (for sample fallback) */
     char name[MAX_NAME_LEN];    /* Folder display name */
+    char sfz_file[MAX_PATH_LEN]; /* If non-empty: single loose .sfz file (no folder) */
 } instrument_entry_t;
 
 typedef struct {
@@ -202,7 +203,7 @@ static int variant_entry_cmp(const void *a, const void *b) {
     return strcasecmp(pa->name, pb->name);
 }
 
-/* Scan instruments/ directory for instrument folders */
+/* Scan instruments/ directory for instrument folders and loose .sfz files */
 static void scan_instruments(sfz_instance_t *inst, const char *module_dir) {
     char dir_path[MAX_PATH_LEN];
     snprintf(dir_path, sizeof(dir_path), "%s/instruments", module_dir);
@@ -219,33 +220,59 @@ static void scan_instruments(sfz_instance_t *inst, const char *module_dir) {
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_name[0] == '.') continue;
 
-        /* Check if it's a directory */
         char full_path[MAX_PATH_LEN];
         snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, entry->d_name);
 
         struct stat st;
-        if (stat(full_path, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+        if (stat(full_path, &st) != 0) continue;
 
-        /* Check if directory (or subdirs) contains instrument files */
-        char sfz_dir[MAX_PATH_LEN];
-        if (!dir_has_instruments(full_path, sfz_dir, sizeof(sfz_dir))) continue;
+        if (S_ISDIR(st.st_mode)) {
+            /* Directory: check if it contains instrument files */
+            char sfz_dir[MAX_PATH_LEN];
+            if (!dir_has_instruments(full_path, sfz_dir, sizeof(sfz_dir))) continue;
 
-        if (inst->instrument_count >= MAX_INSTRUMENTS) {
-            plugin_log("Instrument list full, skipping extras");
-            break;
+            if (inst->instrument_count >= MAX_INSTRUMENTS) {
+                plugin_log("Instrument list full, skipping extras");
+                break;
+            }
+
+            instrument_entry_t *instr = &inst->instruments[inst->instrument_count];
+            strncpy(instr->path, sfz_dir, sizeof(instr->path) - 1);
+            instr->path[sizeof(instr->path) - 1] = '\0';
+            strncpy(instr->root, full_path, sizeof(instr->root) - 1);
+            instr->root[sizeof(instr->root) - 1] = '\0';
+            strncpy(instr->name, entry->d_name, sizeof(instr->name) - 1);
+            instr->name[sizeof(instr->name) - 1] = '\0';
+            instr->sfz_file[0] = '\0';  /* Folder-based instrument */
+            inst->last_variant[inst->instrument_count] = 0;
+            inst->instrument_count++;
+        } else {
+            /* Loose file: check if it's a supported instrument */
+            const char *ext = strrchr(entry->d_name, '.');
+            if (!ext || !is_supported_instrument(ext)) continue;
+
+            if (inst->instrument_count >= MAX_INSTRUMENTS) {
+                plugin_log("Instrument list full, skipping extras");
+                break;
+            }
+
+            instrument_entry_t *instr = &inst->instruments[inst->instrument_count];
+            /* Path and root both point to instruments/ dir for sample resolution */
+            strncpy(instr->path, dir_path, sizeof(instr->path) - 1);
+            instr->path[sizeof(instr->path) - 1] = '\0';
+            strncpy(instr->root, dir_path, sizeof(instr->root) - 1);
+            instr->root[sizeof(instr->root) - 1] = '\0';
+            /* Name = filename without extension */
+            int name_len = ext - entry->d_name;
+            if (name_len >= MAX_NAME_LEN) name_len = MAX_NAME_LEN - 1;
+            strncpy(instr->name, entry->d_name, name_len);
+            instr->name[name_len] = '\0';
+            /* Store full path to the .sfz file */
+            strncpy(instr->sfz_file, full_path, sizeof(instr->sfz_file) - 1);
+            instr->sfz_file[sizeof(instr->sfz_file) - 1] = '\0';
+            inst->last_variant[inst->instrument_count] = 0;
+            inst->instrument_count++;
         }
-
-        instrument_entry_t *instr = &inst->instruments[inst->instrument_count];
-        /* Store the path where SFZ files actually live */
-        strncpy(instr->path, sfz_dir, sizeof(instr->path) - 1);
-        instr->path[sizeof(instr->path) - 1] = '\0';
-        /* Store the instrument root folder (for sample path fallback) */
-        strncpy(instr->root, full_path, sizeof(instr->root) - 1);
-        instr->root[sizeof(instr->root) - 1] = '\0';
-        strncpy(instr->name, entry->d_name, sizeof(instr->name) - 1);
-        instr->name[sizeof(instr->name) - 1] = '\0';
-        inst->last_variant[inst->instrument_count] = 0;
-        inst->instrument_count++;
     }
 
     closedir(dir);
@@ -494,22 +521,36 @@ static void do_load_instrument(sfz_instance_t *inst) {
     int index = inst->current_instrument;
     if (index < 0 || index >= inst->instrument_count) return;
 
-    /* Scan variants in this instrument folder */
-    scan_variants(inst, inst->instruments[index].path);
+    instrument_entry_t *instr = &inst->instruments[index];
 
-    /* Load remembered variant (or first) */
-    if (inst->variant_count > 0) {
-        int variant_idx = inst->last_variant[index];
-        if (variant_idx < 0 || variant_idx >= inst->variant_count)
-            variant_idx = 0;
-        inst->current_variant = variant_idx;
-        strncpy(inst->variant_name, inst->variants[variant_idx].name,
-                sizeof(inst->variant_name) - 1);
-        load_sfz_file(inst, inst->variants[variant_idx].path,
-                      inst->instruments[index].root);
-    } else {
+    if (instr->sfz_file[0]) {
+        /* Single loose .sfz file - one variant, load directly */
+        inst->variant_count = 1;
+        variant_entry_t *v = &inst->variants[0];
+        strncpy(v->path, instr->sfz_file, sizeof(v->path) - 1);
+        v->path[sizeof(v->path) - 1] = '\0';
+        strncpy(v->name, instr->name, sizeof(v->name) - 1);
+        v->name[sizeof(v->name) - 1] = '\0';
+
         inst->current_variant = 0;
-        strcpy(inst->variant_name, "No variants");
+        strncpy(inst->variant_name, v->name, sizeof(inst->variant_name) - 1);
+        load_sfz_file(inst, v->path, instr->root);
+    } else {
+        /* Folder-based instrument - scan for variants */
+        scan_variants(inst, instr->path);
+
+        if (inst->variant_count > 0) {
+            int variant_idx = inst->last_variant[index];
+            if (variant_idx < 0 || variant_idx >= inst->variant_count)
+                variant_idx = 0;
+            inst->current_variant = variant_idx;
+            strncpy(inst->variant_name, inst->variants[variant_idx].name,
+                    sizeof(inst->variant_name) - 1);
+            load_sfz_file(inst, inst->variants[variant_idx].path, instr->root);
+        } else {
+            inst->current_variant = 0;
+            strcpy(inst->variant_name, "No variants");
+        }
     }
 
     char msg[128];

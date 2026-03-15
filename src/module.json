@@ -62,7 +62,7 @@
       ".sfz",
       ".dspreset"
     ],
-    "description": "Upload SFZ or DecentSampler instrument folders. Each folder should contain .sfz/.dspreset file(s) and their sample files.",
+    "description": "Upload SFZ or DecentSampler instruments. Either folders containing .sfz/.dspreset and sample files, or loose .sfz files with samples in adjacent folders.",
     "hint": "Find SFZ instruments at",
     "hint_url": "https://sfzinstruments.github.io/",
     "hint_url_label": "SFZ Instruments"

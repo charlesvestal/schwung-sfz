@@ -39,9 +39,10 @@
             "  synth sample packs",
             "",
             "Each instrument is a",
-            "folder containing",
-            ".sfz file(s) and",
-            "sample WAV files."
+            "folder with .sfz and",
+            "WAV files, or a loose",
+            ".sfz with samples in",
+            "an adjacent folder."
           ]
         },
         {
@@ -66,18 +67,26 @@
           "lines": [
             "On-device path:",
             "",
-            " modules/",
-            "  sound_generators/",
-            "   sfz/",
-            "    instruments/",
-            "     MyPiano/",
-            "      piano.sfz",
-            "      samples/",
-            "       *.wav",
+            " instruments/",
             "",
-            "Each subfolder in",
-            "instruments/ is one",
-            "instrument entry."
+            "Two layouts work:",
+            "",
+            "1) Folder per instrument:",
+            "  MyPiano/",
+            "   piano.sfz",
+            "   samples/*.wav",
+            "",
+            "  Multiple .sfz files",
+            "  in a folder become",
+            "  variants.",
+            "",
+            "2) Loose .sfz files:",
+            "  Be Careful.sfz",
+            "  Be Careful Samples/",
+            "   *.wav",
+            "",
+            "  Each .sfz file is",
+            "  its own instrument."
           ]
         }
       ]

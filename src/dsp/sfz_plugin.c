@@ -16,6 +16,7 @@
 #include <math.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 /* Include plugin API - inline definitions to avoid path issues */
 #include <stdint.h>
@@ -398,6 +399,236 @@ static int try_load_with_root(sfz_instance_t *inst, const char *path,
     return (preloaded > 0) ? 0 : -1;
 }
 
+/* Simple XML attribute parser helper.
+ * Finds attr="value" in a tag string, handling missing spaces between attrs.
+ * Returns value in out_val (null-terminated), or empty string if not found. */
+static void xml_get_attr(const char *tag, const char *attr_name, char *out_val, int max_len) {
+    out_val[0] = '\0';
+    char search[64];
+    snprintf(search, sizeof(search), "%s=\"", attr_name);
+    const char *pos = strstr(tag, search);
+    if (!pos) return;
+    pos += strlen(search);
+    const char *end = strchr(pos, '"');
+    if (!end) return;
+    int len = end - pos;
+    if (len >= max_len) len = max_len - 1;
+    memcpy(out_val, pos, len);
+    out_val[len] = '\0';
+}
+
+/* Convert a .dspreset file to SFZ text and write as a temp .sfz file.
+ * Returns path to the temp .sfz file, or NULL on failure.
+ * Caller must free the returned string. */
+static char *convert_dspreset_to_sfz(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (size <= 0 || size > 1024 * 1024) {
+        fclose(f);
+        return NULL;
+    }
+
+    char *src = (char *)malloc(size + 1);
+    if (!src) { fclose(f); return NULL; }
+    fread(src, 1, size, f);
+    src[size] = '\0';
+    fclose(f);
+
+    /* Fix malformed XML: insert spaces between attributes where missing.
+     * Track quote parity: odd = opening, even = closing. */
+    {
+        int fixes = 0, in_tag = 0, quote_count = 0;
+        for (long i = 0; i < size; i++) {
+            if (src[i] == '<') { in_tag = 1; quote_count = 0; }
+            else if (src[i] == '>') { in_tag = 0; }
+            if (in_tag && src[i] == '"') {
+                quote_count++;
+                if ((quote_count % 2 == 0) && i + 1 < size &&
+                    ((src[i+1] >= 'a' && src[i+1] <= 'z') ||
+                     (src[i+1] >= 'A' && src[i+1] <= 'Z')))
+                    fixes++;
+            }
+        }
+        if (fixes > 0) {
+            char *dst = (char *)malloc(size + fixes + 1);
+            if (!dst) { free(src); return NULL; }
+            long j = 0;
+            in_tag = 0; quote_count = 0;
+            for (long i = 0; i < size; i++) {
+                if (src[i] == '<') { in_tag = 1; quote_count = 0; }
+                else if (src[i] == '>') { in_tag = 0; }
+                dst[j++] = src[i];
+                if (in_tag && src[i] == '"') {
+                    quote_count++;
+                    if ((quote_count % 2 == 0) && i + 1 < size &&
+                        ((src[i+1] >= 'a' && src[i+1] <= 'z') ||
+                         (src[i+1] >= 'A' && src[i+1] <= 'Z')))
+                        dst[j++] = ' ';
+                }
+            }
+            dst[j] = '\0';
+            free(src);
+            src = dst;
+            size = j;
+            char log_msg[128];
+            snprintf(log_msg, sizeof(log_msg),
+                     "Fixed %d malformed XML attributes in dspreset", fixes);
+            plugin_log(log_msg);
+        }
+    }
+
+    /* Now convert XML to SFZ by scanning for tags */
+    /* Allocate output buffer (SFZ is typically smaller than XML) */
+    char *sfz = (char *)malloc(size * 2);
+    if (!sfz) { free(src); return NULL; }
+    int pos = 0;
+    char val[512];
+
+    /* Find <groups> attributes */
+    char *groups_tag = strstr(src, "<groups");
+    if (groups_tag) {
+        char *groups_end = strchr(groups_tag, '>');
+        if (groups_end) {
+            char tag_buf[1024];
+            int tlen = groups_end - groups_tag;
+            if (tlen >= (int)sizeof(tag_buf)) tlen = sizeof(tag_buf) - 1;
+            memcpy(tag_buf, groups_tag, tlen);
+            tag_buf[tlen] = '\0';
+
+            pos += snprintf(sfz + pos, size * 2 - pos, "<global>\n");
+            xml_get_attr(tag_buf, "volume", val, sizeof(val));
+            if (val[0]) pos += snprintf(sfz + pos, size * 2 - pos, "volume=%s\n", val);
+        }
+    }
+
+    /* Find each <group> */
+    char *scan = src;
+    while ((scan = strstr(scan, "<group")) != NULL) {
+        /* Skip <groups> tag */
+        if (scan[6] == 's' || scan[6] == 'S') { scan += 7; continue; }
+        char *tag_end = strchr(scan, '>');
+        if (!tag_end) break;
+
+        char tag_buf[2048];
+        int tlen = tag_end - scan;
+        if (tlen >= (int)sizeof(tag_buf)) tlen = sizeof(tag_buf) - 1;
+        memcpy(tag_buf, scan, tlen);
+        tag_buf[tlen] = '\0';
+
+        pos += snprintf(sfz + pos, size * 2 - pos, "<group>\n");
+        xml_get_attr(tag_buf, "volume", val, sizeof(val));
+        if (val[0]) pos += snprintf(sfz + pos, size * 2 - pos, "volume=%s\n", val);
+        xml_get_attr(tag_buf, "ampVelTrack", val, sizeof(val));
+        if (val[0]) pos += snprintf(sfz + pos, size * 2 - pos, "amp_veltrack=%s\n", val);
+        xml_get_attr(tag_buf, "attack", val, sizeof(val));
+        if (val[0]) pos += snprintf(sfz + pos, size * 2 - pos, "ampeg_attack=%s\n", val);
+        xml_get_attr(tag_buf, "decay", val, sizeof(val));
+        if (val[0]) pos += snprintf(sfz + pos, size * 2 - pos, "ampeg_decay=%s\n", val);
+        xml_get_attr(tag_buf, "sustain", val, sizeof(val));
+        if (val[0]) {
+            float s = atof(val) * 100.0f;
+            pos += snprintf(sfz + pos, size * 2 - pos, "ampeg_sustain=%.1f\n", s);
+        }
+        xml_get_attr(tag_buf, "release", val, sizeof(val));
+        if (val[0]) pos += snprintf(sfz + pos, size * 2 - pos, "ampeg_release=%s\n", val);
+
+        /* Find <sample> tags within this group */
+        char *sample_scan = tag_end;
+        char *group_end = strstr(tag_end, "</group>");
+        if (!group_end) group_end = src + size;
+
+        while (sample_scan < group_end &&
+               (sample_scan = strstr(sample_scan, "<sample")) != NULL &&
+               sample_scan < group_end) {
+            char *stag_end = strchr(sample_scan, '>');
+            if (!stag_end || stag_end > group_end) break;
+
+            /* Skip commented-out samples */
+            char *comment_start = NULL;
+            for (char *c = sample_scan - 1; c >= src && c >= sample_scan - 20; c--) {
+                if (*c == '-' && c > src && *(c-1) == '-' && c > src+1 && *(c-2) == '!') {
+                    comment_start = c - 2;
+                    break;
+                }
+                if (*c != ' ' && *c != '\t' && *c != '\n' && *c != '\r') break;
+            }
+            if (comment_start) {
+                sample_scan = stag_end + 1;
+                continue;
+            }
+
+            char stag_buf[1024];
+            int stlen = stag_end - sample_scan;
+            if (stlen >= (int)sizeof(stag_buf)) stlen = sizeof(stag_buf) - 1;
+            memcpy(stag_buf, sample_scan, stlen);
+            stag_buf[stlen] = '\0';
+
+            pos += snprintf(sfz + pos, size * 2 - pos, "<region>\n");
+
+            /* rootNote -> key (must come before lokey/hikey) */
+            xml_get_attr(stag_buf, "rootNote", val, sizeof(val));
+            if (val[0]) pos += snprintf(sfz + pos, size * 2 - pos, "pitch_keycenter=%s\n", val);
+
+            xml_get_attr(stag_buf, "path", val, sizeof(val));
+            if (val[0]) pos += snprintf(sfz + pos, size * 2 - pos, "sample=%s\n", val);
+            xml_get_attr(stag_buf, "loNote", val, sizeof(val));
+            if (val[0]) pos += snprintf(sfz + pos, size * 2 - pos, "lokey=%s\n", val);
+            xml_get_attr(stag_buf, "hiNote", val, sizeof(val));
+            if (val[0]) pos += snprintf(sfz + pos, size * 2 - pos, "hikey=%s\n", val);
+            xml_get_attr(stag_buf, "loVel", val, sizeof(val));
+            if (val[0]) pos += snprintf(sfz + pos, size * 2 - pos, "lovel=%s\n", val);
+            xml_get_attr(stag_buf, "hiVel", val, sizeof(val));
+            if (val[0]) pos += snprintf(sfz + pos, size * 2 - pos, "hivel=%s\n", val);
+            xml_get_attr(stag_buf, "start", val, sizeof(val));
+            if (val[0]) pos += snprintf(sfz + pos, size * 2 - pos, "offset=%s\n", val);
+            xml_get_attr(stag_buf, "end", val, sizeof(val));
+            if (val[0]) pos += snprintf(sfz + pos, size * 2 - pos, "end=%s\n", val);
+            xml_get_attr(stag_buf, "tuning", val, sizeof(val));
+            if (val[0]) pos += snprintf(sfz + pos, size * 2 - pos, "transpose=%s\n", val);
+            xml_get_attr(stag_buf, "pan", val, sizeof(val));
+            if (val[0]) pos += snprintf(sfz + pos, size * 2 - pos, "pan=%s\n", val);
+            xml_get_attr(stag_buf, "loopEnabled", val, sizeof(val));
+            if (val[0]) pos += snprintf(sfz + pos, size * 2 - pos, "loop_mode=%s\n",
+                                         strcmp(val, "true") == 0 ? "loop_continuous" : "no_loop");
+            xml_get_attr(stag_buf, "loopStart", val, sizeof(val));
+            if (val[0]) pos += snprintf(sfz + pos, size * 2 - pos, "loop_start=%s\n", val);
+            xml_get_attr(stag_buf, "loopEnd", val, sizeof(val));
+            if (val[0]) pos += snprintf(sfz + pos, size * 2 - pos, "loop_end=%s\n", val);
+
+            sample_scan = stag_end + 1;
+        }
+
+        scan = group_end;
+    }
+
+    free(src);
+
+    /* Write SFZ to temp file in same directory */
+    char *tmp_path = (char *)malloc(strlen(path) + 16);
+    if (!tmp_path) { free(sfz); return NULL; }
+    /* Replace .dspreset with .converted.sfz */
+    const char *dsp_ext = strrchr(path, '.');
+    int base_len = dsp_ext ? (int)(dsp_ext - path) : (int)strlen(path);
+    snprintf(tmp_path, strlen(path) + 16, "%.*s.converted.sfz", base_len, path);
+
+    f = fopen(tmp_path, "wb");
+    if (!f) { free(sfz); free(tmp_path); return NULL; }
+    fwrite(sfz, 1, pos, f);
+    fclose(f);
+    free(sfz);
+
+    char log_msg[128];
+    snprintf(log_msg, sizeof(log_msg), "Converted dspreset to SFZ (%d bytes)", pos);
+    plugin_log(log_msg);
+
+    return tmp_path;
+}
+
 /* Load a .sfz or .dspreset file into the synth.
  * root_path is the instrument root folder, used as fallback for
  * sample resolution when the .sfz is in a subdirectory. */
@@ -420,19 +651,45 @@ static int load_sfz_file(sfz_instance_t *inst, const char *path,
     snprintf(msg, sizeof(msg), "File size: %ld bytes", (long)st.st_size);
     plugin_log(msg);
 
+    /* For .dspreset files, convert to SFZ and load directly.
+     * This bypasses sfizz's built-in importer which has issues with
+     * sfizz_load_string sample path resolution. */
+    const char *ext = strrchr(path, '.');
     const char *format = NULL;
-    if (!sfizz_load_or_import_file(inst->synth, path, &format)) {
-        snprintf(msg, sizeof(msg), "Failed to load: %s", path);
-        plugin_log(msg);
-        const char *ext = strrchr(path, '.');
-        if (ext && strcasecmp(ext, ".dspreset") == 0) {
-            snprintf(inst->load_error, sizeof(inst->load_error),
-                     "DecentSampler import failed - check XML format");
+
+    if (ext && strcasecmp(ext, ".dspreset") == 0) {
+        char *converted_path = convert_dspreset_to_sfz(path);
+        if (converted_path) {
+            if (!sfizz_load_file(inst->synth, converted_path)) {
+                snprintf(msg, sizeof(msg), "Failed to load converted SFZ: %s",
+                         converted_path);
+                plugin_log(msg);
+                snprintf(inst->load_error, sizeof(inst->load_error),
+                         "DecentSampler conversion failed");
+                unlink(converted_path);
+                free(converted_path);
+                return -1;
+            }
+            format = "DecentSampler instrument";
+            unlink(converted_path);
+            free(converted_path);
         } else {
+            /* Conversion failed, try sfizz's built-in importer as fallback */
+            plugin_log("dspreset conversion failed, trying sfizz importer");
+            if (!sfizz_load_or_import_file(inst->synth, path, &format)) {
+                snprintf(inst->load_error, sizeof(inst->load_error),
+                         "DecentSampler import failed - check XML format");
+                return -1;
+            }
+        }
+    } else {
+        if (!sfizz_load_or_import_file(inst->synth, path, &format)) {
+            snprintf(msg, sizeof(msg), "Failed to load: %s", path);
+            plugin_log(msg);
             snprintf(inst->load_error, sizeof(inst->load_error),
                      "Failed to load instrument file");
+            return -1;
         }
-        return -1;
     }
 
     int num_regions = sfizz_get_num_regions(inst->synth);
@@ -457,7 +714,6 @@ static int load_sfz_file(sfz_instance_t *inst, const char *path,
             /* If SFZ is in a subdirectory, try resolving samples from
              * the instrument root. Many packs (e.g. drolez/SHLD) put
              * .sfz files in presets/ but reference Samples/ at the root. */
-            const char *ext = strrchr(path, '.');
             if (root_path && root_path[0] &&
                 ext && strcasecmp(ext, ".sfz") == 0 &&
                 strcmp(root_path, inst->instruments[inst->current_instrument].path) != 0 &&
@@ -636,7 +892,8 @@ static void* v2_create_instance(const char *module_dir, const char *json_default
     int sample_rate = g_host ? g_host->sample_rate : MOVE_SAMPLE_RATE;
     sfizz_set_sample_rate(inst->synth, (float)sample_rate);
     sfizz_set_samples_per_block(inst->synth, MOVE_FRAMES_PER_BLOCK);
-    sfizz_set_num_voices(inst->synth, 64);
+    sfizz_set_num_voices(inst->synth, 24);
+    sfizz_set_preload_size(inst->synth, 131072); /* 128K samples - covers large offsets */
     sfizz_set_volume(inst->synth, inst->gain);
 
     snprintf(msg, sizeof(msg), "sfizz initialized: sample_rate=%d, block=%d",

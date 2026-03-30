@@ -2,7 +2,7 @@
   "id": "sfz",
   "name": "SFZ Player",
   "abbrev": "SZ",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "SFZ and DecentSampler (.dspreset) player using sfizz engine",
   "author": "sfizz by sfztools (port: charlesvestal)",
   "license": "BSD-2-Clause",

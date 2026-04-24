@@ -45,11 +45,29 @@
               "min": 0,
               "max": 2,
               "default": 1.0
+            },
+            {
+              "key": "attack_offset",
+              "label": "Attack",
+              "type": "int",
+              "min": -64,
+              "max": 63,
+              "default": 0
+            },
+            {
+              "key": "release_offset",
+              "label": "Release",
+              "type": "int",
+              "min": -64,
+              "max": 63,
+              "default": 0
             }
           ],
           "knobs": [
             "octave_transpose",
-            "gain"
+            "gain",
+            "attack_offset",
+            "release_offset"
           ]
         }
       }

@@ -75,6 +75,19 @@ typedef struct {
     char name[MAX_NAME_LEN];    /* Display name (filename without .sfz) */
 } variant_entry_t;
 
+/* Internal CCs used for bipolar envelope offset modulation. Filtered
+ * from incoming MIDI so user CCs can't collide with them. */
+#define CC_ATTACK_PLUS   102
+#define CC_ATTACK_MINUS  103
+#define CC_RELEASE_PLUS  104
+#define CC_RELEASE_MINUS 105
+
+/* Max offset depths (seconds) applied via <global> _oncc opcodes. Knob
+ * at full-positive adds this much; full-negative subtracts (clamped at
+ * 0 by sfizz). */
+#define ATTACK_OFFSET_DEPTH_S   2.0f
+#define RELEASE_OFFSET_DEPTH_S  5.0f
+
 /* Per-Instance State */
 typedef struct {
     sfizz_synth_t *synth;
@@ -84,6 +97,8 @@ typedef struct {
     int variant_count;
     int octave_transpose;
     float gain;
+    int attack_offset;           /* -64..+63, 0 = no change to author's ampeg_attack */
+    int release_offset;          /* -64..+63, 0 = no change to author's ampeg_release */
     instrument_entry_t instruments[MAX_INSTRUMENTS];
     variant_entry_t variants[MAX_VARIANTS];
     int last_variant[MAX_INSTRUMENTS];  /* Remember last variant per instrument */
@@ -141,6 +156,97 @@ static int json_get_string(const char *json, const char *key, char *out, int out
 static int is_supported_instrument(const char *ext) {
     return (strcasecmp(ext, ".sfz") == 0 ||
             strcasecmp(ext, ".dspreset") == 0);
+}
+
+/* Bipolar envelope offset via SFZ _oncc modulation.
+ *
+ * Two CCs per envelope stage — one lengthens, one shortens — allow the
+ * knob to bias the author's ampeg_attack/release without replacing it.
+ * At knob=0 both CCs are 0 and the instrument plays as authored.
+ *
+ * SFZ scoping rule: a new <global> header resets all previously-set
+ * global opcodes for subsequent regions. So simply prepending our
+ * <global> block isn't enough — we also append our opcodes after every
+ * <global> header in the file. If the file has no <global>, prepend a
+ * fresh one. Opcodes written into a header with a following newline
+ * are valid SFZ because newlines separate opcodes.
+ *
+ * Returns a newly-allocated, NUL-terminated string; caller frees. */
+static char *inject_envelope_mods(const char *src) {
+    static const char mods_tpl[] =
+        "\n// schwung-sfz envelope mod injection\n"
+        "ampeg_attack_oncc%d = %.3f\n"
+        "ampeg_attack_oncc%d = %.3f\n"
+        "ampeg_release_oncc%d = %.3f\n"
+        "ampeg_release_oncc%d = %.3f\n";
+
+    char mods[256];
+    snprintf(mods, sizeof(mods), mods_tpl,
+             CC_ATTACK_PLUS,    ATTACK_OFFSET_DEPTH_S,
+             CC_ATTACK_MINUS,  -ATTACK_OFFSET_DEPTH_S,
+             CC_RELEASE_PLUS,   RELEASE_OFFSET_DEPTH_S,
+             CC_RELEASE_MINUS, -RELEASE_OFFSET_DEPTH_S);
+    size_t mods_len = strlen(mods);
+    size_t src_len = strlen(src);
+
+    int global_count = 0;
+    {
+        const char *p = src;
+        while ((p = strstr(p, "<global>")) != NULL) {
+            global_count++;
+            p += 8;
+        }
+    }
+
+    /* Space = source + one mod block per existing <global>, plus a
+     * fresh "<global>" + mods prepended if the file had none. */
+    int prepend = (global_count == 0) ? 1 : 0;
+    size_t out_cap = src_len + (size_t)global_count * mods_len +
+                     (size_t)prepend * (8 + mods_len) + 1;
+    char *out = malloc(out_cap);
+    if (!out) return NULL;
+    char *dst = out;
+
+    if (prepend) {
+        memcpy(dst, "<global>", 8);
+        dst += 8;
+        memcpy(dst, mods, mods_len);
+        dst += mods_len;
+    }
+
+    const char *sp = src;
+    while (*sp) {
+        if (strncmp(sp, "<global>", 8) == 0) {
+            memcpy(dst, "<global>", 8);
+            dst += 8;
+            memcpy(dst, mods, mods_len);
+            dst += mods_len;
+            sp += 8;
+        } else {
+            *dst++ = *sp++;
+        }
+    }
+    *dst = '\0';
+    return out;
+}
+
+/* Apply current attack/release offset state to sfizz via hdcc.
+ * Positive offset drives the "+" CC, negative drives the "-" CC. */
+static void send_envelope_offset_ccs(sfz_instance_t *inst) {
+    if (!inst || !inst->synth) return;
+
+    float a_plus = 0.0f, a_minus = 0.0f;
+    if (inst->attack_offset > 0) a_plus = (float)inst->attack_offset / 63.0f;
+    else if (inst->attack_offset < 0) a_minus = (float)(-inst->attack_offset) / 64.0f;
+
+    float r_plus = 0.0f, r_minus = 0.0f;
+    if (inst->release_offset > 0) r_plus = (float)inst->release_offset / 63.0f;
+    else if (inst->release_offset < 0) r_minus = (float)(-inst->release_offset) / 64.0f;
+
+    sfizz_automate_hdcc(inst->synth, 0, CC_ATTACK_PLUS,    a_plus);
+    sfizz_automate_hdcc(inst->synth, 0, CC_ATTACK_MINUS,   a_minus);
+    sfizz_automate_hdcc(inst->synth, 0, CC_RELEASE_PLUS,   r_plus);
+    sfizz_automate_hdcc(inst->synth, 0, CC_RELEASE_MINUS,  r_minus);
 }
 
 /* Check if a directory (or its immediate subdirs) contains instrument files.
@@ -387,8 +493,12 @@ static int try_load_with_root(sfz_instance_t *inst, const char *path,
     snprintf(msg, sizeof(msg), "Retrying with root: %s", root_path);
     plugin_log(msg);
 
-    bool ok = sfizz_load_string(inst->synth, virtual_path, content);
+    char *injected = inject_envelope_mods(content);
     free(content);
+    if (!injected) return -1;
+
+    bool ok = sfizz_load_string(inst->synth, virtual_path, injected);
+    free(injected);
 
     if (!ok) return -1;
 
@@ -629,6 +739,38 @@ static char *convert_dspreset_to_sfz(const char *path) {
     return tmp_path;
 }
 
+/* Read a real .sfz file, inject envelope mod opcodes, load via sfizz
+ * load_string using the original path as virtual path so sample paths
+ * resolve correctly. Returns true on success. */
+static bool load_sfz_with_injection(sfz_instance_t *inst, const char *sfz_path) {
+    FILE *f = fopen(sfz_path, "rb");
+    if (!f) return false;
+
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (fsize <= 0 || fsize > 4 * 1024 * 1024) {
+        fclose(f);
+        return false;
+    }
+
+    char *content = malloc(fsize + 1);
+    if (!content) { fclose(f); return false; }
+
+    size_t read_len = fread(content, 1, fsize, f);
+    fclose(f);
+    content[read_len] = '\0';
+
+    char *injected = inject_envelope_mods(content);
+    free(content);
+    if (!injected) return false;
+
+    bool ok = sfizz_load_string(inst->synth, sfz_path, injected);
+    free(injected);
+    return ok;
+}
+
 /* Load a .sfz or .dspreset file into the synth.
  * root_path is the instrument root folder, used as fallback for
  * sample resolution when the .sfz is in a subdirectory. */
@@ -660,7 +802,7 @@ static int load_sfz_file(sfz_instance_t *inst, const char *path,
     if (ext && strcasecmp(ext, ".dspreset") == 0) {
         char *converted_path = convert_dspreset_to_sfz(path);
         if (converted_path) {
-            if (!sfizz_load_file(inst->synth, converted_path)) {
+            if (!load_sfz_with_injection(inst, converted_path)) {
                 snprintf(msg, sizeof(msg), "Failed to load converted SFZ: %s",
                          converted_path);
                 plugin_log(msg);
@@ -674,7 +816,8 @@ static int load_sfz_file(sfz_instance_t *inst, const char *path,
             unlink(converted_path);
             free(converted_path);
         } else {
-            /* Conversion failed, try sfizz's built-in importer as fallback */
+            /* Conversion failed, try sfizz's built-in importer as fallback.
+             * Envelope mod injection is skipped on this rare path. */
             plugin_log("dspreset conversion failed, trying sfizz importer");
             if (!sfizz_load_or_import_file(inst->synth, path, &format)) {
                 snprintf(inst->load_error, sizeof(inst->load_error),
@@ -683,7 +826,7 @@ static int load_sfz_file(sfz_instance_t *inst, const char *path,
             }
         }
     } else {
-        if (!sfizz_load_or_import_file(inst->synth, path, &format)) {
+        if (!load_sfz_with_injection(inst, path)) {
             snprintf(msg, sizeof(msg), "Failed to load: %s", path);
             plugin_log(msg);
             snprintf(inst->load_error, sizeof(inst->load_error),
@@ -767,6 +910,10 @@ static void select_variant(sfz_instance_t *inst, int index) {
     const char *root = inst->instruments[inst->current_instrument].root;
     load_sfz_file(inst, inst->variants[index].path, root);
 
+    /* Re-apply current envelope offsets — variant changes preserve the
+     * user's knob position, so we drive sfizz to match. */
+    send_envelope_offset_ccs(inst);
+
     char msg[128];
     snprintf(msg, sizeof(msg), "Variant %d: %s", index, inst->variant_name);
     plugin_log(msg);
@@ -778,6 +925,11 @@ static void do_load_instrument(sfz_instance_t *inst) {
     if (index < 0 || index >= inst->instrument_count) return;
 
     instrument_entry_t *instr = &inst->instruments[index];
+
+    /* Reset envelope offsets when switching instruments so each instrument
+     * starts with the author's authored ampeg values, matching JV880 macro UX. */
+    inst->attack_offset = 0;
+    inst->release_offset = 0;
 
     if (instr->sfz_file[0]) {
         /* Single loose .sfz file - one variant, load directly */
@@ -808,6 +960,10 @@ static void do_load_instrument(sfz_instance_t *inst) {
             strcpy(inst->variant_name, "No variants");
         }
     }
+
+    /* Push reset CC state into sfizz — CC state persists across load_string
+     * so we explicitly zero our internal CCs after every instrument load. */
+    send_envelope_offset_ccs(inst);
 
     char msg[128];
     snprintf(msg, sizeof(msg), "Instrument %d: %s (%d variants)",
@@ -986,6 +1142,10 @@ static void v2_on_midi(void *instance, const uint8_t *msg, int len, int source) 
         case 0xB0:  /* Control change */
             if (data1 == 123) {  /* All notes off */
                 sfizz_all_sound_off(inst->synth);
+            } else if (data1 == CC_ATTACK_PLUS || data1 == CC_ATTACK_MINUS ||
+                       data1 == CC_RELEASE_PLUS || data1 == CC_RELEASE_MINUS) {
+                /* Reserved for internal envelope offset modulation —
+                 * drop so external MIDI can't stomp knob-driven state. */
             } else {
                 sfizz_send_cc(inst->synth, 0, data1, data2);
                 if (data1 == 64 || data1 == 1) {  /* Log sustain/mod */
@@ -1036,6 +1196,18 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         if (inst->synth) {
             sfizz_set_volume(inst->synth, inst->gain);
         }
+    } else if (strcmp(key, "attack_offset") == 0) {
+        int v = atoi(val);
+        if (v < -64) v = -64;
+        if (v > 63) v = 63;
+        inst->attack_offset = v;
+        send_envelope_offset_ccs(inst);
+    } else if (strcmp(key, "release_offset") == 0) {
+        int v = atoi(val);
+        if (v < -64) v = -64;
+        if (v > 63) v = 63;
+        inst->release_offset = v;
+        send_envelope_offset_ccs(inst);
     } else if (strcmp(key, "all_notes_off") == 0 || strcmp(key, "panic") == 0) {
         if (inst->synth) {
             sfizz_all_sound_off(inst->synth);
@@ -1077,6 +1249,21 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
                 sfizz_set_volume(inst->synth, inst->gain);
             }
         }
+        if (json_get_number(val, "attack_offset", &f) == 0) {
+            int v = (int)f;
+            if (v < -64) v = -64;
+            if (v > 63) v = 63;
+            inst->attack_offset = v;
+        }
+        if (json_get_number(val, "release_offset", &f) == 0) {
+            int v = (int)f;
+            if (v < -64) v = -64;
+            if (v > 63) v = 63;
+            inst->release_offset = v;
+        }
+        /* State restore arrives after instrument load, so re-send CCs to
+         * reflect the restored offsets on top of the freshly-loaded SFZ. */
+        send_envelope_offset_ccs(inst);
     }
 }
 
@@ -1125,6 +1312,10 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
         return snprintf(buf, buf_len, "%d", inst->octave_transpose);
     } else if (strcmp(key, "gain") == 0) {
         return snprintf(buf, buf_len, "%.2f", inst->gain);
+    } else if (strcmp(key, "attack_offset") == 0) {
+        return snprintf(buf, buf_len, "%d", inst->attack_offset);
+    } else if (strcmp(key, "release_offset") == 0) {
+        return snprintf(buf, buf_len, "%d", inst->release_offset);
     }
     /* Chain compatibility */
     else if (strcmp(key, "bank_name") == 0) {
@@ -1172,9 +1363,11 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
         }
         return snprintf(buf, buf_len,
             "{\"instrument_name\":\"%s\",\"instrument_index\":%d,\"variant\":%d,"
-            "\"octave_transpose\":%d,\"gain\":%.2f}",
+            "\"octave_transpose\":%d,\"gain\":%.2f,"
+            "\"attack_offset\":%d,\"release_offset\":%d}",
             instr_name, inst->current_instrument, inst->current_variant,
-            inst->octave_transpose, inst->gain);
+            inst->octave_transpose, inst->gain,
+            inst->attack_offset, inst->release_offset);
     }
     /* UI hierarchy for shadow parameter editor */
     else if (strcmp(key, "ui_hierarchy") == 0) {
@@ -1187,10 +1380,12 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
                     "\"count_param\":\"preset_count\","
                     "\"name_param\":\"preset_name\","
                     "\"children\":null,"
-                    "\"knobs\":[\"octave_transpose\",\"gain\"],"
+                    "\"knobs\":[\"octave_transpose\",\"gain\",\"attack_offset\",\"release_offset\"],"
                     "\"params\":["
                         "{\"key\":\"octave_transpose\",\"label\":\"Octave\"},"
                         "{\"key\":\"gain\",\"label\":\"Gain\"},"
+                        "{\"key\":\"attack_offset\",\"label\":\"Attack\"},"
+                        "{\"key\":\"release_offset\",\"label\":\"Release\"},"
                         "{\"level\":\"variant\",\"label\":\"Choose Variant\"}"
                     "]"
                 "},"

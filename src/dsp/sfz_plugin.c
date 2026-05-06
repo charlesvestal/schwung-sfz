@@ -2,9 +2,14 @@
  * SFZ Player DSP Plugin
  *
  * Uses sfizz to render SFZ and DecentSampler (.dspreset) instruments.
- * Instruments are organized under instruments/:
- *   - Folders containing .sfz files = one preset per folder (with variants)
- *   - Loose .sfz files = one preset each (samples in adjacent folders)
+ * The instruments/ directory is scanned recursively (up to 5 levels deep).
+ * Each .sfz/.dspreset file becomes its own instrument:
+ *   - If a folder contains exactly one preset file, the folder name is used
+ *     as the display name (e.g. instruments/Cosmos/COSMOS.dspreset → "Cosmos").
+ *   - If a folder contains multiple preset files, each is its own instrument
+ *     named after the filename (libraries like DS_The Synths flatten this way).
+ *   - "Library wrapper" folders that only contain other folders are descended
+ *     into (e.g. K4Coll-1.01/K4-Acoustic/K4-Acoustic.dspreset → "K4-Acoustic").
  *
  * V2 API only - instance-based for multi-instance support.
  */
@@ -143,52 +148,13 @@ static int is_supported_instrument(const char *ext) {
             strcasecmp(ext, ".dspreset") == 0);
 }
 
-/* Check if a directory (or its immediate subdirs) contains instrument files.
- * Returns 1 if found, and sets sfz_subdir to the path containing them. */
-static int dir_has_instruments(const char *dir_path, char *sfz_subdir, int sfz_subdir_len) {
-    DIR *dir = opendir(dir_path);
-    if (!dir) return 0;
-
-    struct dirent *entry;
-    /* First pass: check top level */
-    while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_name[0] == '.') continue;
-        const char *ext = strrchr(entry->d_name, '.');
-        if (ext && is_supported_instrument(ext)) {
-            closedir(dir);
-            snprintf(sfz_subdir, sfz_subdir_len, "%s", dir_path);
-            return 1;
-        }
-    }
-    closedir(dir);
-
-    /* Second pass: check one level of subdirectories */
-    dir = opendir(dir_path);
-    if (!dir) return 0;
-
-    while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_name[0] == '.') continue;
-        char sub_path[MAX_PATH_LEN];
-        snprintf(sub_path, sizeof(sub_path), "%s/%s", dir_path, entry->d_name);
-        struct stat st;
-        if (stat(sub_path, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
-
-        DIR *subdir = opendir(sub_path);
-        if (!subdir) continue;
-        struct dirent *sub_entry;
-        while ((sub_entry = readdir(subdir)) != NULL) {
-            const char *ext = strrchr(sub_entry->d_name, '.');
-            if (ext && is_supported_instrument(ext)) {
-                closedir(subdir);
-                closedir(dir);
-                snprintf(sfz_subdir, sfz_subdir_len, "%s", sub_path);
-                return 1;
-            }
-        }
-        closedir(subdir);
-    }
-    closedir(dir);
-    return 0;
+/* Skip our internal `.converted.sfz` temp files so they don't appear as
+ * variants when load_sfz_file's unlink races with a variant scan. */
+static int is_temp_converted_sfz(const char *filename) {
+    const char *suffix = ".converted.sfz";
+    size_t flen = strlen(filename);
+    size_t slen = strlen(suffix);
+    return flen >= slen && strcasecmp(filename + flen - slen, suffix) == 0;
 }
 
 /* Sort helpers */
@@ -204,7 +170,11 @@ static int variant_entry_cmp(const void *a, const void *b) {
     return strcasecmp(pa->name, pb->name);
 }
 
-/* Scan instruments/ directory for instrument folders and loose .sfz files */
+#define VARIANT_MAX_DEPTH 5
+
+/* Scan instruments/ for top-level entries. Each folder or loose .sfz/.dspreset
+ * file becomes one instrument. Variants inside folder instruments are
+ * discovered later (recursively) by scan_variants. */
 static void scan_instruments(sfz_instance_t *inst, const char *module_dir) {
     char dir_path[MAX_PATH_LEN];
     snprintf(dir_path, sizeof(dir_path), "%s/instruments", module_dir);
@@ -220,6 +190,10 @@ static void scan_instruments(sfz_instance_t *inst, const char *module_dir) {
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_name[0] == '.') continue;
+        if (inst->instrument_count >= MAX_INSTRUMENTS) {
+            plugin_log("Instrument list full, skipping extras");
+            break;
+        }
 
         char full_path[MAX_PATH_LEN];
         snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, entry->d_name);
@@ -227,53 +201,38 @@ static void scan_instruments(sfz_instance_t *inst, const char *module_dir) {
         struct stat st;
         if (stat(full_path, &st) != 0) continue;
 
+        instrument_entry_t *instr = &inst->instruments[inst->instrument_count];
+
         if (S_ISDIR(st.st_mode)) {
-            /* Directory: check if it contains instrument files */
-            char sfz_dir[MAX_PATH_LEN];
-            if (!dir_has_instruments(full_path, sfz_dir, sizeof(sfz_dir))) continue;
-
-            if (inst->instrument_count >= MAX_INSTRUMENTS) {
-                plugin_log("Instrument list full, skipping extras");
-                break;
-            }
-
-            instrument_entry_t *instr = &inst->instruments[inst->instrument_count];
-            strncpy(instr->path, sfz_dir, sizeof(instr->path) - 1);
+            /* Folder = one instrument; variants found later by recursive scan. */
+            strncpy(instr->path, full_path, sizeof(instr->path) - 1);
             instr->path[sizeof(instr->path) - 1] = '\0';
             strncpy(instr->root, full_path, sizeof(instr->root) - 1);
             instr->root[sizeof(instr->root) - 1] = '\0';
             strncpy(instr->name, entry->d_name, sizeof(instr->name) - 1);
             instr->name[sizeof(instr->name) - 1] = '\0';
-            instr->sfz_file[0] = '\0';  /* Folder-based instrument */
-            inst->last_variant[inst->instrument_count] = 0;
-            inst->instrument_count++;
-        } else {
-            /* Loose file: check if it's a supported instrument */
+            instr->sfz_file[0] = '\0';
+        } else if (S_ISREG(st.st_mode)) {
             const char *ext = strrchr(entry->d_name, '.');
             if (!ext || !is_supported_instrument(ext)) continue;
 
-            if (inst->instrument_count >= MAX_INSTRUMENTS) {
-                plugin_log("Instrument list full, skipping extras");
-                break;
-            }
-
-            instrument_entry_t *instr = &inst->instruments[inst->instrument_count];
-            /* Path and root both point to instruments/ dir for sample resolution */
+            /* Loose file: 1 instrument, 1 variant (itself). */
             strncpy(instr->path, dir_path, sizeof(instr->path) - 1);
             instr->path[sizeof(instr->path) - 1] = '\0';
             strncpy(instr->root, dir_path, sizeof(instr->root) - 1);
             instr->root[sizeof(instr->root) - 1] = '\0';
-            /* Name = filename without extension */
             int name_len = ext - entry->d_name;
             if (name_len >= MAX_NAME_LEN) name_len = MAX_NAME_LEN - 1;
-            strncpy(instr->name, entry->d_name, name_len);
+            memcpy(instr->name, entry->d_name, name_len);
             instr->name[name_len] = '\0';
-            /* Store full path to the .sfz file */
             strncpy(instr->sfz_file, full_path, sizeof(instr->sfz_file) - 1);
             instr->sfz_file[sizeof(instr->sfz_file) - 1] = '\0';
-            inst->last_variant[inst->instrument_count] = 0;
-            inst->instrument_count++;
+        } else {
+            continue;
         }
+
+        inst->last_variant[inst->instrument_count] = 0;
+        inst->instrument_count++;
     }
 
     closedir(dir);
@@ -305,41 +264,42 @@ static void add_variant_entry(sfz_instance_t *inst, const char *dir_path, const 
     v->name[name_len] = '\0';
 }
 
-/* Scan .sfz files within an instrument folder (these become variants).
- * Also checks one level of subdirectories for instruments with nested structures. */
-static void scan_variants(sfz_instance_t *inst, const char *instrument_path) {
-    inst->variant_count = 0;
+/* Recursively gather .sfz/.dspreset files under instrument_path. */
+static void collect_variants(sfz_instance_t *inst, const char *path, int depth) {
+    if (depth > VARIANT_MAX_DEPTH) return;
+    if (inst->variant_count >= MAX_VARIANTS) return;
 
-    DIR *dir = opendir(instrument_path);
+    DIR *dir = opendir(path);
     if (!dir) return;
 
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_name[0] == '.') continue;
+        if (inst->variant_count >= MAX_VARIANTS) break;
 
-        const char *ext = strrchr(entry->d_name, '.');
-        if (ext && is_supported_instrument(ext)) {
-            add_variant_entry(inst, instrument_path, entry->d_name);
-        } else {
-            /* Check subdirectories for more SFZ files */
-            char sub_path[MAX_PATH_LEN];
-            snprintf(sub_path, sizeof(sub_path), "%s/%s", instrument_path, entry->d_name);
-            struct stat st;
-            if (stat(sub_path, &st) == 0 && S_ISDIR(st.st_mode)) {
-                DIR *subdir = opendir(sub_path);
-                if (subdir) {
-                    struct dirent *sub_entry;
-                    while ((sub_entry = readdir(subdir)) != NULL) {
-                        if (sub_entry->d_name[0] == '.') continue;
-                        add_variant_entry(inst, sub_path, sub_entry->d_name);
-                    }
-                    closedir(subdir);
-                }
-            }
+        char child[MAX_PATH_LEN];
+        snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
+
+        struct stat st;
+        if (stat(child, &st) != 0) continue;
+
+        if (S_ISDIR(st.st_mode)) {
+            collect_variants(inst, child, depth + 1);
+        } else if (S_ISREG(st.st_mode)) {
+            const char *ext = strrchr(entry->d_name, '.');
+            if (ext && is_supported_instrument(ext) &&
+                !is_temp_converted_sfz(entry->d_name))
+                add_variant_entry(inst, path, entry->d_name);
         }
     }
 
     closedir(dir);
+}
+
+/* Scan an instrument folder for variants (recursive, up to 5 levels). */
+static void scan_variants(sfz_instance_t *inst, const char *instrument_path) {
+    inst->variant_count = 0;
+    collect_variants(inst, instrument_path, 0);
 
     if (inst->variant_count > 1) {
         qsort(inst->variants, inst->variant_count,
@@ -400,21 +360,306 @@ static int try_load_with_root(sfz_instance_t *inst, const char *path,
 }
 
 /* Simple XML attribute parser helper.
- * Finds attr="value" in a tag string, handling missing spaces between attrs.
+ * Finds attr="value" in a tag string. Tolerates whitespace around the `=` and
+ * matches the attribute name as a token (preceded by whitespace or `<`) so
+ * `tuning=` doesn't accidentally hit `groupTuning=`.
  * Returns value in out_val (null-terminated), or empty string if not found. */
 static void xml_get_attr(const char *tag, const char *attr_name, char *out_val, int max_len) {
     out_val[0] = '\0';
-    char search[64];
-    snprintf(search, sizeof(search), "%s=\"", attr_name);
-    const char *pos = strstr(tag, search);
-    if (!pos) return;
-    pos += strlen(search);
-    const char *end = strchr(pos, '"');
-    if (!end) return;
-    int len = end - pos;
-    if (len >= max_len) len = max_len - 1;
-    memcpy(out_val, pos, len);
-    out_val[len] = '\0';
+    int name_len = (int)strlen(attr_name);
+    const char *p = tag;
+    while ((p = strstr(p, attr_name)) != NULL) {
+        /* Must be at a token boundary: preceded by whitespace or '<'. */
+        if (p > tag) {
+            char prev = *(p - 1);
+            if (prev != ' ' && prev != '\t' && prev != '\n' && prev != '\r' && prev != '<') {
+                p += name_len;
+                continue;
+            }
+        }
+        const char *q = p + name_len;
+        while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+        if (*q != '=') { p += name_len; continue; }
+        q++;
+        while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+        if (*q != '"') { p += name_len; continue; }
+        q++;
+        const char *end = strchr(q, '"');
+        if (!end) return;
+        int len = (int)(end - q);
+        if (len >= max_len) len = max_len - 1;
+        memcpy(out_val, q, len);
+        out_val[len] = '\0';
+        return;
+    }
+}
+
+/* DecentSampler effect descriptor, indexed by `position` from the dspreset. */
+#define DS_MAX_FX 8
+typedef struct {
+    char type[32];
+    char freq[32];        /* lowpass: frequency */
+    char resonance[32];   /* lowpass: resonance */
+    char wet_level[32];   /* reverb/delay: wetLevel */
+    char room_size[32];   /* reverb: roomSize */
+    char damping[32];     /* reverb: damping */
+    char level[32];       /* gain: level (dB) */
+} ds_effect_t;
+
+/* Pre-scan <effects> block. Returns number of effects parsed. */
+static int parse_effects(const char *src, ds_effect_t fx[DS_MAX_FX]) {
+    int count = 0;
+    const char *p = strstr(src, "<effects");
+    if (!p) return 0;
+    const char *end = strstr(p, "</effects>");
+    if (!end) end = src + strlen(src);
+
+    p = strstr(p, "<effect ");
+    while (p && p < end && count < DS_MAX_FX) {
+        const char *tag_end = strchr(p, '>');
+        if (!tag_end || tag_end > end) break;
+        char tag[512];
+        int tlen = (int)(tag_end - p);
+        if (tlen > 511) tlen = 511;
+        memcpy(tag, p, tlen);
+        tag[tlen] = '\0';
+
+        ds_effect_t *f = &fx[count++];
+        memset(f, 0, sizeof(*f));
+        xml_get_attr(tag, "type", f->type, sizeof(f->type));
+        xml_get_attr(tag, "frequency", f->freq, sizeof(f->freq));
+        xml_get_attr(tag, "resonance", f->resonance, sizeof(f->resonance));
+        xml_get_attr(tag, "wetLevel", f->wet_level, sizeof(f->wet_level));
+        xml_get_attr(tag, "roomSize", f->room_size, sizeof(f->room_size));
+        xml_get_attr(tag, "damping", f->damping, sizeof(f->damping));
+        xml_get_attr(tag, "level", f->level, sizeof(f->level));
+
+        p = tag_end + 1;
+        p = strstr(p, "<effect ");
+    }
+    return count;
+}
+
+/* Compute the effective parameter value from a UI control + its <binding>.
+ *
+ * DS computes:
+ *   1. clamp ctrl `value` to [ctrl.minValue, ctrl.maxValue]
+ *   2. if binding has translation="linear" with translationOutputMin/Max,
+ *      remap the clamped value linearly to the output range.
+ *   3. multiply by binding's `factor` if present.
+ *
+ * Returns 1 on success and writes the result into `out` as a string. */
+static int compute_binding_value(const char *ctrl_tag, const char *bind_tag,
+                                 char *out, int out_len) {
+    char ctrl_value[64], cmin[64], cmax[64];
+    xml_get_attr(ctrl_tag, "value",    ctrl_value, sizeof(ctrl_value));
+    xml_get_attr(ctrl_tag, "minValue", cmin,       sizeof(cmin));
+    xml_get_attr(ctrl_tag, "maxValue", cmax,       sizeof(cmax));
+    if (!ctrl_value[0]) return 0;
+
+    double v = atof(ctrl_value);
+    double minv = cmin[0] ? atof(cmin) : 0.0;
+    double maxv = cmax[0] ? atof(cmax) : 1.0;
+    if (maxv < minv) { double t = maxv; maxv = minv; minv = t; }
+    if (v < minv) v = minv;
+    if (v > maxv) v = maxv;
+
+    char trans[32], omin[64], omax[64], factor[64];
+    xml_get_attr(bind_tag, "translation",          trans,  sizeof(trans));
+    xml_get_attr(bind_tag, "translationOutputMin", omin,   sizeof(omin));
+    xml_get_attr(bind_tag, "translationOutputMax", omax,   sizeof(omax));
+    xml_get_attr(bind_tag, "factor",               factor, sizeof(factor));
+
+    if (strcmp(trans, "linear") == 0 && omin[0] && omax[0]) {
+        double range = (maxv - minv);
+        double t = range != 0.0 ? (v - minv) / range : 0.0;
+        double oMin = atof(omin), oMax = atof(omax);
+        v = oMin + t * (oMax - oMin);
+    } else if (strcmp(trans, "table") == 0) {
+        /* translationTable="k1,v1;k2,v2;..." — DS normalizes ctrl value to
+         * [0,1] across [minValue,maxValue], then maps via the table whose
+         * keys are scaled by their own max. */
+        char tbl[1024];
+        xml_get_attr(bind_tag, "translationTable", tbl, sizeof(tbl));
+        if (tbl[0]) {
+            double keys[64], vals[64];
+            int n = 0;
+            const char *q = tbl;
+            while (*q && n < 64) {
+                while (*q == ' ' || *q == '\t') q++;
+                keys[n] = atof(q);
+                const char *comma = strchr(q, ',');
+                if (!comma) break;
+                vals[n] = atof(comma + 1);
+                n++;
+                const char *semi = strchr(comma, ';');
+                if (!semi) break;
+                q = semi + 1;
+            }
+            if (n >= 2) {
+                double max_key = keys[n - 1];
+                double t = (maxv != minv) ? (v - minv) / (maxv - minv) : 0.0;
+                if (t < 0) t = 0; if (t > 1) t = 1;
+                double st = t * max_key;
+                if (st <= keys[0]) {
+                    v = vals[0];
+                } else if (st >= keys[n - 1]) {
+                    v = vals[n - 1];
+                } else {
+                    int i = 0;
+                    while (i < n - 1 && st > keys[i + 1]) i++;
+                    double span = keys[i + 1] - keys[i];
+                    double seg_t = span != 0.0 ? (st - keys[i]) / span : 0.0;
+                    v = vals[i] + seg_t * (vals[i + 1] - vals[i]);
+                }
+            }
+        }
+    }
+    if (factor[0])
+        v *= atof(factor);
+
+    snprintf(out, out_len, "%g", v);
+    return 1;
+}
+
+/* Walk <ui> controls and apply their initial `value=` to the effect that
+ * their <binding parameter="..."> targets. Also captures ENV_* overrides. */
+static void apply_ui_overrides(const char *src,
+                               ds_effect_t fx[DS_MAX_FX], int fx_count,
+                               char env_attack[32], char env_decay[32],
+                               char env_sustain[32], char env_release[32]) {
+    /* Some dspresets are sloppy about pairing tags (e.g. ASIMOV opens
+     * `<labeled-knob>` and closes with `</control>`), so when looking for the
+     * end of a control we accept whichever closing tag comes first. */
+    static const char *patterns[2] = { "<control", "<labeled-knob" };
+
+    for (int pi = 0; pi < 2; pi++) {
+        const char *p = src;
+        size_t pat_len = strlen(patterns[pi]);
+        while ((p = strstr(p, patterns[pi])) != NULL) {
+            /* Make sure next char is whitespace or '>' so we don't match
+             * `<controls>` or similar. */
+            char nxt = p[pat_len];
+            if (nxt != ' ' && nxt != '\t' && nxt != '\n' &&
+                nxt != '\r' && nxt != '>' && nxt != '/') {
+                p += pat_len;
+                continue;
+            }
+
+            const char *tag_end = strchr(p, '>');
+            if (!tag_end) break;
+
+            char ctrl_tag[1024];
+            int tlen = (int)(tag_end - p);
+            if (tlen > 1023) tlen = 1023;
+            memcpy(ctrl_tag, p, tlen);
+            ctrl_tag[tlen] = '\0';
+
+            /* Range to look for nested <binding>: from after this opening tag
+             * to the matching closing tag (or end of self-closed control). */
+            const char *bind_search_start = tag_end + 1;
+            const char *bind_search_end;
+            int self_closed = (tag_end > p && *(tag_end - 1) == '/');
+            if (self_closed) {
+                bind_search_end = tag_end;
+            } else {
+                /* Accept either `</control>` or `</labeled-knob>` as the
+                 * closer — see ASIMOV malformed XML note above. */
+                const char *c1 = strstr(bind_search_start, "</control>");
+                const char *c2 = strstr(bind_search_start, "</labeled-knob>");
+                if (c1 && c2)       bind_search_end = (c1 < c2) ? c1 : c2;
+                else if (c1)        bind_search_end = c1;
+                else if (c2)        bind_search_end = c2;
+                else {
+                    p = tag_end + 1;
+                    continue;
+                }
+            }
+
+            /* Advance past whichever closer matched (10 chars for `</control>`,
+             * 15 for `</labeled-knob>`). Detect by reading the closer ahead. */
+            int closer_skip = 0;
+            if (!self_closed) {
+                if (strncmp(bind_search_end, "</control>", 10) == 0)
+                    closer_skip = 10;
+                else if (strncmp(bind_search_end, "</labeled-knob>", 15) == 0)
+                    closer_skip = 15;
+            }
+
+            const char *binding = strstr(bind_search_start, "<binding");
+            if (!binding || binding > bind_search_end) {
+                p = self_closed ? (tag_end + 1) : (bind_search_end + closer_skip);
+                continue;
+            }
+
+            const char *bind_end = strchr(binding, '>');
+            if (!bind_end) {
+                p = bind_search_end;
+                continue;
+            }
+
+            char bind_tag[512];
+            int blen = (int)(bind_end - binding);
+            if (blen > 511) blen = 511;
+            memcpy(bind_tag, binding, blen);
+            bind_tag[blen] = '\0';
+
+            char param[64] = "", position_str[16] = "";
+            xml_get_attr(bind_tag, "parameter", param, sizeof(param));
+            xml_get_attr(bind_tag, "position",  position_str, sizeof(position_str));
+
+            char effective[64];
+            if (param[0] && compute_binding_value(ctrl_tag, bind_tag,
+                                                   effective, sizeof(effective))) {
+                int position = position_str[0] ? atoi(position_str) : 0;
+
+                if (strcmp(param, "ENV_ATTACK") == 0) {
+                    strncpy(env_attack, effective, 31);  env_attack[31] = '\0';
+                } else if (strcmp(param, "ENV_DECAY") == 0) {
+                    strncpy(env_decay, effective, 31);   env_decay[31]  = '\0';
+                } else if (strcmp(param, "ENV_SUSTAIN") == 0) {
+                    strncpy(env_sustain, effective, 31); env_sustain[31] = '\0';
+                } else if (strcmp(param, "ENV_RELEASE") == 0) {
+                    strncpy(env_release, effective, 31); env_release[31] = '\0';
+                } else if (position >= 0 && position < fx_count) {
+                    ds_effect_t *f = &fx[position];
+                    if (strcmp(param, "FX_FILTER_FREQUENCY") == 0) {
+                        strncpy(f->freq, effective, 31); f->freq[31] = '\0';
+                    } else if (strcmp(param, "FX_FILTER_RESONANCE") == 0) {
+                        strncpy(f->resonance, effective, 31); f->resonance[31] = '\0';
+                    } else if (strcmp(param, "FX_REVERB_WET_LEVEL") == 0) {
+                        strncpy(f->wet_level, effective, 31); f->wet_level[31] = '\0';
+                    } else if (strcmp(param, "FX_REVERB_ROOM_SIZE") == 0) {
+                        strncpy(f->room_size, effective, 31); f->room_size[31] = '\0';
+                    } else if (strcmp(param, "FX_REVERB_DAMPING") == 0) {
+                        strncpy(f->damping, effective, 31); f->damping[31] = '\0';
+                    }
+                }
+            }
+
+            p = self_closed ? (tag_end + 1) : (bind_search_end + closer_skip);
+        }
+    }
+}
+
+/* Count <group> tags whose seqMode="round_robin" so we can emit seq_length. */
+static int count_rr_groups(const char *src) {
+    int count = 0;
+    const char *p = src;
+    while ((p = strstr(p, "<group ")) != NULL) {
+        const char *tag_end = strchr(p, '>');
+        if (!tag_end) break;
+        char tag[1024];
+        int tlen = (int)(tag_end - p);
+        if (tlen > 1023) tlen = 1023;
+        memcpy(tag, p, tlen);
+        tag[tlen] = '\0';
+        char mode[32];
+        xml_get_attr(tag, "seqMode", mode, sizeof(mode));
+        if (strcmp(mode, "round_robin") == 0) count++;
+        p = tag_end + 1;
+    }
+    return count;
 }
 
 /* Convert a .dspreset file to SFZ text and write as a temp .sfz file.
@@ -489,8 +734,56 @@ static char *convert_dspreset_to_sfz(const char *path) {
     int pos = 0;
     char val[512];
 
-    /* Find <groups> attributes */
+    /* === Pre-scan: effects, UI overrides, round-robin === */
+    ds_effect_t fx[DS_MAX_FX] = {0};
+    int fx_count = parse_effects(src, fx);
+
+    char env_attack[32] = "", env_decay[32] = "";
+    char env_sustain[32] = "", env_release[32] = "";
+    apply_ui_overrides(src, fx, fx_count, env_attack, env_decay, env_sustain, env_release);
+
+    int rr_total = count_rr_groups(src);
+
+    /* Locate effects we care about (first match wins by DS convention). */
+    int reverb_idx = -1, lp_idx = -1, gain_idx = -1;
+    for (int i = 0; i < fx_count; i++) {
+        if (reverb_idx < 0 && strcmp(fx[i].type, "reverb") == 0) reverb_idx = i;
+        if (lp_idx < 0 && (strcmp(fx[i].type, "lowpass") == 0 ||
+                            strcmp(fx[i].type, "lowpass_4pl") == 0)) lp_idx = i;
+        if (gain_idx < 0 && strcmp(fx[i].type, "gain") == 0) gain_idx = i;
+    }
+
+    /* === Emit reverb effect block (sfizz fverb) ===
+     * fx1 bus is wet-only: dry stays on the main bus (regions output to main),
+     * and fx1 contributes only the reverb tail. This avoids stacking dry+dry
+     * which was causing clipping on polyphonic chords. */
+    if (reverb_idx >= 0) {
+        pos += snprintf(sfz + pos, size * 2 - pos,
+                        "<effect>\ntype=fverb\nbus=fx1\nreverb_dry=0\n");
+        if (fx[reverb_idx].wet_level[0]) {
+            float w = atof(fx[reverb_idx].wet_level) * 100.0f;
+            if (w < 0) w = 0; if (w > 100) w = 100;
+            pos += snprintf(sfz + pos, size * 2 - pos, "reverb_wet=%.1f\n", w);
+        } else {
+            pos += snprintf(sfz + pos, size * 2 - pos, "reverb_wet=50\n");
+        }
+        if (fx[reverb_idx].room_size[0]) {
+            float s = atof(fx[reverb_idx].room_size) * 100.0f;
+            if (s < 0) s = 0; if (s > 100) s = 100;
+            pos += snprintf(sfz + pos, size * 2 - pos, "reverb_size=%.1f\n", s);
+        }
+        if (fx[reverb_idx].damping[0]) {
+            float d = atof(fx[reverb_idx].damping) * 100.0f;
+            if (d < 0) d = 0; if (d > 100) d = 100;
+            pos += snprintf(sfz + pos, size * 2 - pos, "reverb_damp=%.1f\n", d);
+        }
+    }
+
+    /* === Emit <global> with combined defaults === */
     char *groups_tag = strstr(src, "<groups");
+    char wrapper_attack[64] = "", wrapper_decay[64] = "";
+    char wrapper_sustain[64] = "", wrapper_release[64] = "";
+    char wrapper_volume[64] = "", wrapper_loop[64] = "";
     if (groups_tag) {
         char *groups_end = strchr(groups_tag, '>');
         if (groups_end) {
@@ -499,12 +792,61 @@ static char *convert_dspreset_to_sfz(const char *path) {
             if (tlen >= (int)sizeof(tag_buf)) tlen = sizeof(tag_buf) - 1;
             memcpy(tag_buf, groups_tag, tlen);
             tag_buf[tlen] = '\0';
-
-            pos += snprintf(sfz + pos, size * 2 - pos, "<global>\n");
-            xml_get_attr(tag_buf, "volume", val, sizeof(val));
-            if (val[0]) pos += snprintf(sfz + pos, size * 2 - pos, "volume=%s\n", val);
+            xml_get_attr(tag_buf, "volume",      wrapper_volume,  sizeof(wrapper_volume));
+            xml_get_attr(tag_buf, "attack",      wrapper_attack,  sizeof(wrapper_attack));
+            xml_get_attr(tag_buf, "decay",       wrapper_decay,   sizeof(wrapper_decay));
+            xml_get_attr(tag_buf, "sustain",     wrapper_sustain, sizeof(wrapper_sustain));
+            xml_get_attr(tag_buf, "release",     wrapper_release, sizeof(wrapper_release));
+            xml_get_attr(tag_buf, "loopEnabled", wrapper_loop,    sizeof(wrapper_loop));
         }
     }
+
+    pos += snprintf(sfz + pos, size * 2 - pos, "<global>\n");
+
+    /* Volume: <groups volume=...> first, then add any gain effect (dB). */
+    if (wrapper_volume[0])
+        pos += snprintf(sfz + pos, size * 2 - pos, "volume=%s\n", wrapper_volume);
+    if (gain_idx >= 0 && fx[gain_idx].level[0])
+        pos += snprintf(sfz + pos, size * 2 - pos, "global_volume=%s\n", fx[gain_idx].level);
+
+    /* ADSR: prefer the explicit <groups> wrapper value (author's stated
+     * default), fall back to the UI knob's `value=` when no wrapper attr.
+     * Without runtime knob control on Move, the wrapper is usually closer
+     * to what the author intended the patch to sound like. */
+    const char *use_attack  = wrapper_attack[0]  ? wrapper_attack  : env_attack;
+    const char *use_decay   = wrapper_decay[0]   ? wrapper_decay   : env_decay;
+    const char *use_sustain = wrapper_sustain[0] ? wrapper_sustain : env_sustain;
+    const char *use_release = wrapper_release[0] ? wrapper_release : env_release;
+    if (use_attack[0])
+        pos += snprintf(sfz + pos, size * 2 - pos, "ampeg_attack=%s\n", use_attack);
+    if (use_decay[0])
+        pos += snprintf(sfz + pos, size * 2 - pos, "ampeg_decay=%s\n", use_decay);
+    if (use_sustain[0]) {
+        float s = atof(use_sustain) * 100.0f;
+        if (s < 0) s = 0; if (s > 100) s = 100;
+        pos += snprintf(sfz + pos, size * 2 - pos, "ampeg_sustain=%.1f\n", s);
+    }
+    if (use_release[0])
+        pos += snprintf(sfz + pos, size * 2 - pos, "ampeg_release=%s\n", use_release);
+    if (wrapper_loop[0])
+        pos += snprintf(sfz + pos, size * 2 - pos, "loop_mode=%s\n",
+                        strcmp(wrapper_loop, "true") == 0 ? "loop_continuous" : "no_loop");
+
+    /* Lowpass filter at <global> level. */
+    if (lp_idx >= 0) {
+        const char *fil_type = strcmp(fx[lp_idx].type, "lowpass_4pl") == 0
+                                 ? "lpf_4p" : "lpf_2p";
+        pos += snprintf(sfz + pos, size * 2 - pos, "fil_type=%s\n", fil_type);
+        if (fx[lp_idx].freq[0])
+            pos += snprintf(sfz + pos, size * 2 - pos, "cutoff=%s\n", fx[lp_idx].freq);
+        if (fx[lp_idx].resonance[0])
+            pos += snprintf(sfz + pos, size * 2 - pos, "resonance=%s\n",
+                            fx[lp_idx].resonance);
+    }
+
+    /* Reverb send: route 100% to fx1 — wet level is controlled by reverb_wet. */
+    if (reverb_idx >= 0)
+        pos += snprintf(sfz + pos, size * 2 - pos, "effect1=100\n");
 
     /* Find each <group> */
     char *scan = src;
@@ -536,6 +878,19 @@ static char *convert_dspreset_to_sfz(const char *path) {
         }
         xml_get_attr(tag_buf, "release", val, sizeof(val));
         if (val[0]) pos += snprintf(sfz + pos, size * 2 - pos, "ampeg_release=%s\n", val);
+
+        /* Round-robin: emit seq_position/seq_length so sfizz cycles between
+         * sibling RR groups (Frozen Glock and similar). */
+        xml_get_attr(tag_buf, "seqMode", val, sizeof(val));
+        if (strcmp(val, "round_robin") == 0 && rr_total > 0) {
+            char rr_pos[16];
+            xml_get_attr(tag_buf, "seqPosition", rr_pos, sizeof(rr_pos));
+            if (rr_pos[0]) {
+                pos += snprintf(sfz + pos, size * 2 - pos,
+                                "seq_length=%d\nseq_position=%s\n",
+                                rr_total, rr_pos);
+            }
+        }
 
         /* Find <sample> tags within this group */
         char *sample_scan = tag_end;
@@ -575,7 +930,11 @@ static char *convert_dspreset_to_sfz(const char *path) {
             if (val[0]) pos += snprintf(sfz + pos, size * 2 - pos, "pitch_keycenter=%s\n", val);
 
             xml_get_attr(stag_buf, "path", val, sizeof(val));
-            if (val[0]) pos += snprintf(sfz + pos, size * 2 - pos, "sample=%s\n", val);
+            if (val[0]) {
+                /* Normalize Windows backslashes (Raw Violin uses Samples\foo.wav). */
+                for (char *p = val; *p; p++) if (*p == '\\') *p = '/';
+                pos += snprintf(sfz + pos, size * 2 - pos, "sample=%s\n", val);
+            }
             xml_get_attr(stag_buf, "loNote", val, sizeof(val));
             if (val[0]) pos += snprintf(sfz + pos, size * 2 - pos, "lokey=%s\n", val);
             xml_get_attr(stag_buf, "hiNote", val, sizeof(val));
@@ -764,8 +1123,20 @@ static void select_variant(sfz_instance_t *inst, int index) {
         inst->last_variant[inst->current_instrument] = index;
     }
 
-    const char *root = inst->instruments[inst->current_instrument].root;
-    load_sfz_file(inst, inst->variants[index].path, root);
+    /* Per-variant root so samples resolve relative to the variant's folder. */
+    char variant_root[MAX_PATH_LEN];
+    strncpy(variant_root, inst->variants[index].path, sizeof(variant_root) - 1);
+    variant_root[sizeof(variant_root) - 1] = '\0';
+    char *slash = strrchr(variant_root, '/');
+    if (slash) {
+        *slash = '\0';
+    } else {
+        strncpy(variant_root,
+                inst->instruments[inst->current_instrument].root,
+                sizeof(variant_root) - 1);
+        variant_root[sizeof(variant_root) - 1] = '\0';
+    }
+    load_sfz_file(inst, inst->variants[index].path, variant_root);
 
     char msg[128];
     snprintf(msg, sizeof(msg), "Variant %d: %s", index, inst->variant_name);
@@ -802,7 +1173,17 @@ static void do_load_instrument(sfz_instance_t *inst) {
             inst->current_variant = variant_idx;
             strncpy(inst->variant_name, inst->variants[variant_idx].name,
                     sizeof(inst->variant_name) - 1);
-            load_sfz_file(inst, inst->variants[variant_idx].path, instr->root);
+            /* Use the variant's own folder as root so samples resolve relative
+             * to where the .sfz/.dspreset lives (matters for nested layouts
+             * like K4Coll-1.01/K4-Acoustic/...). */
+            char variant_root[MAX_PATH_LEN];
+            strncpy(variant_root, inst->variants[variant_idx].path,
+                    sizeof(variant_root) - 1);
+            variant_root[sizeof(variant_root) - 1] = '\0';
+            char *slash = strrchr(variant_root, '/');
+            if (slash) *slash = '\0';
+            else strncpy(variant_root, instr->root, sizeof(variant_root) - 1);
+            load_sfz_file(inst, inst->variants[variant_idx].path, variant_root);
         } else {
             inst->current_variant = 0;
             strcpy(inst->variant_name, "No variants");
@@ -815,6 +1196,37 @@ static void do_load_instrument(sfz_instance_t *inst) {
     plugin_log(msg);
 }
 
+/* Refresh the variant list for the current instrument without loading any
+ * sample data. Called eagerly so variant_list UI lookups don't see stale
+ * entries from the previous instrument. */
+static void refresh_variants_for_current(sfz_instance_t *inst) {
+    int idx = inst->current_instrument;
+    if (idx < 0 || idx >= inst->instrument_count) return;
+    instrument_entry_t *instr = &inst->instruments[idx];
+
+    if (instr->sfz_file[0]) {
+        inst->variant_count = 1;
+        variant_entry_t *v = &inst->variants[0];
+        strncpy(v->path, instr->sfz_file, sizeof(v->path) - 1);
+        v->path[sizeof(v->path) - 1] = '\0';
+        strncpy(v->name, instr->name, sizeof(v->name) - 1);
+        v->name[sizeof(v->name) - 1] = '\0';
+    } else {
+        scan_variants(inst, instr->path);
+    }
+
+    int vi = inst->last_variant[idx];
+    if (vi < 0 || vi >= inst->variant_count) vi = 0;
+    inst->current_variant = vi;
+    if (inst->variant_count > 0) {
+        strncpy(inst->variant_name, inst->variants[vi].name,
+                sizeof(inst->variant_name) - 1);
+        inst->variant_name[sizeof(inst->variant_name) - 1] = '\0';
+    } else {
+        strcpy(inst->variant_name, "No variants");
+    }
+}
+
 /* Switch to an instrument folder (deferred load with debounce) */
 static void set_instrument_index(sfz_instance_t *inst, int index) {
     if (inst->instrument_count <= 0) return;
@@ -825,6 +1237,10 @@ static void set_instrument_index(sfz_instance_t *inst, int index) {
     inst->current_instrument = index;
     strncpy(inst->instrument_name, inst->instruments[index].name,
             sizeof(inst->instrument_name) - 1);
+
+    /* Refresh variants synchronously so the menu reflects the new instrument
+     * even before the debounced sample load completes. */
+    refresh_variants_for_current(inst);
 
     /* Silence current notes */
     sfizz_all_sound_off(inst->synth);

@@ -26,10 +26,22 @@ src/
 
 ## Instrument Organization
 
-- `instruments/` directory contains instrument folders
-- Each folder = one instrument (folder name = display name)
-- Multiple .sfz files within a folder = presets
-- Shift+L/R switches instruments, preset nav switches .sfz files
+- Each top-level entry in `instruments/` becomes one instrument:
+  - A folder = one instrument named after the folder. Variants are all
+    `.sfz` / `.dspreset` files found anywhere inside (recursive, up to 5 levels).
+  - A loose `.sfz` / `.dspreset` file at the top of `instruments/` = one
+    instrument with one variant.
+- Examples:
+  - `Cosmos/COSMOS.dspreset` → instrument "Cosmos", variant "COSMOS"
+  - `Raw Violin/{Pad,Granular Pad,Harmonic Pad,Raw Violin}.dspreset` →
+    instrument "Raw Violin", 4 variants
+  - `K4Coll-1.01/K4-Acoustic/K4-Acoustic.dspreset` (and ~60 sibling folders)
+    → instrument "K4Coll-1.01", 60 variants
+  - `DS - The Synths/DS_The Synths/*.dspreset` → instrument "DS - The Synths",
+    45 variants
+- Shift+L/R switches instruments; preset nav switches variants. Each variant
+  loads with its own folder as the sample-resolution root (so nested layouts
+  like K4Coll work).
 
 ## DSP Plugin API
 

@@ -62,42 +62,46 @@ static const host_api_v1_t *g_host = NULL;
 
 /* Constants */
 #define MAX_INSTRUMENTS 512
-#define MAX_VARIANTS 256
+#define MAX_PRESETS 1024
 #define MAX_PATH_LEN 512
 #define MAX_NAME_LEN 128
-/* ~150ms debounce at 48kHz/128 frames per block */
+/* ~150ms debounce at 44.1kHz/128 frames per block */
 #define DEBOUNCE_BLOCKS 56
 
 typedef struct {
-    char path[MAX_PATH_LEN];    /* Path where .sfz files live (may be subdir) */
-    char root[MAX_PATH_LEN];    /* Instrument root folder (for sample fallback) */
-    char name[MAX_NAME_LEN];    /* Folder display name */
-    char sfz_file[MAX_PATH_LEN]; /* If non-empty: single loose .sfz file (no folder) */
+    char name[MAX_NAME_LEN];        /* Display name (top-level folder/file name) */
+    char root[MAX_PATH_LEN];        /* Top-level folder path (for sample-resolution fallback) */
+    int first_preset;               /* First index in presets[] (-1 if empty) */
+    int preset_count;               /* How many presets belong to this instrument */
 } instrument_entry_t;
 
 typedef struct {
-    char path[MAX_PATH_LEN];    /* Full path to .sfz file */
-    char name[MAX_NAME_LEN];    /* Display name (filename without .sfz) */
-} variant_entry_t;
+    char path[MAX_PATH_LEN];        /* Full path to .sfz/.dspreset file */
+    char name[MAX_NAME_LEN];        /* Display name (filename without ext) */
+    int instrument_idx;             /* Index into instruments[] */
+} preset_entry_t;
 
 /* Per-Instance State */
 typedef struct {
     sfizz_synth_t *synth;
-    int current_instrument;
-    int current_variant;
+    int current_preset;             /* Flat index into presets[] */
     int instrument_count;
-    int variant_count;
+    int preset_count;
     int octave_transpose;
     float gain;
     instrument_entry_t instruments[MAX_INSTRUMENTS];
-    variant_entry_t variants[MAX_VARIANTS];
-    int last_variant[MAX_INSTRUMENTS];  /* Remember last variant per instrument */
-    char instrument_name[MAX_NAME_LEN];
-    char variant_name[MAX_NAME_LEN];
+    preset_entry_t presets[MAX_PRESETS];
+    char preset_name[MAX_NAME_LEN];
+    char instrument_name[MAX_NAME_LEN];     /* Cached: current preset's parent */
     char module_dir[MAX_PATH_LEN];
     char load_error[256];
-    int debounce_remaining;      /* Blocks remaining before loading */
-    int pending_load;            /* 1 if a deferred load is pending */
+    int debounce_remaining;         /* Blocks remaining before loading */
+    int pending_load;               /* 1 if a deferred load is pending */
+    int suppress_next_preset_set;   /* Workaround for shared UI's setBank
+                                     * which calls set_param('preset', 0)
+                                     * immediately after set_param('bank', N).
+                                     * We set the flag in the bank handler
+                                     * and consume it in the preset handler. */
     float *left_buf;
     float *right_buf;
 } sfz_instance_t;
@@ -157,117 +161,36 @@ static int is_temp_converted_sfz(const char *filename) {
     return flen >= slen && strcasecmp(filename + flen - slen, suffix) == 0;
 }
 
-/* Sort helpers */
-static int instrument_entry_cmp(const void *a, const void *b) {
-    const instrument_entry_t *ia = (const instrument_entry_t *)a;
-    const instrument_entry_t *ib = (const instrument_entry_t *)b;
-    return strcasecmp(ia->name, ib->name);
-}
+#define SCAN_MAX_DEPTH 5
 
-static int variant_entry_cmp(const void *a, const void *b) {
-    const variant_entry_t *pa = (const variant_entry_t *)a;
-    const variant_entry_t *pb = (const variant_entry_t *)b;
+/* Sort helper for the per-instrument slice of presets[]. */
+static int preset_entry_cmp(const void *a, const void *b) {
+    const preset_entry_t *pa = (const preset_entry_t *)a;
+    const preset_entry_t *pb = (const preset_entry_t *)b;
     return strcasecmp(pa->name, pb->name);
 }
 
-#define VARIANT_MAX_DEPTH 5
-
-/* Scan instruments/ for top-level entries. Each folder or loose .sfz/.dspreset
- * file becomes one instrument. Variants inside folder instruments are
- * discovered later (recursively) by scan_variants. */
-static void scan_instruments(sfz_instance_t *inst, const char *module_dir) {
-    char dir_path[MAX_PATH_LEN];
-    snprintf(dir_path, sizeof(dir_path), "%s/instruments", module_dir);
-
-    inst->instrument_count = 0;
-
-    DIR *dir = opendir(dir_path);
-    if (!dir) {
-        plugin_log("No instruments/ directory found");
-        return;
-    }
-
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_name[0] == '.') continue;
-        if (inst->instrument_count >= MAX_INSTRUMENTS) {
-            plugin_log("Instrument list full, skipping extras");
-            break;
-        }
-
-        char full_path[MAX_PATH_LEN];
-        snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, entry->d_name);
-
-        struct stat st;
-        if (stat(full_path, &st) != 0) continue;
-
-        instrument_entry_t *instr = &inst->instruments[inst->instrument_count];
-
-        if (S_ISDIR(st.st_mode)) {
-            /* Folder = one instrument; variants found later by recursive scan. */
-            strncpy(instr->path, full_path, sizeof(instr->path) - 1);
-            instr->path[sizeof(instr->path) - 1] = '\0';
-            strncpy(instr->root, full_path, sizeof(instr->root) - 1);
-            instr->root[sizeof(instr->root) - 1] = '\0';
-            strncpy(instr->name, entry->d_name, sizeof(instr->name) - 1);
-            instr->name[sizeof(instr->name) - 1] = '\0';
-            instr->sfz_file[0] = '\0';
-        } else if (S_ISREG(st.st_mode)) {
-            const char *ext = strrchr(entry->d_name, '.');
-            if (!ext || !is_supported_instrument(ext)) continue;
-
-            /* Loose file: 1 instrument, 1 variant (itself). */
-            strncpy(instr->path, dir_path, sizeof(instr->path) - 1);
-            instr->path[sizeof(instr->path) - 1] = '\0';
-            strncpy(instr->root, dir_path, sizeof(instr->root) - 1);
-            instr->root[sizeof(instr->root) - 1] = '\0';
-            int name_len = ext - entry->d_name;
-            if (name_len >= MAX_NAME_LEN) name_len = MAX_NAME_LEN - 1;
-            memcpy(instr->name, entry->d_name, name_len);
-            instr->name[name_len] = '\0';
-            strncpy(instr->sfz_file, full_path, sizeof(instr->sfz_file) - 1);
-            instr->sfz_file[sizeof(instr->sfz_file) - 1] = '\0';
-        } else {
-            continue;
-        }
-
-        inst->last_variant[inst->instrument_count] = 0;
-        inst->instrument_count++;
-    }
-
-    closedir(dir);
-
-    if (inst->instrument_count > 1) {
-        qsort(inst->instruments, inst->instrument_count,
-              sizeof(instrument_entry_t), instrument_entry_cmp);
-    }
-
-    char msg[128];
-    snprintf(msg, sizeof(msg), "Found %d instruments", inst->instrument_count);
-    plugin_log(msg);
-}
-
-/* Add a single variant entry from a file path */
-static void add_variant_entry(sfz_instance_t *inst, const char *dir_path, const char *filename) {
-    if (inst->variant_count >= MAX_VARIANTS) return;
-
+/* Append one preset_entry. */
+static void add_preset(sfz_instance_t *inst, const char *dir_path,
+                       const char *filename, int instrument_idx) {
+    if (inst->preset_count >= MAX_PRESETS) return;
     const char *ext = strrchr(filename, '.');
-    if (!ext || !is_supported_instrument(ext)) return;
-
-    variant_entry_t *v = &inst->variants[inst->variant_count++];
-    snprintf(v->path, sizeof(v->path), "%s/%s", dir_path, filename);
-
-    /* Display name = filename without extension */
-    int name_len = ext - filename;
-    if (name_len >= MAX_NAME_LEN) name_len = MAX_NAME_LEN - 1;
-    strncpy(v->name, filename, name_len);
-    v->name[name_len] = '\0';
+    if (!ext) return;
+    preset_entry_t *p = &inst->presets[inst->preset_count++];
+    snprintf(p->path, sizeof(p->path), "%s/%s", dir_path, filename);
+    int nlen = (int)(ext - filename);
+    if (nlen >= MAX_NAME_LEN) nlen = MAX_NAME_LEN - 1;
+    memcpy(p->name, filename, nlen);
+    p->name[nlen] = '\0';
+    p->instrument_idx = instrument_idx;
 }
 
-/* Recursively gather .sfz/.dspreset files under instrument_path. */
-static void collect_variants(sfz_instance_t *inst, const char *path, int depth) {
-    if (depth > VARIANT_MAX_DEPTH) return;
-    if (inst->variant_count >= MAX_VARIANTS) return;
+/* Walk a folder recursively, appending all .sfz/.dspreset files as presets
+ * belonging to the given instrument index. */
+static void collect_presets(sfz_instance_t *inst, const char *path,
+                            int instrument_idx, int depth) {
+    if (depth > SCAN_MAX_DEPTH) return;
+    if (inst->preset_count >= MAX_PRESETS) return;
 
     DIR *dir = opendir(path);
     if (!dir) return;
@@ -275,7 +198,7 @@ static void collect_variants(sfz_instance_t *inst, const char *path, int depth) 
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_name[0] == '.') continue;
-        if (inst->variant_count >= MAX_VARIANTS) break;
+        if (inst->preset_count >= MAX_PRESETS) break;
 
         char child[MAX_PATH_LEN];
         snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
@@ -284,30 +207,131 @@ static void collect_variants(sfz_instance_t *inst, const char *path, int depth) 
         if (stat(child, &st) != 0) continue;
 
         if (S_ISDIR(st.st_mode)) {
-            collect_variants(inst, child, depth + 1);
+            collect_presets(inst, child, instrument_idx, depth + 1);
         } else if (S_ISREG(st.st_mode)) {
             const char *ext = strrchr(entry->d_name, '.');
             if (ext && is_supported_instrument(ext) &&
                 !is_temp_converted_sfz(entry->d_name))
-                add_variant_entry(inst, path, entry->d_name);
+                add_preset(inst, path, entry->d_name, instrument_idx);
         }
     }
 
     closedir(dir);
 }
 
-/* Scan an instrument folder for variants (recursive, up to 5 levels). */
-static void scan_variants(sfz_instance_t *inst, const char *instrument_path) {
-    inst->variant_count = 0;
-    collect_variants(inst, instrument_path, 0);
+/* Scan instruments/ and build a flat preset list across all instruments.
+ * Each top-level entry (folder or loose file) becomes one instrument; every
+ * .sfz/.dspreset inside is a preset belonging to that instrument. */
+static void scan_instruments(sfz_instance_t *inst, const char *module_dir) {
+    char dir_path[MAX_PATH_LEN];
+    snprintf(dir_path, sizeof(dir_path), "%s/instruments", module_dir);
 
-    if (inst->variant_count > 1) {
-        qsort(inst->variants, inst->variant_count,
-              sizeof(variant_entry_t), variant_entry_cmp);
+    inst->instrument_count = 0;
+    inst->preset_count = 0;
+
+    DIR *dir = opendir(dir_path);
+    if (!dir) {
+        plugin_log("No instruments/ directory found");
+        return;
+    }
+
+    /* Pass 1: collect top-level instrument names, sort alphabetically. */
+    typedef struct {
+        char name[MAX_NAME_LEN];
+        char full_path[MAX_PATH_LEN];
+        int is_dir;       /* 1 = folder instrument, 0 = loose file */
+        char filename[MAX_NAME_LEN];   /* for loose files */
+    } scan_entry_t;
+    static scan_entry_t entries[MAX_INSTRUMENTS];
+    int entry_count = 0;
+
+    struct dirent *de;
+    while ((de = readdir(dir)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        if (entry_count >= MAX_INSTRUMENTS) {
+            plugin_log("Instrument list full, skipping extras");
+            break;
+        }
+        char full_path[MAX_PATH_LEN];
+        snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, de->d_name);
+        struct stat st;
+        if (stat(full_path, &st) != 0) continue;
+
+        scan_entry_t *e = &entries[entry_count];
+        if (S_ISDIR(st.st_mode)) {
+            e->is_dir = 1;
+            strncpy(e->name, de->d_name, MAX_NAME_LEN - 1);
+            e->name[MAX_NAME_LEN - 1] = '\0';
+            strncpy(e->full_path, full_path, MAX_PATH_LEN - 1);
+            e->full_path[MAX_PATH_LEN - 1] = '\0';
+            entry_count++;
+        } else if (S_ISREG(st.st_mode)) {
+            const char *ext = strrchr(de->d_name, '.');
+            if (!ext || !is_supported_instrument(ext)) continue;
+            if (is_temp_converted_sfz(de->d_name)) continue;
+            e->is_dir = 0;
+            int nlen = (int)(ext - de->d_name);
+            if (nlen >= MAX_NAME_LEN) nlen = MAX_NAME_LEN - 1;
+            memcpy(e->name, de->d_name, nlen);
+            e->name[nlen] = '\0';
+            strncpy(e->full_path, dir_path, MAX_PATH_LEN - 1);
+            e->full_path[MAX_PATH_LEN - 1] = '\0';
+            strncpy(e->filename, de->d_name, MAX_NAME_LEN - 1);
+            e->filename[MAX_NAME_LEN - 1] = '\0';
+            entry_count++;
+        }
+    }
+    closedir(dir);
+
+    /* Sort top-level entries alphabetically. */
+    for (int i = 0; i < entry_count - 1; i++) {
+        for (int j = 0; j < entry_count - 1 - i; j++) {
+            if (strcasecmp(entries[j].name, entries[j + 1].name) > 0) {
+                scan_entry_t t = entries[j];
+                entries[j] = entries[j + 1];
+                entries[j + 1] = t;
+            }
+        }
+    }
+
+    /* Pass 2: for each entry, register the instrument and collect its presets. */
+    for (int i = 0; i < entry_count; i++) {
+        if (inst->instrument_count >= MAX_INSTRUMENTS) break;
+        scan_entry_t *e = &entries[i];
+
+        int idx = inst->instrument_count;
+        instrument_entry_t *instr = &inst->instruments[idx];
+        strncpy(instr->name, e->name, MAX_NAME_LEN - 1);
+        instr->name[MAX_NAME_LEN - 1] = '\0';
+        strncpy(instr->root, e->full_path, MAX_PATH_LEN - 1);
+        instr->root[MAX_PATH_LEN - 1] = '\0';
+        instr->first_preset = inst->preset_count;
+        int presets_before = inst->preset_count;
+
+        if (e->is_dir) {
+            collect_presets(inst, e->full_path, idx, 0);
+            /* Sort just this instrument's slice of the flat list. */
+            int n = inst->preset_count - presets_before;
+            if (n > 1) {
+                qsort(&inst->presets[presets_before], n,
+                      sizeof(preset_entry_t), preset_entry_cmp);
+            }
+        } else {
+            add_preset(inst, e->full_path, e->filename, idx);
+        }
+
+        instr->preset_count = inst->preset_count - presets_before;
+        if (instr->preset_count == 0) {
+            instr->first_preset = -1;
+            /* Drop empty instruments — happens for folders with no .sfz/.dspreset. */
+            continue;
+        }
+        inst->instrument_count++;
     }
 
     char msg[128];
-    snprintf(msg, sizeof(msg), "Found %d variants in instrument", inst->variant_count);
+    snprintf(msg, sizeof(msg), "Found %d instruments, %d presets total",
+             inst->instrument_count, inst->preset_count);
     plugin_log(msg);
 }
 
@@ -440,26 +464,13 @@ static int parse_effects(const char *src, ds_effect_t fx[DS_MAX_FX]) {
     return count;
 }
 
-/* Compute the effective parameter value from a UI control + its <binding>.
- *
- * DS computes:
- *   1. clamp ctrl `value` to [ctrl.minValue, ctrl.maxValue]
- *   2. if binding has translation="linear" with translationOutputMin/Max,
- *      remap the clamped value linearly to the output range.
- *   3. multiply by binding's `factor` if present.
- *
- * Returns 1 on success and writes the result into `out` as a string. */
-static int compute_binding_value(const char *ctrl_tag, const char *bind_tag,
-                                 char *out, int out_len) {
-    char ctrl_value[64], cmin[64], cmax[64];
-    xml_get_attr(ctrl_tag, "value",    ctrl_value, sizeof(ctrl_value));
-    xml_get_attr(ctrl_tag, "minValue", cmin,       sizeof(cmin));
-    xml_get_attr(ctrl_tag, "maxValue", cmax,       sizeof(cmax));
-    if (!ctrl_value[0]) return 0;
-
-    double v = atof(ctrl_value);
-    double minv = cmin[0] ? atof(cmin) : 0.0;
-    double maxv = cmax[0] ? atof(cmax) : 1.0;
+/* Apply a <binding>'s transformation (factor + linear/table translation) to
+ * an arbitrary input value `v`. `in_min`/`in_max` define the input domain
+ * (typically a UI control's [minValue,maxValue], but can also be CC range
+ * 0..127 when computing values from a <midi><cc> binding). */
+static double apply_binding_xform(const char *bind_tag, double in_min,
+                                  double in_max, double v) {
+    double minv = in_min, maxv = in_max;
     if (maxv < minv) { double t = maxv; maxv = minv; minv = t; }
     if (v < minv) v = minv;
     if (v > maxv) v = maxv;
@@ -476,9 +487,6 @@ static int compute_binding_value(const char *ctrl_tag, const char *bind_tag,
         double oMin = atof(omin), oMax = atof(omax);
         v = oMin + t * (oMax - oMin);
     } else if (strcmp(trans, "table") == 0) {
-        /* translationTable="k1,v1;k2,v2;..." — DS normalizes ctrl value to
-         * [0,1] across [minValue,maxValue], then maps via the table whose
-         * keys are scaled by their own max. */
         char tbl[1024];
         xml_get_attr(bind_tag, "translationTable", tbl, sizeof(tbl));
         if (tbl[0]) {
@@ -515,9 +523,30 @@ static int compute_binding_value(const char *ctrl_tag, const char *bind_tag,
             }
         }
     }
-    if (factor[0])
-        v *= atof(factor);
+    if (factor[0]) v *= atof(factor);
+    return v;
+}
 
+/* Compute the effective parameter value from a UI control + its <binding>.
+ *
+ * DS computes:
+ *   1. clamp ctrl `value` to [ctrl.minValue, ctrl.maxValue]
+ *   2. if binding has translation="linear" with translationOutputMin/Max,
+ *      remap the clamped value linearly to the output range.
+ *   3. multiply by binding's `factor` if present.
+ *
+ * Returns 1 on success and writes the result into `out` as a string. */
+static int compute_binding_value(const char *ctrl_tag, const char *bind_tag,
+                                 char *out, int out_len) {
+    char ctrl_value[64], cmin[64], cmax[64];
+    xml_get_attr(ctrl_tag, "value",    ctrl_value, sizeof(ctrl_value));
+    xml_get_attr(ctrl_tag, "minValue", cmin,       sizeof(cmin));
+    xml_get_attr(ctrl_tag, "maxValue", cmax,       sizeof(cmax));
+    if (!ctrl_value[0]) return 0;
+
+    double minv = cmin[0] ? atof(cmin) : 0.0;
+    double maxv = cmax[0] ? atof(cmax) : 1.0;
+    double v = apply_binding_xform(bind_tag, minv, maxv, atof(ctrl_value));
     snprintf(out, out_len, "%g", v);
     return 1;
 }
@@ -662,6 +691,248 @@ static int count_rr_groups(const char *src) {
     return count;
 }
 
+/* Find the Nth `<control>` or `<labeled-knob>` element in src (in document
+ * order). Returns the position of the opening `<` or NULL if not found. */
+static const char *find_nth_ui_control(const char *src, int n) {
+    const char *p = src;
+    int idx = 0;
+    while (*p) {
+        const char *c1 = strstr(p, "<control");
+        const char *c2 = strstr(p, "<labeled-knob");
+        const char *next = NULL;
+        if (c1 && c2)       next = (c1 < c2) ? c1 : c2;
+        else if (c1)        next = c1;
+        else                next = c2;
+        if (!next) return NULL;
+        size_t len = (next == c1) ? 8 : 13;
+        char nx = next[len];
+        if (nx == ' ' || nx == '\t' || nx == '\n' || nx == '\r' ||
+            nx == '>' || nx == '/') {
+            if (idx == n) return next;
+            idx++;
+        }
+        p = next + len;
+    }
+    return NULL;
+}
+
+/* Resolve a DS parameter name to its sfizz `_oncc<N>` opcode + scaling.
+ * Returns 0 if unsupported.
+ *   is_reverb_bus      → opcode goes in the reverb <effect> block.
+ *   sustain_pct        → DS 0..1 ratio → sfizz 0..100 percent.
+ *   multiplicative_mod → sfizz applies the mod multiplicatively to the
+ *                        base (true for `amplitude`, where mod=0 silences
+ *                        the output regardless of base). For these we
+ *                        skip the base override and rely on set_cc<N> +
+ *                        the source depth to produce the right load value. */
+typedef struct {
+    char opcode[32];
+    double scale;
+    int is_reverb_bus;
+    int sustain_pct;
+    int multiplicative_mod;
+} cc_target_t;
+
+static int resolve_cc_target(const char *ds_param, cc_target_t *out) {
+    memset(out, 0, sizeof(*out));
+    out->scale = 1.0;
+    if (strcmp(ds_param, "ENV_ATTACK") == 0)
+        snprintf(out->opcode, sizeof(out->opcode), "ampeg_attack");
+    else if (strcmp(ds_param, "ENV_DECAY") == 0)
+        snprintf(out->opcode, sizeof(out->opcode), "ampeg_decay");
+    else if (strcmp(ds_param, "ENV_SUSTAIN") == 0) {
+        snprintf(out->opcode, sizeof(out->opcode), "ampeg_sustain");
+        out->sustain_pct = 1;
+    } else if (strcmp(ds_param, "ENV_RELEASE") == 0)
+        snprintf(out->opcode, sizeof(out->opcode), "ampeg_release");
+    else if (strcmp(ds_param, "FX_FILTER_FREQUENCY") == 0)
+        snprintf(out->opcode, sizeof(out->opcode), "cutoff");
+    else if (strcmp(ds_param, "FX_FILTER_RESONANCE") == 0)
+        snprintf(out->opcode, sizeof(out->opcode), "resonance");
+    else if (strcmp(ds_param, "AMP_VOLUME") == 0 ||
+             strcmp(ds_param, "TAG_VOLUME") == 0) {
+        snprintf(out->opcode, sizeof(out->opcode), "amplitude");
+        out->scale = 100.0;          /* DS 0..1 → sfizz 0..100% */
+        out->multiplicative_mod = 1; /* sfizz amplitude mod is *= */
+    } else if (strcmp(ds_param, "FX_REVERB_WET_LEVEL") == 0) {
+        snprintf(out->opcode, sizeof(out->opcode), "reverb_wet");
+        out->scale = 100.0;
+        out->is_reverb_bus = 1;
+    } else if (strcmp(ds_param, "FX_REVERB_ROOM_SIZE") == 0) {
+        snprintf(out->opcode, sizeof(out->opcode), "reverb_size");
+        out->scale = 100.0;
+        out->is_reverb_bus = 1;
+    } else if (strcmp(ds_param, "FX_REVERB_DAMPING") == 0) {
+        snprintf(out->opcode, sizeof(out->opcode), "reverb_damp");
+        out->scale = 100.0;
+        out->is_reverb_bus = 1;
+    } else {
+        return 0;
+    }
+    return 1;
+}
+
+/* Collected <midi><cc> bindings, ready to be emitted into the SFZ output. */
+typedef struct {
+    int cc_number;          /* CC number (1..127) */
+    cc_target_t target;
+    double v_at_0;          /* parameter value when CC=0 */
+    double v_at_127;        /* parameter value when CC=127 */
+    int cc_at_load;         /* CC value that reproduces the UI's load-time
+                             * default — for level=ui this is derived from
+                             * the target knob's `value=` attribute, so the
+                             * patch loads at the position the dspreset
+                             * intended. Defaults to 127 (full) when the
+                             * binding is level=instrument with no UI ctrl. */
+} ds_cc_binding_t;
+
+#define DS_MAX_CC 16
+
+/* Parse <midi><cc> blocks and resolve each binding to a sfizz opcode + range.
+ * Returns the number of bindings collected. */
+static int parse_midi_bindings(const char *src, ds_cc_binding_t bindings[DS_MAX_CC]) {
+    int n = 0;
+    const char *midi = strstr(src, "<midi");
+    if (!midi) return 0;
+    const char *midi_end = strstr(midi, "</midi>");
+    if (!midi_end) midi_end = src + strlen(src);
+
+    const char *p = midi;
+    while (n < DS_MAX_CC) {
+        const char *cc = strstr(p, "<cc ");
+        if (!cc || cc >= midi_end) break;
+        const char *cc_tag_end = strchr(cc, '>');
+        if (!cc_tag_end) break;
+
+        char cc_tag[256];
+        int tlen = (int)(cc_tag_end - cc);
+        if (tlen > 255) tlen = 255;
+        memcpy(cc_tag, cc, tlen);
+        cc_tag[tlen] = '\0';
+
+        char num_str[16];
+        xml_get_attr(cc_tag, "number", num_str, sizeof(num_str));
+        int cc_num = num_str[0] ? atoi(num_str) : 0;
+        if (cc_num <= 0 || cc_num > 127) {
+            p = cc_tag_end + 1;
+            continue;
+        }
+
+        const char *cc_close = strstr(cc_tag_end, "</cc>");
+        if (!cc_close || cc_close > midi_end) cc_close = midi_end;
+
+        const char *bind = strstr(cc_tag_end, "<binding");
+        if (!bind || bind > cc_close) {
+            p = cc_close;
+            continue;
+        }
+        const char *bind_end = strchr(bind, '>');
+        if (!bind_end) break;
+
+        char bind_tag[512];
+        int blen = (int)(bind_end - bind);
+        if (blen > 511) blen = 511;
+        memcpy(bind_tag, bind, blen);
+        bind_tag[blen] = '\0';
+
+        char level[32], param[64], pos_str[16];
+        xml_get_attr(bind_tag, "level",     level,   sizeof(level));
+        xml_get_attr(bind_tag, "parameter", param,   sizeof(param));
+        xml_get_attr(bind_tag, "position",  pos_str, sizeof(pos_str));
+
+        const char *target_param = NULL;
+        double v_at_0 = 0, v_at_127 = 0;
+        int cc_at_load = 127;       /* default for level=instrument */
+
+        /* CC bindings have their own translation that maps CC 0..127 to
+         * an output range. Apply it first to get values at the CC endpoints. */
+        double cc_v0 = apply_binding_xform(bind_tag, 0, 127, 0);
+        double cc_v127 = apply_binding_xform(bind_tag, 0, 127, 127);
+
+        if (strcmp(level, "instrument") == 0) {
+            target_param = param;
+            v_at_0 = cc_v0;
+            v_at_127 = cc_v127;
+        } else if (strcmp(level, "ui") == 0 && strcmp(param, "VALUE") == 0 &&
+                   pos_str[0]) {
+            int target_pos = atoi(pos_str);
+            const char *ctrl = find_nth_ui_control(src, target_pos);
+            if (!ctrl) {
+                p = cc_close;
+                continue;
+            }
+            const char *ctrl_tag_end = strchr(ctrl, '>');
+            if (!ctrl_tag_end) break;
+            char ctrl_tag[1024];
+            int clen = (int)(ctrl_tag_end - ctrl);
+            if (clen > 1023) clen = 1023;
+            memcpy(ctrl_tag, ctrl, clen);
+            ctrl_tag[clen] = '\0';
+
+            /* Find the target control's first <binding>. */
+            const char *t_bind = strstr(ctrl_tag_end, "<binding");
+            if (!t_bind) {
+                p = cc_close;
+                continue;
+            }
+            const char *t_bind_end = strchr(t_bind, '>');
+            if (!t_bind_end) break;
+            char t_bind_tag[512];
+            int tblen = (int)(t_bind_end - t_bind);
+            if (tblen > 511) tblen = 511;
+            memcpy(t_bind_tag, t_bind, tblen);
+            t_bind_tag[tblen] = '\0';
+
+            char t_param[64];
+            xml_get_attr(t_bind_tag, "parameter", t_param, sizeof(t_param));
+
+            char cmin[64], cmax[64], cval[64];
+            xml_get_attr(ctrl_tag, "minValue", cmin, sizeof(cmin));
+            xml_get_attr(ctrl_tag, "maxValue", cmax, sizeof(cmax));
+            xml_get_attr(ctrl_tag, "value",    cval, sizeof(cval));
+            double minv = cmin[0] ? atof(cmin) : 0.0;
+            double maxv = cmax[0] ? atof(cmax) : 1.0;
+
+            target_param = t_param;
+            v_at_0   = apply_binding_xform(t_bind_tag, minv, maxv, cc_v0);
+            v_at_127 = apply_binding_xform(t_bind_tag, minv, maxv, cc_v127);
+
+            /* Compute the CC value that reproduces the knob's load-time
+             * `value=` attribute. The knob's value sits in the CC binding's
+             * output range [OutMin, OutMax]; map it back to [0, 127]. */
+            char omin[64], omax[64], trans[32];
+            xml_get_attr(bind_tag, "translationOutputMin", omin,  sizeof(omin));
+            xml_get_attr(bind_tag, "translationOutputMax", omax,  sizeof(omax));
+            xml_get_attr(bind_tag, "translation",          trans, sizeof(trans));
+            if (cval[0] && strcmp(trans, "linear") == 0 && omin[0] && omax[0]) {
+                double k = atof(cval);
+                double oM = atof(omin), oX = atof(omax);
+                if (oX != oM) {
+                    double t = (k - oM) / (oX - oM);
+                    if (t < 0) t = 0; if (t > 1) t = 1;
+                    cc_at_load = (int)(t * 127.0 + 0.5);
+                }
+            }
+        } else {
+            p = cc_close;
+            continue;
+        }
+
+        cc_target_t t;
+        if (target_param && resolve_cc_target(target_param, &t)) {
+            ds_cc_binding_t *b = &bindings[n++];
+            b->cc_number = cc_num;
+            b->target = t;
+            b->v_at_0 = v_at_0;
+            b->v_at_127 = v_at_127;
+            b->cc_at_load = cc_at_load;
+        }
+
+        p = cc_close;
+    }
+    return n;
+}
+
 /* Convert a .dspreset file to SFZ text and write as a temp .sfz file.
  * Returns path to the temp .sfz file, or NULL on failure.
  * Caller must free the returned string. */
@@ -744,6 +1015,11 @@ static char *convert_dspreset_to_sfz(const char *path) {
 
     int rr_total = count_rr_groups(src);
 
+    /* Parse <midi><cc> bindings — these become sfizz `_oncc<N>` opcodes plus
+     * a `set_cc<N>=127` initializer at <control> level so CC starts maxed. */
+    ds_cc_binding_t ccs[DS_MAX_CC];
+    int cc_count = parse_midi_bindings(src, ccs);
+
     /* Locate effects we care about (first match wins by DS convention). */
     int reverb_idx = -1, lp_idx = -1, gain_idx = -1;
     for (int i = 0; i < fx_count; i++) {
@@ -753,29 +1029,90 @@ static char *convert_dspreset_to_sfz(const char *path) {
         if (gain_idx < 0 && strcmp(fx[i].type, "gain") == 0) gain_idx = i;
     }
 
+    /* === Dedupe CC bindings by target opcode ===
+     * Multiple <midi><cc> blocks can target the same SFZ opcode (e.g. Raw
+     * Violin Pad has CC11 + CC22 both modulating amplitude — global vs.
+     * per-tag in DS, but we collapse to global). sfizz mod sources sum,
+     * so emitting two amplitude_oncc<N>=100 would give 2x output. Keep
+     * only the first binding per opcode. */
+    int kept = 0;
+    for (int i = 0; i < cc_count; i++) {
+        int dup = 0;
+        for (int j = 0; j < kept; j++) {
+            if (strcmp(ccs[i].target.opcode, ccs[j].target.opcode) == 0) {
+                dup = 1;
+                break;
+            }
+        }
+        if (!dup) {
+            if (kept != i) ccs[kept] = ccs[i];
+            kept++;
+        }
+    }
+    cc_count = kept;
+
+    /* === Emit <control> set_cc<N> initializers ===
+     * Each CC binding's load-time CC value comes from the target UI knob's
+     * `value=` attribute (or 127 default for level=instrument). */
+    if (cc_count > 0) {
+        int any = 0;
+        for (int i = 0; i < cc_count; i++) {
+            double delta;
+            if (ccs[i].target.sustain_pct) {
+                delta = (ccs[i].v_at_127 - ccs[i].v_at_0) * 100.0;
+            } else {
+                delta = (ccs[i].v_at_127 - ccs[i].v_at_0) * ccs[i].target.scale;
+            }
+            if (delta > -1e-6 && delta < 1e-6) continue;
+            if (!any) {
+                pos += snprintf(sfz + pos, size * 2 - pos, "<control>\n");
+                any = 1;
+            }
+            pos += snprintf(sfz + pos, size * 2 - pos,
+                            "set_cc%d=%d\n", ccs[i].cc_number,
+                            ccs[i].cc_at_load);
+        }
+    }
+
     /* === Emit reverb effect block (sfizz fverb) ===
-     * fx1 bus is wet-only: dry stays on the main bus (regions output to main),
-     * and fx1 contributes only the reverb tail. This avoids stacking dry+dry
-     * which was causing clipping on polyphonic chords. */
+     * Implement DS's wet/dry MIX (not additive) by attenuating the main bus
+     * (directtomain) by (1 - wet) and the fx1 bus (fx1tomain) by wet. The
+     * fverb itself runs fully wet — the bus gains do the mix.
+     *
+     * Without this, fx1 output (full wet) was being added on top of the
+     * full-strength main signal, ~doubling amplitude on heavy-reverb chords
+     * (e.g. ASIMOV's Brave New World with wet=0.8). */
     if (reverb_idx >= 0) {
+        /* DS-documented defaults: roomSize=0.7, damping=0.3, wetLevel=0. */
+        double wet  = fx[reverb_idx].wet_level[0] ? atof(fx[reverb_idx].wet_level) : 0.0;
+        double room = fx[reverb_idx].room_size[0] ? atof(fx[reverb_idx].room_size) : 0.7;
+        double damp = fx[reverb_idx].damping[0]   ? atof(fx[reverb_idx].damping)   : 0.3;
+        if (wet  < 0) wet  = 0; if (wet  > 1) wet  = 1;
+        if (room < 0) room = 0; if (room > 1) room = 1;
+        if (damp < 0) damp = 0; if (damp > 1) damp = 1;
+
         pos += snprintf(sfz + pos, size * 2 - pos,
-                        "<effect>\ntype=fverb\nbus=fx1\nreverb_dry=0\n");
-        if (fx[reverb_idx].wet_level[0]) {
-            float w = atof(fx[reverb_idx].wet_level) * 100.0f;
-            if (w < 0) w = 0; if (w > 100) w = 100;
-            pos += snprintf(sfz + pos, size * 2 - pos, "reverb_wet=%.1f\n", w);
-        } else {
-            pos += snprintf(sfz + pos, size * 2 - pos, "reverb_wet=50\n");
-        }
-        if (fx[reverb_idx].room_size[0]) {
-            float s = atof(fx[reverb_idx].room_size) * 100.0f;
-            if (s < 0) s = 0; if (s > 100) s = 100;
-            pos += snprintf(sfz + pos, size * 2 - pos, "reverb_size=%.1f\n", s);
-        }
-        if (fx[reverb_idx].damping[0]) {
-            float d = atof(fx[reverb_idx].damping) * 100.0f;
-            if (d < 0) d = 0; if (d > 100) d = 100;
-            pos += snprintf(sfz + pos, size * 2 - pos, "reverb_damp=%.1f\n", d);
+                        "<effect>\ntype=fverb\nbus=fx1\n"
+                        "reverb_dry=0\nreverb_wet=100\n");
+        pos += snprintf(sfz + pos, size * 2 - pos, "reverb_size=%.1f\n", room * 100.0);
+        pos += snprintf(sfz + pos, size * 2 - pos, "reverb_damp=%.1f\n", damp * 100.0);
+
+        /* Wet/dry crossfade via bus gain so total amplitude stays ~unity. */
+        pos += snprintf(sfz + pos, size * 2 - pos,
+                        "directtomain=%.1f\nfx1tomain=%.1f\n",
+                        (1.0 - wet) * 100.0, wet * 100.0);
+
+        /* CC modulation for reverb_* opcodes (room/damp/wet). Override base
+         * + emit oncc range, mirroring the global non-reverb path. */
+        for (int i = 0; i < cc_count; i++) {
+            if (!ccs[i].target.is_reverb_bus) continue;
+            double base  = ccs[i].v_at_0   * ccs[i].target.scale;
+            double delta = (ccs[i].v_at_127 - ccs[i].v_at_0) * ccs[i].target.scale;
+            if (delta > -1e-6 && delta < 1e-6) continue;
+            pos += snprintf(sfz + pos, size * 2 - pos, "%s=%g\n",
+                            ccs[i].target.opcode, base);
+            pos += snprintf(sfz + pos, size * 2 - pos, "%s_oncc%d=%g\n",
+                            ccs[i].target.opcode, ccs[i].cc_number, delta);
         }
     }
 
@@ -828,25 +1165,62 @@ static char *convert_dspreset_to_sfz(const char *path) {
     }
     if (use_release[0])
         pos += snprintf(sfz + pos, size * 2 - pos, "ampeg_release=%s\n", use_release);
+    else {
+        /* Many DS presets (e.g. K4Coll pianos) specify no release attr at
+         * all. DS's docs don't state a default, but its own boilerplate
+         * dspreset uses release="0.430". sfizz's default is ~1ms which
+         * cuts notes abruptly, so fall back to 0.5s. */
+        pos += snprintf(sfz + pos, size * 2 - pos, "ampeg_release=0.5\n");
+    }
     if (wrapper_loop[0])
         pos += snprintf(sfz + pos, size * 2 - pos, "loop_mode=%s\n",
                         strcmp(wrapper_loop, "true") == 0 ? "loop_continuous" : "no_loop");
 
-    /* Lowpass filter at <global> level. */
+    /* Lowpass filter at <global> level. DS defaults: frequency=22000,
+     * resonance=0.7. sfizz `resonance` is in dB (a Q→dB conversion would
+     * be more faithful, but the values DS authors set tend to land in
+     * sane sfizz dB ranges anyway, so pass-through for now). */
     if (lp_idx >= 0) {
         const char *fil_type = strcmp(fx[lp_idx].type, "lowpass_4pl") == 0
                                  ? "lpf_4p" : "lpf_2p";
-        pos += snprintf(sfz + pos, size * 2 - pos, "fil_type=%s\n", fil_type);
-        if (fx[lp_idx].freq[0])
-            pos += snprintf(sfz + pos, size * 2 - pos, "cutoff=%s\n", fx[lp_idx].freq);
-        if (fx[lp_idx].resonance[0])
-            pos += snprintf(sfz + pos, size * 2 - pos, "resonance=%s\n",
-                            fx[lp_idx].resonance);
+        const char *cutoff = fx[lp_idx].freq[0]      ? fx[lp_idx].freq      : "22000";
+        const char *q      = fx[lp_idx].resonance[0] ? fx[lp_idx].resonance : "0.7";
+        pos += snprintf(sfz + pos, size * 2 - pos,
+                        "fil_type=%s\ncutoff=%s\nresonance=%s\n",
+                        fil_type, cutoff, q);
     }
 
     /* Reverb send: route 100% to fx1 — wet level is controlled by reverb_wet. */
     if (reverb_idx >= 0)
         pos += snprintf(sfz + pos, size * 2 - pos, "effect1=100\n");
+
+    /* === CC modulation opcodes ===
+     * For most parameters we use absolute control: emit `base = v_at_0` and
+     * `_oncc<N> = delta` so the patch sweeps fully across the CC range.
+     *
+     * For multiplicative-mod targets (sfizz's `amplitude`) we DON'T override
+     * the base — sfizz applies the mod as `output *= mod` so a base override
+     * either silences (mod=0 at CC=0) or doubles up. Instead we leave the
+     * base at sfizz's default (unity) and let the source depth + set_cc do
+     * the work. */
+    for (int i = 0; i < cc_count; i++) {
+        if (ccs[i].target.is_reverb_bus) continue;
+        double base, delta;
+        if (ccs[i].target.sustain_pct) {
+            base  = ccs[i].v_at_0   * 100.0;
+            delta = (ccs[i].v_at_127 - ccs[i].v_at_0) * 100.0;
+        } else {
+            base  = ccs[i].v_at_0   * ccs[i].target.scale;
+            delta = (ccs[i].v_at_127 - ccs[i].v_at_0) * ccs[i].target.scale;
+        }
+        if (delta > -1e-6 && delta < 1e-6) continue;
+        if (!ccs[i].target.multiplicative_mod) {
+            pos += snprintf(sfz + pos, size * 2 - pos, "%s=%g\n",
+                            ccs[i].target.opcode, base);
+        }
+        pos += snprintf(sfz + pos, size * 2 - pos, "%s_oncc%d=%g\n",
+                        ccs[i].target.opcode, ccs[i].cc_number, delta);
+    }
 
     /* Find each <group> */
     char *scan = src;
@@ -1030,7 +1404,7 @@ static int load_sfz_file(sfz_instance_t *inst, const char *path,
                 return -1;
             }
             format = "DecentSampler instrument";
-            unlink(converted_path);
+            /* unlink(converted_path); */
             free(converted_path);
         } else {
             /* Conversion failed, try sfizz's built-in importer as fallback */
@@ -1073,10 +1447,16 @@ static int load_sfz_file(sfz_instance_t *inst, const char *path,
             /* If SFZ is in a subdirectory, try resolving samples from
              * the instrument root. Many packs (e.g. drolez/SHLD) put
              * .sfz files in presets/ but reference Samples/ at the root. */
+            const char *instrument_root = NULL;
+            if (inst->current_preset >= 0 && inst->current_preset < inst->preset_count) {
+                int ii = inst->presets[inst->current_preset].instrument_idx;
+                if (ii >= 0 && ii < inst->instrument_count)
+                    instrument_root = inst->instruments[ii].root;
+            }
             if (root_path && root_path[0] &&
                 ext && strcasecmp(ext, ".sfz") == 0 &&
-                strcmp(root_path, inst->instruments[inst->current_instrument].path) != 0 &&
-                try_load_with_root(inst, path, root_path) == 0) {
+                instrument_root && strcmp(root_path, instrument_root) != 0 &&
+                try_load_with_root(inst, path, instrument_root) == 0) {
                 plugin_log("Loaded with instrument root path fallback");
                 inst->load_error[0] = '\0';
             } else {
@@ -1092,179 +1472,99 @@ static int load_sfz_file(sfz_instance_t *inst, const char *path,
     return 0;
 }
 
-/* Find instrument index by name, returns -1 if not found */
-static int find_instrument_by_name(sfz_instance_t *inst, const char *name) {
-    for (int i = 0; i < inst->instrument_count; i++) {
-        if (strcmp(inst->instruments[i].name, name) == 0) {
-            return i;
-        }
+/* Find preset index by name, returns -1 if not found. */
+static int find_preset_by_name(sfz_instance_t *inst, const char *name) {
+    for (int i = 0; i < inst->preset_count; i++) {
+        if (strcmp(inst->presets[i].name, name) == 0) return i;
     }
     return -1;
 }
 
-/* Select a variant (.sfz file) within the current instrument */
-static void select_variant(sfz_instance_t *inst, int index) {
-    if (inst->variant_count <= 0) return;
-
-    if (index < 0) index = inst->variant_count - 1;
-    if (index >= inst->variant_count) index = 0;
-
-    /* Silence current notes */
-    if (inst->current_variant != index) {
-        sfizz_all_sound_off(inst->synth);
+/* Find instrument index by name, returns -1 if not found. */
+static int find_instrument_by_name(sfz_instance_t *inst, const char *name) {
+    for (int i = 0; i < inst->instrument_count; i++) {
+        if (strcmp(inst->instruments[i].name, name) == 0) return i;
     }
+    return -1;
+}
 
-    inst->current_variant = index;
-    strncpy(inst->variant_name, inst->variants[index].name,
-            sizeof(inst->variant_name) - 1);
-
-    /* Remember this variant for the current instrument */
-    if (inst->current_instrument >= 0 && inst->current_instrument < MAX_INSTRUMENTS) {
-        inst->last_variant[inst->current_instrument] = index;
+/* Update cached preset_name + instrument_name from the current preset index. */
+static void sync_preset_display(sfz_instance_t *inst) {
+    if (inst->preset_count <= 0 || inst->current_preset < 0 ||
+        inst->current_preset >= inst->preset_count) {
+        strcpy(inst->preset_name, "No presets");
+        inst->instrument_name[0] = '\0';
+        return;
     }
-
-    /* Per-variant root so samples resolve relative to the variant's folder. */
-    char variant_root[MAX_PATH_LEN];
-    strncpy(variant_root, inst->variants[index].path, sizeof(variant_root) - 1);
-    variant_root[sizeof(variant_root) - 1] = '\0';
-    char *slash = strrchr(variant_root, '/');
-    if (slash) {
-        *slash = '\0';
+    preset_entry_t *p = &inst->presets[inst->current_preset];
+    strncpy(inst->preset_name, p->name, sizeof(inst->preset_name) - 1);
+    inst->preset_name[sizeof(inst->preset_name) - 1] = '\0';
+    if (p->instrument_idx >= 0 && p->instrument_idx < inst->instrument_count) {
+        strncpy(inst->instrument_name, inst->instruments[p->instrument_idx].name,
+                sizeof(inst->instrument_name) - 1);
+        inst->instrument_name[sizeof(inst->instrument_name) - 1] = '\0';
     } else {
-        strncpy(variant_root,
-                inst->instruments[inst->current_instrument].root,
-                sizeof(variant_root) - 1);
-        variant_root[sizeof(variant_root) - 1] = '\0';
+        inst->instrument_name[0] = '\0';
     }
-    load_sfz_file(inst, inst->variants[index].path, variant_root);
+}
+
+/* Load presets[current_preset] (called after debounce). */
+static void do_load_preset(sfz_instance_t *inst) {
+    int idx = inst->current_preset;
+    if (idx < 0 || idx >= inst->preset_count) return;
+    preset_entry_t *p = &inst->presets[idx];
+
+    /* Sample-resolution root = directory containing this preset. */
+    char root[MAX_PATH_LEN];
+    strncpy(root, p->path, sizeof(root) - 1);
+    root[sizeof(root) - 1] = '\0';
+    char *slash = strrchr(root, '/');
+    if (slash) *slash = '\0';
+
+    load_sfz_file(inst, p->path, root);
 
     char msg[128];
-    snprintf(msg, sizeof(msg), "Variant %d: %s", index, inst->variant_name);
+    snprintf(msg, sizeof(msg), "Preset %d: %s [%s]",
+             idx, inst->preset_name, inst->instrument_name);
     plugin_log(msg);
 }
 
-/* Actually load the current instrument's variant (called after debounce) */
-static void do_load_instrument(sfz_instance_t *inst) {
-    int index = inst->current_instrument;
-    if (index < 0 || index >= inst->instrument_count) return;
+/* Switch to a preset (deferred load with debounce). */
+static void set_preset_index(sfz_instance_t *inst, int index) {
+    if (inst->preset_count <= 0) return;
+    if (index < 0) index = inst->preset_count - 1;
+    if (index >= inst->preset_count) index = 0;
 
-    instrument_entry_t *instr = &inst->instruments[index];
+    inst->current_preset = index;
+    sync_preset_display(inst);
 
-    if (instr->sfz_file[0]) {
-        /* Single loose .sfz file - one variant, load directly */
-        inst->variant_count = 1;
-        variant_entry_t *v = &inst->variants[0];
-        strncpy(v->path, instr->sfz_file, sizeof(v->path) - 1);
-        v->path[sizeof(v->path) - 1] = '\0';
-        strncpy(v->name, instr->name, sizeof(v->name) - 1);
-        v->name[sizeof(v->name) - 1] = '\0';
-
-        inst->current_variant = 0;
-        strncpy(inst->variant_name, v->name, sizeof(inst->variant_name) - 1);
-        load_sfz_file(inst, v->path, instr->root);
-    } else {
-        /* Folder-based instrument - scan for variants */
-        scan_variants(inst, instr->path);
-
-        if (inst->variant_count > 0) {
-            int variant_idx = inst->last_variant[index];
-            if (variant_idx < 0 || variant_idx >= inst->variant_count)
-                variant_idx = 0;
-            inst->current_variant = variant_idx;
-            strncpy(inst->variant_name, inst->variants[variant_idx].name,
-                    sizeof(inst->variant_name) - 1);
-            /* Use the variant's own folder as root so samples resolve relative
-             * to where the .sfz/.dspreset lives (matters for nested layouts
-             * like K4Coll-1.01/K4-Acoustic/...). */
-            char variant_root[MAX_PATH_LEN];
-            strncpy(variant_root, inst->variants[variant_idx].path,
-                    sizeof(variant_root) - 1);
-            variant_root[sizeof(variant_root) - 1] = '\0';
-            char *slash = strrchr(variant_root, '/');
-            if (slash) *slash = '\0';
-            else strncpy(variant_root, instr->root, sizeof(variant_root) - 1);
-            load_sfz_file(inst, inst->variants[variant_idx].path, variant_root);
-        } else {
-            inst->current_variant = 0;
-            strcpy(inst->variant_name, "No variants");
-        }
-    }
-
-    char msg[128];
-    snprintf(msg, sizeof(msg), "Instrument %d: %s (%d variants)",
-             index, inst->instrument_name, inst->variant_count);
-    plugin_log(msg);
-}
-
-/* Refresh the variant list for the current instrument without loading any
- * sample data. Called eagerly so variant_list UI lookups don't see stale
- * entries from the previous instrument. */
-static void refresh_variants_for_current(sfz_instance_t *inst) {
-    int idx = inst->current_instrument;
-    if (idx < 0 || idx >= inst->instrument_count) return;
-    instrument_entry_t *instr = &inst->instruments[idx];
-
-    if (instr->sfz_file[0]) {
-        inst->variant_count = 1;
-        variant_entry_t *v = &inst->variants[0];
-        strncpy(v->path, instr->sfz_file, sizeof(v->path) - 1);
-        v->path[sizeof(v->path) - 1] = '\0';
-        strncpy(v->name, instr->name, sizeof(v->name) - 1);
-        v->name[sizeof(v->name) - 1] = '\0';
-    } else {
-        scan_variants(inst, instr->path);
-    }
-
-    int vi = inst->last_variant[idx];
-    if (vi < 0 || vi >= inst->variant_count) vi = 0;
-    inst->current_variant = vi;
-    if (inst->variant_count > 0) {
-        strncpy(inst->variant_name, inst->variants[vi].name,
-                sizeof(inst->variant_name) - 1);
-        inst->variant_name[sizeof(inst->variant_name) - 1] = '\0';
-    } else {
-        strcpy(inst->variant_name, "No variants");
-    }
-}
-
-/* Switch to an instrument folder (deferred load with debounce) */
-static void set_instrument_index(sfz_instance_t *inst, int index) {
-    if (inst->instrument_count <= 0) return;
-
-    if (index < 0) index = inst->instrument_count - 1;
-    if (index >= inst->instrument_count) index = 0;
-
-    inst->current_instrument = index;
-    strncpy(inst->instrument_name, inst->instruments[index].name,
-            sizeof(inst->instrument_name) - 1);
-
-    /* Refresh variants synchronously so the menu reflects the new instrument
-     * even before the debounced sample load completes. */
-    refresh_variants_for_current(inst);
-
-    /* Silence current notes */
     sfizz_all_sound_off(inst->synth);
 
-    /* Defer the actual load to allow rapid jog browsing */
     inst->pending_load = 1;
     inst->debounce_remaining = DEBOUNCE_BLOCKS;
 }
 
-/* Switch to an instrument and load immediately (for startup/state restore) */
-static void set_instrument_index_immediate(sfz_instance_t *inst, int index) {
-    if (inst->instrument_count <= 0) return;
+/* Switch and load immediately (for startup / state restore). */
+static void set_preset_index_immediate(sfz_instance_t *inst, int index) {
+    if (inst->preset_count <= 0) return;
+    if (index < 0) index = inst->preset_count - 1;
+    if (index >= inst->preset_count) index = 0;
 
-    if (index < 0) index = inst->instrument_count - 1;
-    if (index >= inst->instrument_count) index = 0;
-
-    inst->current_instrument = index;
-    strncpy(inst->instrument_name, inst->instruments[index].name,
-            sizeof(inst->instrument_name) - 1);
+    inst->current_preset = index;
+    sync_preset_display(inst);
 
     sfizz_all_sound_off(inst->synth);
     inst->pending_load = 0;
     inst->debounce_remaining = 0;
-    do_load_instrument(inst);
+    do_load_preset(inst);
+}
+
+/* Jump to the first preset of an instrument (used by the bank/jump menu). */
+static void jump_to_instrument(sfz_instance_t *inst, int instrument_idx) {
+    if (instrument_idx < 0 || instrument_idx >= inst->instrument_count) return;
+    int first = inst->instruments[instrument_idx].first_preset;
+    if (first < 0) return;
+    set_preset_index(inst, first);
 }
 
 /* V2 API Implementation */
@@ -1278,8 +1578,8 @@ static void* v2_create_instance(const char *module_dir, const char *json_default
     if (!inst) return NULL;
 
     strncpy(inst->module_dir, module_dir, sizeof(inst->module_dir) - 1);
-    strcpy(inst->instrument_name, "No instrument");
-    strcpy(inst->variant_name, "");
+    strcpy(inst->preset_name, "No preset");
+    inst->instrument_name[0] = '\0';
     inst->load_error[0] = '\0';
     inst->gain = 1.0f;
 
@@ -1319,36 +1619,29 @@ static void* v2_create_instance(const char *module_dir, const char *json_default
     /* Scan instruments */
     scan_instruments(inst, module_dir);
 
-    /* Restore from defaults or load first instrument */
-    int start_instrument = 0;
-    int start_variant = 0;
-
+    /* Restore preset selection from defaults. Prefer name-based lookup so the
+     * same patch survives reorderings; fall back to index. */
+    int start_preset = 0;
     if (json_defaults) {
         float f;
         char name[MAX_NAME_LEN];
-        if (json_get_string(json_defaults, "instrument_name", name, sizeof(name)) > 0) {
-            int idx = find_instrument_by_name(inst, name);
-            if (idx >= 0) start_instrument = idx;
+        if (json_get_string(json_defaults, "preset_name", name, sizeof(name)) > 0) {
+            int idx = find_preset_by_name(inst, name);
+            if (idx >= 0) start_preset = idx;
+        } else if (json_get_string(json_defaults, "instrument_name", name,
+                                   sizeof(name)) > 0) {
+            int ii = find_instrument_by_name(inst, name);
+            if (ii >= 0 && inst->instruments[ii].first_preset >= 0)
+                start_preset = inst->instruments[ii].first_preset;
         }
-        if (json_get_number(json_defaults, "instrument_index", &f) == 0) {
+        if (json_get_number(json_defaults, "preset", &f) == 0) {
             int idx = (int)f;
-            if (idx >= 0 && idx < inst->instrument_count) {
-                start_instrument = idx;
-            }
-        }
-        /* Support both old "preset" key and new "variant" key */
-        if (json_get_number(json_defaults, "variant", &f) == 0) {
-            start_variant = (int)f;
-        } else if (json_get_number(json_defaults, "preset", &f) == 0) {
-            start_variant = (int)f;
+            if (idx >= 0 && idx < inst->preset_count) start_preset = idx;
         }
     }
 
-    if (inst->instrument_count > 0) {
-        set_instrument_index_immediate(inst, start_instrument);
-        if (start_variant > 0 && start_variant < inst->variant_count) {
-            select_variant(inst, start_variant);
-        }
+    if (inst->preset_count > 0) {
+        set_preset_index_immediate(inst, start_preset);
     }
 
     plugin_log("Instance created");
@@ -1417,9 +1710,9 @@ static void v2_on_midi(void *instance, const uint8_t *msg, int len, int source) 
                 sfizz_send_pitch_wheel(inst->synth, 0, bend);
             }
             break;
-        case 0xC0:  /* Program change - map to instrument list */
-            if (data1 < inst->instrument_count) {
-                set_instrument_index(inst, data1);
+        case 0xC0:  /* Program change - map to flat preset list */
+            if (data1 < inst->preset_count) {
+                set_preset_index(inst, data1);
             }
             break;
         case 0xD0:  /* Channel pressure (aftertouch) */
@@ -1432,15 +1725,31 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
     sfz_instance_t *inst = (sfz_instance_t *)instance;
     if (!inst) return;
 
-    /* Preset browser navigates instrument folders */
-    if (strcmp(key, "preset") == 0 || strcmp(key, "instrument_index") == 0) {
+    if (strcmp(key, "preset") == 0) {
+        /* Shared sound_generator UI calls set_param('preset', '0') right after
+         * a bank change. Suppress that specific follow-up so the bank jump
+         * isn't immediately overwritten by preset 0. */
+        if (inst->suppress_next_preset_set) {
+            inst->suppress_next_preset_set = 0;
+            return;
+        }
         int idx = atoi(val);
-        if (idx == inst->current_instrument) return;
-        set_instrument_index(inst, idx);
-    } else if (strcmp(key, "variant") == 0) {
+        if (idx == inst->current_preset) return;
+        set_preset_index(inst, idx);
+    } else if (strcmp(key, "bank_index") == 0 || strcmp(key, "bank") == 0 ||
+               strcmp(key, "instrument_index") == 0) {
         int idx = atoi(val);
-        if (idx == inst->current_variant) return;
-        select_variant(inst, idx);
+        int current_bank = -1;
+        if (inst->current_preset >= 0 && inst->current_preset < inst->preset_count)
+            current_bank = inst->presets[inst->current_preset].instrument_idx;
+        if (idx == current_bank) {
+            /* Already on this bank — but the shared UI will still send the
+             * follow-up preset=0 reset, so suppress it. */
+            inst->suppress_next_preset_set = 1;
+            return;
+        }
+        jump_to_instrument(inst, idx);
+        inst->suppress_next_preset_set = 1;
     } else if (strcmp(key, "octave_transpose") == 0) {
         inst->octave_transpose = atoi(val);
         if (inst->octave_transpose < -4) inst->octave_transpose = -4;
@@ -1453,33 +1762,26 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             sfizz_set_volume(inst->synth, inst->gain);
         }
     } else if (strcmp(key, "all_notes_off") == 0 || strcmp(key, "panic") == 0) {
-        if (inst->synth) {
-            sfizz_all_sound_off(inst->synth);
-        }
+        if (inst->synth) sfizz_all_sound_off(inst->synth);
     } else if (strcmp(key, "state") == 0) {
-        /* Restore state from JSON */
+        /* Restore state by preset name first, then fall back to index. */
         float f;
         char name[MAX_NAME_LEN];
-        int instr_idx = -1;
+        int idx = -1;
+        if (json_get_string(val, "preset_name", name, sizeof(name)) > 0) {
+            idx = find_preset_by_name(inst, name);
+        }
+        if (idx < 0 && json_get_string(val, "instrument_name", name,
+                                        sizeof(name)) > 0) {
+            int ii = find_instrument_by_name(inst, name);
+            if (ii >= 0) idx = inst->instruments[ii].first_preset;
+        }
+        if (idx < 0 && json_get_number(val, "preset", &f) == 0) {
+            int p = (int)f;
+            if (p >= 0 && p < inst->preset_count) idx = p;
+        }
+        if (idx >= 0) set_preset_index_immediate(inst, idx);
 
-        if (json_get_string(val, "instrument_name", name, sizeof(name)) > 0) {
-            instr_idx = find_instrument_by_name(inst, name);
-        }
-        if (instr_idx < 0 && json_get_number(val, "instrument_index", &f) == 0) {
-            int idx = (int)f;
-            if (idx >= 0 && idx < inst->instrument_count) {
-                instr_idx = idx;
-            }
-        }
-        if (instr_idx >= 0) {
-            set_instrument_index_immediate(inst, instr_idx);
-        }
-        /* Support both old "preset" and new "variant" keys */
-        if (json_get_number(val, "variant", &f) == 0) {
-            select_variant(inst, (int)f);
-        } else if (json_get_number(val, "preset", &f) == 0) {
-            select_variant(inst, (int)f);
-        }
         if (json_get_number(val, "octave_transpose", &f) == 0) {
             inst->octave_transpose = (int)f;
             if (inst->octave_transpose < -4) inst->octave_transpose = -4;
@@ -1489,9 +1791,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             inst->gain = f;
             if (inst->gain < 0.0f) inst->gain = 0.0f;
             if (inst->gain > 2.0f) inst->gain = 2.0f;
-            if (inst->synth) {
-                sfizz_set_volume(inst->synth, inst->gain);
-            }
+            if (inst->synth) sfizz_set_volume(inst->synth, inst->gain);
         }
     }
 }
@@ -1506,35 +1806,38 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
         }
         return 0;
     }
-    /* Preset browser shows instrument folders */
+    /* Flat preset list — scrolling crosses every preset in alphabetical
+     * (instrument, then preset) order. */
     else if (strcmp(key, "preset") == 0 || strcmp(key, "current_patch") == 0) {
-        return snprintf(buf, buf_len, "%d", inst->current_instrument);
+        return snprintf(buf, buf_len, "%d", inst->current_preset);
     } else if (strcmp(key, "preset_count") == 0 || strcmp(key, "total_patches") == 0) {
-        return snprintf(buf, buf_len, "%d", inst->instrument_count);
-    } else if (strcmp(key, "preset_name") == 0 || strcmp(key, "patch_name") == 0 || strcmp(key, "name") == 0) {
-        strncpy(buf, inst->instrument_name, buf_len - 1);
+        return snprintf(buf, buf_len, "%d", inst->preset_count);
+    } else if (strcmp(key, "preset_name") == 0 || strcmp(key, "patch_name") == 0 ||
+               strcmp(key, "name") == 0) {
+        strncpy(buf, inst->preset_name, buf_len - 1);
         buf[buf_len - 1] = '\0';
         return strlen(buf);
     }
-    /* Instrument params (alias for preset browser) */
-    else if (strcmp(key, "instrument_name") == 0) {
+    /* Bank = instrument (jump menu). bank_count > 1 enables Shift+L/R to
+     * jump between instruments via set_param('bank_index', N). */
+    else if (strcmp(key, "bank_name") == 0 || strcmp(key, "instrument_name") == 0) {
         strncpy(buf, inst->instrument_name, buf_len - 1);
         buf[buf_len - 1] = '\0';
         return strlen(buf);
-    } else if (strcmp(key, "instrument_count") == 0) {
+    } else if (strcmp(key, "bank_count") == 0 || strcmp(key, "instrument_count") == 0) {
         return snprintf(buf, buf_len, "%d", inst->instrument_count);
-    } else if (strcmp(key, "instrument_index") == 0) {
-        return snprintf(buf, buf_len, "%d", inst->current_instrument);
-    }
-    /* Variant params (.sfz files within instrument) */
-    else if (strcmp(key, "variant") == 0) {
-        return snprintf(buf, buf_len, "%d", inst->current_variant);
-    } else if (strcmp(key, "variant_count") == 0) {
-        return snprintf(buf, buf_len, "%d", inst->variant_count);
-    } else if (strcmp(key, "variant_name") == 0) {
-        strncpy(buf, inst->variant_name, buf_len - 1);
-        buf[buf_len - 1] = '\0';
-        return strlen(buf);
+    } else if (strcmp(key, "bank_index") == 0 || strcmp(key, "instrument_index") == 0) {
+        int ii = 0;
+        if (inst->current_preset >= 0 && inst->current_preset < inst->preset_count)
+            ii = inst->presets[inst->current_preset].instrument_idx;
+        return snprintf(buf, buf_len, "%d", ii);
+    } else if (strcmp(key, "patch_in_bank") == 0) {
+        int ii = 0, first = 0;
+        if (inst->current_preset >= 0 && inst->current_preset < inst->preset_count) {
+            ii = inst->presets[inst->current_preset].instrument_idx;
+            first = inst->instruments[ii].first_preset;
+        }
+        return snprintf(buf, buf_len, "%d", inst->current_preset - first + 1);
     }
     /* Knob params */
     else if (strcmp(key, "octave_transpose") == 0) {
@@ -1542,32 +1845,39 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
     } else if (strcmp(key, "gain") == 0) {
         return snprintf(buf, buf_len, "%.2f", inst->gain);
     }
-    /* Chain compatibility */
-    else if (strcmp(key, "bank_name") == 0) {
-        strncpy(buf, inst->instrument_name, buf_len - 1);
-        buf[buf_len - 1] = '\0';
-        return strlen(buf);
-    } else if (strcmp(key, "patch_in_bank") == 0) {
-        return snprintf(buf, buf_len, "%d", inst->current_instrument + 1);
-    } else if (strcmp(key, "bank_count") == 0) {
-        return snprintf(buf, buf_len, "%d", inst->instrument_count);
-    }
-    /* Dynamic variant list for menu */
-    else if (strcmp(key, "variant_list") == 0) {
+    /* Flat preset list — every preset across all instruments. Each entry's
+     * label is "Instrument / Preset" so the menu reads in context. */
+    else if (strcmp(key, "preset_list") == 0) {
         int written = 0;
         written += snprintf(buf + written, buf_len - written, "[");
-        for (int i = 0; i < inst->variant_count && written < buf_len - 50; i++) {
+        for (int i = 0; i < inst->preset_count && written < buf_len - 80; i++) {
             if (i > 0) written += snprintf(buf + written, buf_len - written, ",");
+            preset_entry_t *p = &inst->presets[i];
+            const char *iname = (p->instrument_idx >= 0 &&
+                                 p->instrument_idx < inst->instrument_count)
+                                ? inst->instruments[p->instrument_idx].name : "";
             written += snprintf(buf + written, buf_len - written,
-                "{\"label\":\"%s\",\"index\":%d}",
-                inst->variants[i].name, i);
+                "{\"label\":\"%s / %s\",\"index\":%d}", iname, p->name, i);
         }
         written += snprintf(buf + written, buf_len - written, "]");
         return written;
     }
-    /* Dynamic instrument list for menu - rescan each time */
-    else if (strcmp(key, "instrument_list") == 0 || strcmp(key, "soundfont_list") == 0) {
+    /* Instrument list (jump menu) — rescan each time so newly uploaded
+     * libraries appear without a restart. */
+    else if (strcmp(key, "instrument_list") == 0 || strcmp(key, "bank_list") == 0 ||
+             strcmp(key, "soundfont_list") == 0) {
+        char saved_preset_name[MAX_NAME_LEN];
+        strncpy(saved_preset_name, inst->preset_name, MAX_NAME_LEN - 1);
+        saved_preset_name[MAX_NAME_LEN - 1] = '\0';
+
         scan_instruments(inst, inst->module_dir);
+
+        /* Restore current_preset by name if possible. */
+        int restored = find_preset_by_name(inst, saved_preset_name);
+        if (restored >= 0) inst->current_preset = restored;
+        else if (inst->current_preset >= inst->preset_count)
+            inst->current_preset = inst->preset_count > 0 ? 0 : -1;
+        sync_preset_display(inst);
 
         int written = 0;
         written += snprintf(buf + written, buf_len - written, "[");
@@ -1580,17 +1890,13 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
         written += snprintf(buf + written, buf_len - written, "]");
         return written;
     }
-    /* State serialization for save/load */
+    /* State serialization */
     else if (strcmp(key, "state") == 0) {
-        const char *instr_name = "";
-        if (inst->instrument_count > 0 && inst->current_instrument < inst->instrument_count) {
-            instr_name = inst->instruments[inst->current_instrument].name;
-        }
         return snprintf(buf, buf_len,
-            "{\"instrument_name\":\"%s\",\"instrument_index\":%d,\"variant\":%d,"
-            "\"octave_transpose\":%d,\"gain\":%.2f}",
-            instr_name, inst->current_instrument, inst->current_variant,
-            inst->octave_transpose, inst->gain);
+            "{\"preset_name\":\"%s\",\"instrument_name\":\"%s\","
+            "\"preset\":%d,\"octave_transpose\":%d,\"gain\":%.2f}",
+            inst->preset_name, inst->instrument_name,
+            inst->current_preset, inst->octave_transpose, inst->gain);
     }
     /* UI hierarchy for shadow parameter editor */
     else if (strcmp(key, "ui_hierarchy") == 0) {
@@ -1607,13 +1913,13 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
                     "\"params\":["
                         "{\"key\":\"octave_transpose\",\"label\":\"Octave\"},"
                         "{\"key\":\"gain\",\"label\":\"Gain\"},"
-                        "{\"level\":\"variant\",\"label\":\"Choose Variant\"}"
+                        "{\"level\":\"jump\",\"label\":\"Jump To Library\"}"
                     "]"
                 "},"
-                "\"variant\":{"
-                    "\"label\":\"Variant\","
-                    "\"items_param\":\"variant_list\","
-                    "\"select_param\":\"variant\","
+                "\"jump\":{"
+                    "\"label\":\"Library\","
+                    "\"items_param\":\"instrument_list\","
+                    "\"select_param\":\"bank_index\","
                     "\"children\":null,"
                     "\"knobs\":[],"
                     "\"params\":[]"
@@ -1649,7 +1955,7 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
         return;
     }
 
-    /* Handle debounced instrument loading */
+    /* Handle debounced preset loading */
     if (inst->pending_load) {
         if (inst->debounce_remaining > 0) {
             inst->debounce_remaining--;
@@ -1658,7 +1964,7 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
             return;
         }
         inst->pending_load = 0;
-        do_load_instrument(inst);
+        do_load_preset(inst);
     }
 
     /* sfizz renders to separate float channel buffers */

@@ -4,3 +4,4 @@ dist/
 *.so
 *.tar.gz
 .DS_Store
+.claude/

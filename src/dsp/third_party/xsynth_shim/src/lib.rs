@@ -11,8 +11,42 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
+
+/// MOVE: process-global load lock. Move runs multiple SFZ tracks in the
+/// same shim process, each with its own XSynthHandle. If two of them
+/// concurrently load heavy DS libraries (WörliTzer 950 MB + Clean Fender
+/// 600 MB) they collectively exceed the device's free RAM and Rust's
+/// alloc handler aborts the whole process. Workers acquire this lock for
+/// the duration of SampleSoundfont::new so allocations are sequential
+/// across instances.
+fn process_load_lock() -> &'static Mutex<()> {
+    static L: OnceLock<Mutex<()>> = OnceLock::new();
+    L.get_or_init(|| Mutex::new(()))
+}
+
+/// MOVE: read `MemAvailable` from /proc/meminfo (KB units). Returns 0 on
+/// any error so callers can choose to skip the check rather than fail.
+fn available_memory_mb() -> u64 {
+    if let Ok(content) = std::fs::read_to_string("/proc/meminfo") {
+        for line in content.lines() {
+            if let Some(rest) = line.strip_prefix("MemAvailable:") {
+                if let Some(kb) = rest.split_whitespace().next().and_then(|s| s.parse::<u64>().ok()) {
+                    return kb / 1024;
+                }
+            }
+        }
+    }
+    0
+}
+
+/// MOVE: refuse a load if free RAM is below this threshold. Picked so that
+/// a typical "heavy DS library" (Clean Fender ~600 MB decoded, WörliTzer
+/// ~950 MB) has a chance to allocate without tipping the whole device into
+/// OOM-abort. The plugin surfaces this as a load_error string and the user
+/// can choose a smaller patch.
+const MIN_FREE_MB_FOR_LOAD: u64 = 350;
 
 thread_local! {
     static LAST_ERROR: RefCell<String> = const { RefCell::new(String::new()) };
@@ -31,31 +65,23 @@ use xsynth_core::{
     soundfont::{Interpolator, SampleSoundfont, SoundfontBase, SoundfontInitOptions},
 };
 
-/// Load worker status. Mirrors `XSHIM_LOAD_*` constants exposed to C.
-/// 0 idle / 1 loading / 2 ready / 3 error / 4 cancelled
-const STATUS_IDLE: u32 = 0;
-const STATUS_LOADING: u32 = 1;
-const STATUS_READY: u32 = 2;
-const STATUS_ERROR: u32 = 3;
+const STATUS_IDLE:      u32 = 0;
+const STATUS_LOADING:   u32 = 1;
+const STATUS_READY:     u32 = 2;
+const STATUS_ERROR:     u32 = 3;
 const STATUS_CANCELLED: u32 = 4;
 
 struct LoadWorker {
     handle: Option<thread::JoinHandle<()>>,
     status: Arc<AtomicU32>,
     cancel: Arc<AtomicBool>,
-    /// Worker writes the loaded soundfont here on success; main thread takes
-    /// it out via `xshim_load_apply`. Mutex<Option> so we can `take()`.
     result: Arc<Mutex<Option<SampleSoundfont>>>,
 }
 
 pub struct XSynthHandle {
     group: ChannelGroup,
     worker: Option<LoadWorker>,
-    /// Old soundfonts pushed here by the audio thread on SetSoundfonts; the
-    /// gc thread below drains and drops them off-thread.
     drop_sink: SoundfontDropSink,
-    gc_alive: Arc<AtomicBool>,
-    gc_handle: Option<thread::JoinHandle<()>>,
 }
 
 /* Install once: panic hook that writes the panic message + a short backtrace
@@ -101,43 +127,22 @@ pub unsafe extern "C" fn xshim_create(sample_rate: u32, channels: u32) -> *mut X
             parallelism: ParallelismOptions::AUTO_PER_CHANNEL,
         };
         let mut group = ChannelGroup::new(cfg);
-
-        // Wire deferred-drop sink + GC worker for old soundfonts.
-        let drop_sink: SoundfontDropSink =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let drop_sink: SoundfontDropSink = Arc::new(Mutex::new(Vec::new()));
         group.set_soundfont_drop_sink(drop_sink.clone());
-
-        let gc_alive = Arc::new(AtomicBool::new(true));
-        let gc_alive_t = gc_alive.clone();
-        let drop_sink_t = drop_sink.clone();
-        let gc_handle = thread::Builder::new()
-            .name("xshim-sf-gc".into())
-            .spawn(move || {
-                while gc_alive_t.load(Ordering::Relaxed) {
-                    let drained = {
-                        if let Ok(mut q) = drop_sink_t.lock() {
-                            std::mem::take(&mut *q)
-                        } else { Vec::new() }
-                    };
-                    // Drop here, off the audio thread. The Vec going out of
-                    // scope drops each Arc<dyn SoundfontBase> — if no other
-                    // refs (no live voices), this is where the heavy
-                    // sample buffers actually free.
-                    drop(drained);
-                    thread::sleep(std::time::Duration::from_millis(50));
-                }
-            })
-            .ok();
-
         Box::into_raw(Box::new(XSynthHandle {
             group,
             worker: None,
             drop_sink,
-            gc_alive,
-            gc_handle,
         }))
     }))
     .unwrap_or(ptr::null_mut())
+}
+
+unsafe fn cancel_inflight(h: &mut XSynthHandle) {
+    if let Some(mut w) = h.worker.take() {
+        w.cancel.store(true, Ordering::Release);
+        if let Some(jh) = w.handle.take() { let _ = jh.join(); }
+    }
 }
 
 #[no_mangle]
@@ -146,9 +151,6 @@ pub unsafe extern "C" fn xshim_destroy(handle: *mut XSynthHandle) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         let mut boxed = Box::from_raw(handle);
         cancel_inflight(&mut boxed);
-        // Tell the gc worker to exit, then join it.
-        boxed.gc_alive.store(false, Ordering::Release);
-        if let Some(jh) = boxed.gc_handle.take() { let _ = jh.join(); }
         drop(boxed);
     }));
 }
@@ -270,19 +272,11 @@ pub unsafe extern "C" fn xshim_all_notes_off(handle: *mut XSynthHandle) {
 #[no_mangle]
 pub unsafe extern "C" fn xshim_render(handle: *mut XSynthHandle, out: *mut f32, num_samples: usize) {
     if handle.is_null() || out.is_null() || num_samples == 0 { return; }
-    let result = catch_unwind(AssertUnwindSafe(|| {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
         let h = &mut *handle;
         let slc = std::slice::from_raw_parts_mut(out, num_samples);
         h.group.read_samples(slc);
     }));
-    if let Err(e) = result {
-        let msg = if let Some(s) = e.downcast_ref::<&str>() { s.to_string() }
-            else if let Some(s) = e.downcast_ref::<String>() { s.clone() }
-            else { "<no payload>".to_string() };
-        set_last_error(format!("panic in render: {msg}"));
-        // Zero the output so we hand the C side silence rather than UB.
-        std::ptr::write_bytes(out, 0, num_samples);
-    }
 }
 
 #[no_mangle]
@@ -298,21 +292,10 @@ pub unsafe extern "C" fn xshim_last_error(out_buf: *mut c_char, out_len: usize) 
     })
 }
 
-/// Cancel the in-flight load (if any) and join its thread. Drops the old
-/// soundfont from the channel group before any new load kicks off so peak
-/// memory stays bounded on a memory-tight device.
-unsafe fn cancel_inflight(h: &mut XSynthHandle) {
-    if let Some(mut w) = h.worker.take() {
-        w.cancel.store(true, Ordering::Release);
-        if let Some(jh) = w.handle.take() {
-            let _ = jh.join();
-        }
-    }
-}
-
-/// Drop the currently-loaded soundfont. Used before kicking off a load so
-/// new + old don't both live in RAM simultaneously.
-unsafe fn drop_current_soundfont(h: &mut XSynthHandle) {
+/// Send SetSoundfonts(empty) so the OLD soundfont gets pushed to drop_sink.
+/// The worker thread will then drain & drop it before allocating the new
+/// soundfont, keeping peak memory bounded.
+unsafe fn dispatch_drop_old(h: &mut XSynthHandle) {
     h.group.send_event(SynthEvent::AllChannels(
         ChannelEvent::Audio(ChannelAudioEvent::AllNotesKilled),
     ));
@@ -331,10 +314,8 @@ pub unsafe extern "C" fn xshim_load_sfz_async(handle: *mut XSynthHandle, path: *
         Err(_) => { set_last_error("path is not valid UTF-8"); return -1; }
     };
 
-    // Stop any in-flight load + drop the current soundfont so peak memory
-    // stays within budget while the new one loads.
     cancel_inflight(h);
-    drop_current_soundfont(h);
+    dispatch_drop_old(h);
 
     let status = Arc::new(AtomicU32::new(STATUS_LOADING));
     let cancel = Arc::new(AtomicBool::new(false));
@@ -343,10 +324,21 @@ pub unsafe extern "C" fn xshim_load_sfz_async(handle: *mut XSynthHandle, path: *
     let status_t = status.clone();
     let cancel_t = cancel.clone();
     let result_t = result.clone();
+    let drop_sink_t = h.drop_sink.clone();
 
     let join_handle = thread::Builder::new()
         .name("xshim-load".into())
         .spawn(move || {
+            // Drop any pending old soundfont(s) FIRST so we don't have OLD +
+            // NEW resident at the same time.
+            {
+                let owned = {
+                    if let Ok(mut q) = drop_sink_t.lock() {
+                        std::mem::take(&mut *q)
+                    } else { Vec::new() }
+                };
+                drop(owned);
+            }
             let stream_params = AudioStreamParams::new(44100, ChannelCount::Stereo);
             let opts = SoundfontInitOptions {
                 bank: None, preset: None,
@@ -355,6 +347,30 @@ pub unsafe extern "C" fn xshim_load_sfz_async(handle: *mut XSynthHandle, path: *
                 interpolator: Interpolator::Linear,
             };
             let pb = PathBuf::from(&cstr);
+            // Acquire the process-global load lock so peak memory stays
+            // bounded to ONE soundfont's allocation at a time.
+            let _guard = process_load_lock().lock();
+            // Cancel check after acquiring lock — caller may have signaled
+            // cancel while we were queued.
+            if cancel_t.load(Ordering::Relaxed) {
+                set_last_error("Load cancelled before start");
+                status_t.store(STATUS_CANCELLED, Ordering::Release);
+                return;
+            }
+            // OOM guard: refuse if RAM is too tight rather than abort the
+            // whole shim. Without this, two heavy DS patches concurrently
+            // resident push past Move's free RAM and Rust's alloc handler
+            // takes down the process.
+            let avail = available_memory_mb();
+            if avail > 0 && avail < MIN_FREE_MB_FOR_LOAD {
+                set_last_error(format!(
+                    "Insufficient memory to load ({} MB free, need ≥{} MB). \
+                     Switch other tracks to lighter patches.",
+                    avail, MIN_FREE_MB_FOR_LOAD
+                ));
+                status_t.store(STATUS_ERROR, Ordering::Release);
+                return;
+            }
             let load_res = catch_unwind(AssertUnwindSafe(|| {
                 SampleSoundfont::new_sfz_cancellable(pb, stream_params, opts, Some(cancel_t))
             }));
@@ -364,16 +380,15 @@ pub unsafe extern "C" fn xshim_load_sfz_async(handle: *mut XSynthHandle, path: *
                     status_t.store(STATUS_READY, Ordering::Release);
                 }
                 Ok(Err(e)) => {
-                    let msg = format!("{e:?}");
-                    set_last_error(format!("SampleSoundfont::new: {msg}"));
                     let is_cancel = matches!(e, xsynth_core::soundfont::LoadSfzError::Cancelled);
+                    set_last_error(format!("SampleSoundfont::new_sfz: {e:?}"));
                     status_t.store(
                         if is_cancel { STATUS_CANCELLED } else { STATUS_ERROR },
                         Ordering::Release,
                     );
                 }
                 Err(_) => {
-                    set_last_error("panic during load");
+                    set_last_error("panic during async load");
                     status_t.store(STATUS_ERROR, Ordering::Release);
                 }
             }
@@ -383,9 +398,7 @@ pub unsafe extern "C" fn xshim_load_sfz_async(handle: *mut XSynthHandle, path: *
         Ok(jh) => {
             h.worker = Some(LoadWorker {
                 handle: Some(jh),
-                status,
-                cancel,
-                result,
+                status, cancel, result,
             });
             0
         }
@@ -396,8 +409,6 @@ pub unsafe extern "C" fn xshim_load_sfz_async(handle: *mut XSynthHandle, path: *
     }
 }
 
-/// 0 idle / 1 loading / 2 ready / 3 error / 4 cancelled. Always returns a
-/// snapshot — caller can poll repeatedly.
 #[no_mangle]
 pub unsafe extern "C" fn xshim_load_status(handle: *const XSynthHandle) -> c_int {
     if handle.is_null() { return STATUS_IDLE as c_int; }
@@ -408,7 +419,6 @@ pub unsafe extern "C" fn xshim_load_status(handle: *const XSynthHandle) -> c_int
     }
 }
 
-/// Signal cancellation. Worker will return on its next sample boundary.
 #[no_mangle]
 pub unsafe extern "C" fn xshim_load_cancel(handle: *mut XSynthHandle) {
     if handle.is_null() { return; }
@@ -418,30 +428,23 @@ pub unsafe extern "C" fn xshim_load_cancel(handle: *mut XSynthHandle) {
     }
 }
 
-/// Apply a ready soundfont into the channel group. Returns 0 on success,
-/// -1 if no soundfont is ready. Resets worker state to Idle.
 #[no_mangle]
 pub unsafe extern "C" fn xshim_load_apply(handle: *mut XSynthHandle) -> c_int {
     if handle.is_null() { return -1; }
     let h = &mut *handle;
     let Some(w) = h.worker.as_mut() else { return -1; };
     if w.status.load(Ordering::Acquire) != STATUS_READY { return -1; }
-
     let sf_opt = w.result.lock().unwrap().take();
     let Some(sf) = sf_opt else { return -1; };
-
     let arc: Arc<dyn SoundfontBase> = Arc::new(sf);
     h.group.send_event(SynthEvent::AllChannels(ChannelEvent::Config(
         ChannelConfigEvent::SetSoundfonts(vec![arc]),
     )));
-
-    // Reap the worker thread now that we've consumed its output.
     if let Some(jh) = w.handle.take() { let _ = jh.join(); }
     h.worker = None;
     0
 }
 
-/// Clear error / cancelled status so subsequent loads can fire cleanly.
 #[no_mangle]
 pub unsafe extern "C" fn xshim_load_clear_status(handle: *mut XSynthHandle) {
     if handle.is_null() { return; }

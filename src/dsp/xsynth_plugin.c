@@ -84,11 +84,7 @@ static const host_api_v1_t *g_host = NULL;
 #define MAX_PRESETS 1024
 #define MAX_PATH_LEN 512
 #define MAX_NAME_LEN 128
-/* ~900ms at 44.1k/128. Longer than the sfizz default (~150ms) because xsynth
- * loads take 2-15s for big DS libraries, and accidentally landing on a heavy
- * patch while scrolling past it locks the audio thread for that whole load.
- * 900ms gives the user a wide window to keep scrolling without committing. */
-#define DEBOUNCE_BLOCKS 310
+#define DEBOUNCE_BLOCKS 56
 
 typedef struct {
     char name[MAX_NAME_LEN];
@@ -122,20 +118,7 @@ typedef struct {
     char load_error[256];
     int debounce_remaining;
     int pending_load;
-    int loading_active;            /* 1 while xshim_load_sfz is in flight or
-                                    * a debounced load is pending; UI uses
-                                    * this to show "Loading…". */
     int suppress_next_preset_set;
-    /* DS knob inventory + live state. Populated by the converter on each
-     * preset load. set_param("knob_<idx>", "0..1") translates to
-     * xshim_cc(synth, 0, cc, fraction*127) and updates `current_t01`
-     * so state save persists user-adjusted values. */
-    ds_xsynth_knob_t knobs[DS_MAX_KNOBS];
-    int knob_count;
-    int knob_resend_pending;       /* 1 after preset apply: next render
-                                    * resends all knob CCs so the new
-                                    * voices pick up the load-time CC
-                                    * values immediately. */
     float *render_buf;             /* interleaved L/R/L/R..., 2 * frames */
 } xsynth_instance_t;
 
@@ -355,12 +338,9 @@ static void sync_preset_display(xsynth_instance_t *inst) {
     }
 }
 
-/* Kicks off an async load via the shim. Returns immediately. Caller polls
- * xshim_load_status from the render loop and calls xshim_load_apply once it
- * goes Ready, or xshim_load_cancel + new dispatch if the user moved on. */
 static int load_sfz_file(xsynth_instance_t *inst, const char *path) {
     char msg[512];
-    snprintf(msg, sizeof(msg), "Loading (async): %s", path);
+    snprintf(msg, sizeof(msg), "Loading: %s", path);
     plugin_log(msg);
     struct stat st;
     if (stat(path, &st) != 0) {
@@ -368,27 +348,21 @@ static int load_sfz_file(xsynth_instance_t *inst, const char *path) {
         return -1;
     }
 
-    /* .dspreset → convert to .converted.sfz alongside the source. The
-     * conversion is fast (~100 ms even for the heavy patches); only the
-     * sample decoding inside xsynth needs the background thread. */
+    /* .dspreset → convert to .converted.sfz next to source, load that. */
     const char *ext = strrchr(path, '.');
-    char *converted = NULL;
     const char *load_path = path;
-    inst->knob_count = 0;
+    char *converted = NULL;
     if (ext && strcasecmp(ext, ".dspreset") == 0) {
-        converted = convert_dspreset_to_xsynth_sfz(
-            path, inst->knobs, &inst->knob_count);
+        converted = convert_dspreset_to_xsynth_sfz(path);
         if (!converted) {
             plugin_log("DS converter returned NULL");
             snprintf(inst->load_error, sizeof(inst->load_error),
                      "DecentSampler conversion failed");
             return -1;
         }
-        snprintf(msg, sizeof(msg), "Converted dspreset → %s (%d knobs)",
-                 converted, inst->knob_count);
+        snprintf(msg, sizeof(msg), "Converted dspreset → %s", converted);
         plugin_log(msg);
         load_path = converted;
-        inst->knob_resend_pending = 1;
     }
 
     int rc = xshim_load_sfz_async(inst->synth, load_path);
@@ -422,12 +396,8 @@ static void set_preset_index(xsynth_instance_t *inst, int index) {
     inst->current_preset = index;
     sync_preset_display(inst);
     xshim_all_notes_off(inst->synth);
-    /* If a load is already running for a different preset, cancel it so the
-     * worker thread aborts at the next sample boundary instead of forcing us
-     * to wait through 15s of decoding for a patch we no longer want. */
     xshim_load_cancel(inst->synth);
     inst->pending_load = 1;
-    inst->loading_active = 1;
     inst->debounce_remaining = DEBOUNCE_BLOCKS;
 }
 
@@ -438,10 +408,8 @@ static void set_preset_index_immediate(xsynth_instance_t *inst, int index) {
     inst->current_preset = index;
     sync_preset_display(inst);
     xshim_all_notes_off(inst->synth);
-    xshim_load_cancel(inst->synth);
     inst->pending_load = 0;
     inst->debounce_remaining = 0;
-    inst->loading_active = 1;
     do_load_preset(inst);
 }
 
@@ -615,30 +583,6 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
          * the value is captured but takes effect on the next preset load. */
     } else if (strcmp(key, "all_notes_off") == 0 || strcmp(key, "panic") == 0) {
         if (inst->synth) xshim_all_notes_off(inst->synth);
-    } else if (strncmp(key, "knob_", 5) == 0) {
-        /* Only respond to exact "knob_<int>" keys (e.g. "knob_3"). The
-         * shell may also send sibling keys like "knob_3_name" or
-         * "knob_3_value" for display purposes — if we treat those as
-         * value writes, atof on a non-numeric val ("Tone", say) returns
-         * 0 and silently snaps the knob to zero. */
-        const char *num = key + 5;
-        int valid_int = (*num != '\0');
-        for (const char *p = num; *p; p++) {
-            if (*p < '0' || *p > '9') { valid_int = 0; break; }
-        }
-        if (valid_int) {
-            int idx = atoi(num);
-            if (idx >= 0 && idx < inst->knob_count && inst->synth) {
-                double t = atof(val);
-                if (t < 0) t = 0; if (t > 1) t = 1;
-                inst->knobs[idx].current_t01 = t;
-                int cc_val = (int)(t * 127.0 + 0.5);
-                if (cc_val < 0) cc_val = 0; if (cc_val > 127) cc_val = 127;
-                xshim_cc(inst->synth, 0,
-                         (uint8_t)inst->knobs[idx].cc_number,
-                         (uint8_t)cc_val);
-            }
-        }
     } else if (strcmp(key, "state") == 0) {
         float f;
         char name[MAX_NAME_LEN];
@@ -687,15 +631,10 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
     else if (strcmp(key, "preset_count") == 0 || strcmp(key, "total_patches") == 0)
         return snprintf(buf, buf_len, "%d", inst->preset_count);
     else if (strcmp(key, "preset_name") == 0 || strcmp(key, "patch_name") == 0) {
-        if (inst->loading_active)
-            return snprintf(buf, buf_len, "Loading… %s", inst->preset_name);
         strncpy(buf, inst->preset_name, buf_len - 1);
         buf[buf_len - 1] = '\0';
         return strlen(buf);
     }
-    /* Also expose as a separate flag in case the host can subscribe. */
-    else if (strcmp(key, "loading") == 0)
-        return snprintf(buf, buf_len, "%d", inst->loading_active ? 1 : 0);
     else if (strcmp(key, "name") == 0)
         return snprintf(buf, buf_len, "SFZ");
     else if (strcmp(key, "bank_name") == 0 || strcmp(key, "instrument_name") == 0) {
@@ -726,7 +665,8 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
     else if (strcmp(key, "voices") == 0)
         return snprintf(buf, buf_len, "%d", inst->voices);
     else if (strcmp(key, "chain_params") == 0) {
-        int written = snprintf(buf, buf_len,
+        /* Phase 1: no DS knobs. octave/gain/voices live in the params menu. */
+        return snprintf(buf, buf_len,
             "[{\"key\":\"preset\",\"name\":\"Instrument\","
              "\"type\":\"int\",\"min\":0,\"max_param\":\"preset_count\","
              "\"default\":0},"
@@ -735,48 +675,8 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
              "{\"key\":\"gain\",\"name\":\"Gain\","
              "\"type\":\"float\",\"min\":0,\"max\":2,\"default\":1.0,\"step\":0.02},"
              "{\"key\":\"voices\",\"name\":\"Voices\","
-             "\"type\":\"int\",\"min\":4,\"max\":128,\"default\":64}");
-        /* Up to 8 DS knobs surfaced as live encoder params. Each is
-         * normalized 0..1 so encoder feel is uniform across patches.
-         * `default` is the dspreset-time value (frozen) — the user's live
-         * value is reflected via get_param("knob_<idx>") returning
-         * current_t01. Setting `default` to the dynamic value caused the
-         * shell to interpret it as a snap-to target on encoder release. */
-        for (int i = 0; i < 8; i++) {
-            if (i < inst->knob_count) {
-                ds_xsynth_knob_t *k = &inst->knobs[i];
-                written += snprintf(buf + written, buf_len - written,
-                    ",{\"key\":\"%s\",\"name\":\"%s\","
-                    "\"type\":\"float\",\"min\":0,\"max\":1,"
-                    "\"default\":%g,\"step\":0.02,\"unit\":\"%%\"}",
-                    k->key, k->label, k->dspreset_t01);
-            } else {
-                written += snprintf(buf + written, buf_len - written,
-                    ",{\"key\":\"knob_%d\",\"name\":\"—\","
-                    "\"type\":\"float\",\"min\":0,\"max\":1,"
-                    "\"default\":0,\"step\":0.02}", i);
-            }
-        }
-        written += snprintf(buf + written, buf_len - written, "]");
-        return written;
+             "\"type\":\"int\",\"min\":4,\"max\":128,\"default\":64}]");
     }
-    else if (strncmp(key, "knob_", 5) == 0) {
-        /* Per-encoder name + value probes used by the shadow UI. */
-        const char *suffix = strchr(key + 5, '_');
-        if (suffix && strcmp(suffix, "_name") == 0) {
-            int n = atoi(key + 5);
-            int idx = n - 1;
-            if (idx >= 0 && idx < inst->knob_count)
-                return snprintf(buf, buf_len, "%s", inst->knobs[idx].label);
-            return snprintf(buf, buf_len, "—");
-        }
-        int idx = atoi(key + 5);
-        if (idx >= 0 && idx < inst->knob_count)
-            return snprintf(buf, buf_len, "%g", inst->knobs[idx].current_t01);
-        return 0;
-    }
-    else if (strcmp(key, "knob_count") == 0)
-        return snprintf(buf, buf_len, "%d", inst->knob_count);
     else if (strcmp(key, "preset_list") == 0) {
         int written = snprintf(buf, buf_len, "[");
         for (int i = 0; i < inst->preset_count && written < buf_len - 80; i++) {
@@ -812,48 +712,27 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
         return written;
     }
     else if (strcmp(key, "state") == 0) {
-        int written = snprintf(buf, buf_len,
+        return snprintf(buf, buf_len,
             "{\"preset_name\":\"%s\",\"instrument_name\":\"%s\","
             "\"preset\":%d,\"octave_transpose\":%d,\"gain\":%.2f,"
-            "\"voices\":%d",
+            "\"voices\":%d}",
             inst->preset_name, inst->instrument_name,
             inst->current_preset, inst->octave_transpose, inst->gain,
             inst->voices);
-        for (int i = 0; i < inst->knob_count && written < buf_len - 32; i++) {
-            written += snprintf(buf + written, buf_len - written,
-                ",\"knob_%d\":%g", i, inst->knobs[i].current_t01);
-        }
-        written += snprintf(buf + written, buf_len - written, "}");
-        return written;
     }
     else if (strcmp(key, "ui_hierarchy") == 0) {
-        int written = 0;
-        written += snprintf(buf + written, buf_len - written,
+        return snprintf(buf, buf_len,
             "{\"modes\":null,\"levels\":{\"root\":{"
             "\"label\":\"SFZ\","
             "\"list_param\":\"preset\","
             "\"count_param\":\"preset_count\","
             "\"name_param\":\"preset_name\","
             "\"children\":null,"
-            "\"knobs\":[");
-        /* Encoder row: live DS knobs (up to 8), otherwise placeholders. */
-        for (int i = 0; i < 8; i++) {
-            written += snprintf(buf + written, buf_len - written,
-                                "%s\"knob_%d\"", (i ? "," : ""), i);
-        }
-        written += snprintf(buf + written, buf_len - written,
-            "],\"params\":["
+            "\"knobs\":[],\"params\":["
                 "{\"key\":\"octave_transpose\",\"label\":\"Octave\"},"
                 "{\"key\":\"gain\",\"label\":\"Gain\"},"
-                "{\"key\":\"voices\",\"label\":\"Voices\"}");
-        for (int i = 0; i < inst->knob_count; i++) {
-            written += snprintf(buf + written, buf_len - written,
-                ",{\"key\":\"%s\",\"label\":\"%s\","
-                "\"min\":0,\"max\":1}",
-                inst->knobs[i].key, inst->knobs[i].label);
-        }
-        written += snprintf(buf + written, buf_len - written,
-            ",{\"level\":\"jump\",\"label\":\"Jump To Library\"}"
+                "{\"key\":\"voices\",\"label\":\"Voices\"},"
+                "{\"level\":\"jump\",\"label\":\"Jump To Library\"}"
             "]},"
             "\"jump\":{"
                 "\"label\":\"Library\","
@@ -862,7 +741,6 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
                 "\"children\":null,"
                 "\"knobs\":[],\"params\":[]"
             "}}}");
-        return written;
     }
 
     return -1;
@@ -882,7 +760,6 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
         return;
     }
 
-    /* Debounce window: user is still scrolling, hold off on dispatching. */
     if (inst->pending_load) {
         if (inst->debounce_remaining > 0) {
             inst->debounce_remaining--;
@@ -890,33 +767,17 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
             return;
         }
         inst->pending_load = 0;
-        /* Async dispatch — returns immediately. From here on the load runs
-         * in a background thread; we poll status below. */
-        do_load_preset(inst);
+        do_load_preset(inst);  /* async dispatch — returns immediately */
     }
 
-    /* Poll the async load. While loading: render silence. On Ready: swap in.
-     * On Error/Cancelled: log + clear status. */
+    /* Poll the async load worker. Render silence while loading; swap in the
+     * new soundfont when status flips to Ready. */
     int load_st = xshim_load_status(inst->synth);
     if (load_st == XSHIM_LOAD_LOADING) {
-        inst->loading_active = 1;
         memset(out_interleaved_lr, 0, frames * 2 * sizeof(int16_t));
         return;
     } else if (load_st == XSHIM_LOAD_READY) {
         xshim_load_apply(inst->synth);
-        inst->loading_active = 0;
-        /* Push the load-time CC value for each knob now that voices exist
-         * for the new soundfont. Otherwise the patch sounds with every CC
-         * at 0 until the user touches a knob. */
-        if (inst->knob_resend_pending) {
-            for (int i = 0; i < inst->knob_count; i++) {
-                ds_xsynth_knob_t *k = &inst->knobs[i];
-                int v = (int)(k->current_t01 * 127.0 + 0.5);
-                if (v < 0) v = 0; if (v > 127) v = 127;
-                xshim_cc(inst->synth, 0, (uint8_t)k->cc_number, (uint8_t)v);
-            }
-            inst->knob_resend_pending = 0;
-        }
         plugin_log("xsynth: async SFZ ready and applied");
     } else if (load_st == XSHIM_LOAD_ERROR) {
         char err[256] = {0};
@@ -924,13 +785,8 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
         snprintf(inst->load_error, sizeof(inst->load_error),
                  "xsynth load failed: %s", err[0] ? err : "unknown");
         xshim_load_clear_status(inst->synth);
-        inst->loading_active = 0;
     } else if (load_st == XSHIM_LOAD_CANCELLED) {
         xshim_load_clear_status(inst->synth);
-        /* loading_active stays 1 if the cancel was triggered by a new
-         * preset that's still in its debounce window — set_preset_index
-         * already set it. Otherwise clear it. */
-        if (!inst->pending_load) inst->loading_active = 0;
     }
 
     /* One-shot CPU/scheduler setup. Matches what sfz_plugin.c does — pin to

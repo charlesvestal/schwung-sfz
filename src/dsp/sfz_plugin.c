@@ -14,6 +14,9 @@
  * V2 API only - instance-based for multi-instance support.
  */
 
+#define _GNU_SOURCE   /* enables CPU_SET / sched_setaffinity in <sched.h>; must
+                       * come before any system header so the macros are picked
+                       * up when those headers transitively pull in features.h */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,6 +25,9 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <time.h>
+#include <sched.h>
 
 /* Include plugin API - inline definitions to avoid path issues */
 #include <stdint.h>
@@ -81,6 +87,21 @@ typedef struct {
     int instrument_idx;             /* Index into instruments[] */
 } preset_entry_t;
 
+/* Per-preset DS-knob entry. Populated by the converter when a dspreset loads;
+ * empty for raw .sfz presets. Each knob owns one synthetic MIDI CC; moving the
+ * knob sends that CC via sfizz_send_cc, which sfizz routes through the
+ * `_oncc<N>` opcodes the converter emitted. */
+#define MAX_DS_KNOBS 16
+#define DS_KNOB_LIVE_COUNT 8       /* All 8 Move encoders are DS knobs;
+                                     * octave/gain live in the params menu. */
+typedef struct {
+    char key[16];                  /* "knob_0"…"knob_15" */
+    char label[32];                /* DS `label=` (auto-derived if empty) */
+    double min, max;               /* From <control minValue=/maxValue=> */
+    double current;                /* Current logical position (min..max) */
+    int cc_number;                 /* Synthetic MIDI CC (102..117) */
+} ds_knob_t;
+
 /* Per-Instance State */
 typedef struct {
     sfizz_synth_t *synth;
@@ -88,6 +109,7 @@ typedef struct {
     int instrument_count;
     int preset_count;
     int octave_transpose;
+    int voices;                     /* sfizz polyphony cap */
     float gain;
     instrument_entry_t instruments[MAX_INSTRUMENTS];
     preset_entry_t presets[MAX_PRESETS];
@@ -102,6 +124,8 @@ typedef struct {
                                      * immediately after set_param('bank', N).
                                      * We set the flag in the bank handler
                                      * and consume it in the preset handler. */
+    ds_knob_t knobs[MAX_DS_KNOBS];
+    int knob_count;
     float *left_buf;
     float *right_buf;
 } sfz_instance_t;
@@ -420,6 +444,14 @@ static void xml_get_attr(const char *tag, const char *attr_name, char *out_val, 
 
 /* DecentSampler effect descriptor, indexed by `position` from the dspreset. */
 #define DS_MAX_FX 8
+#define DS_MAX_GROUPS 32
+
+/* Linear amplitude (0..>0) → dB, with a floor for true mute. */
+static double lin_to_db(double x) {
+    if (x <= 1e-5) return -80.0;
+    return 20.0 * log10(x);
+}
+
 typedef struct {
     char type[32];
     char freq[32];        /* lowpass: frequency */
@@ -556,7 +588,8 @@ static int compute_binding_value(const char *ctrl_tag, const char *bind_tag,
 static void apply_ui_overrides(const char *src,
                                ds_effect_t fx[DS_MAX_FX], int fx_count,
                                char env_attack[32], char env_decay[32],
-                               char env_sustain[32], char env_release[32]) {
+                               char env_sustain[32], char env_release[32],
+                               double group_amp_db[DS_MAX_GROUPS]) {
     /* Some dspresets are sloppy about pairing tags (e.g. ASIMOV opens
      * `<labeled-knob>` and closes with `</control>`), so when looking for the
      * end of a control we accept whichever closing tag comes first. */
@@ -615,55 +648,66 @@ static void apply_ui_overrides(const char *src,
                     closer_skip = 15;
             }
 
-            const char *binding = strstr(bind_search_start, "<binding");
-            if (!binding || binding > bind_search_end) {
-                p = self_closed ? (tag_end + 1) : (bind_search_end + closer_skip);
-                continue;
-            }
+            /* Walk every <binding> inside this control (a single labeled-knob
+             * can fan out to multiple groups, e.g. WörliTzer's "Line" knob
+             * binds AMP_VOLUME at positions 1 AND 5). */
+            const char *bp = bind_search_start;
+            while (bp && bp < bind_search_end) {
+                const char *binding = strstr(bp, "<binding");
+                if (!binding || binding >= bind_search_end) break;
 
-            const char *bind_end = strchr(binding, '>');
-            if (!bind_end) {
-                p = bind_search_end;
-                continue;
-            }
+                const char *bind_end = strchr(binding, '>');
+                if (!bind_end || bind_end > bind_search_end) break;
 
-            char bind_tag[512];
-            int blen = (int)(bind_end - binding);
-            if (blen > 511) blen = 511;
-            memcpy(bind_tag, binding, blen);
-            bind_tag[blen] = '\0';
+                char bind_tag[512];
+                int blen = (int)(bind_end - binding);
+                if (blen > 511) blen = 511;
+                memcpy(bind_tag, binding, blen);
+                bind_tag[blen] = '\0';
 
-            char param[64] = "", position_str[16] = "";
-            xml_get_attr(bind_tag, "parameter", param, sizeof(param));
-            xml_get_attr(bind_tag, "position",  position_str, sizeof(position_str));
+                char param[64] = "", position_str[16] = "", level[32] = "";
+                xml_get_attr(bind_tag, "parameter", param,        sizeof(param));
+                xml_get_attr(bind_tag, "position",  position_str, sizeof(position_str));
+                xml_get_attr(bind_tag, "level",     level,        sizeof(level));
 
-            char effective[64];
-            if (param[0] && compute_binding_value(ctrl_tag, bind_tag,
-                                                   effective, sizeof(effective))) {
-                int position = position_str[0] ? atoi(position_str) : 0;
+                char effective[64];
+                if (param[0] && compute_binding_value(ctrl_tag, bind_tag,
+                                                       effective, sizeof(effective))) {
+                    int position = position_str[0] ? atoi(position_str) : 0;
 
-                if (strcmp(param, "ENV_ATTACK") == 0) {
-                    strncpy(env_attack, effective, 31);  env_attack[31] = '\0';
-                } else if (strcmp(param, "ENV_DECAY") == 0) {
-                    strncpy(env_decay, effective, 31);   env_decay[31]  = '\0';
-                } else if (strcmp(param, "ENV_SUSTAIN") == 0) {
-                    strncpy(env_sustain, effective, 31); env_sustain[31] = '\0';
-                } else if (strcmp(param, "ENV_RELEASE") == 0) {
-                    strncpy(env_release, effective, 31); env_release[31] = '\0';
-                } else if (position >= 0 && position < fx_count) {
-                    ds_effect_t *f = &fx[position];
-                    if (strcmp(param, "FX_FILTER_FREQUENCY") == 0) {
-                        strncpy(f->freq, effective, 31); f->freq[31] = '\0';
-                    } else if (strcmp(param, "FX_FILTER_RESONANCE") == 0) {
-                        strncpy(f->resonance, effective, 31); f->resonance[31] = '\0';
-                    } else if (strcmp(param, "FX_REVERB_WET_LEVEL") == 0) {
-                        strncpy(f->wet_level, effective, 31); f->wet_level[31] = '\0';
-                    } else if (strcmp(param, "FX_REVERB_ROOM_SIZE") == 0) {
-                        strncpy(f->room_size, effective, 31); f->room_size[31] = '\0';
-                    } else if (strcmp(param, "FX_REVERB_DAMPING") == 0) {
-                        strncpy(f->damping, effective, 31); f->damping[31] = '\0';
+                    if (strcmp(param, "ENV_ATTACK") == 0) {
+                        strncpy(env_attack, effective, 31);  env_attack[31] = '\0';
+                    } else if (strcmp(param, "ENV_DECAY") == 0) {
+                        strncpy(env_decay, effective, 31);   env_decay[31]  = '\0';
+                    } else if (strcmp(param, "ENV_SUSTAIN") == 0) {
+                        strncpy(env_sustain, effective, 31); env_sustain[31] = '\0';
+                    } else if (strcmp(param, "ENV_RELEASE") == 0) {
+                        strncpy(env_release, effective, 31); env_release[31] = '\0';
+                    } else if ((strcmp(param, "AMP_VOLUME") == 0 ||
+                                strcmp(param, "TAG_VOLUME") == 0) &&
+                               strcmp(level, "group") == 0 &&
+                               position >= 0 && position < DS_MAX_GROUPS) {
+                        /* Knob's effective value is a 0..1 linear amp factor.
+                         * Convert to dB so it composes with the group's own
+                         * <group volume=...> attribute additively. */
+                        group_amp_db[position] = lin_to_db(atof(effective));
+                    } else if (position >= 0 && position < fx_count) {
+                        ds_effect_t *f = &fx[position];
+                        if (strcmp(param, "FX_FILTER_FREQUENCY") == 0) {
+                            strncpy(f->freq, effective, 31); f->freq[31] = '\0';
+                        } else if (strcmp(param, "FX_FILTER_RESONANCE") == 0) {
+                            strncpy(f->resonance, effective, 31); f->resonance[31] = '\0';
+                        } else if (strcmp(param, "FX_REVERB_WET_LEVEL") == 0) {
+                            strncpy(f->wet_level, effective, 31); f->wet_level[31] = '\0';
+                        } else if (strcmp(param, "FX_REVERB_ROOM_SIZE") == 0) {
+                            strncpy(f->room_size, effective, 31); f->room_size[31] = '\0';
+                        } else if (strcmp(param, "FX_REVERB_DAMPING") == 0) {
+                            strncpy(f->damping, effective, 31); f->damping[31] = '\0';
+                        }
                     }
                 }
+
+                bp = bind_end + 1;
             }
 
             p = self_closed ? (tag_end + 1) : (bind_search_end + closer_skip);
@@ -754,6 +798,11 @@ static int resolve_cc_target(const char *ds_param, cc_target_t *out) {
         snprintf(out->opcode, sizeof(out->opcode), "amplitude");
         out->scale = 100.0;          /* DS 0..1 → sfizz 0..100% */
         out->multiplicative_mod = 1; /* sfizz amplitude mod is *= */
+    } else if (strcmp(ds_param, "LEVEL") == 0) {
+        /* DS gain-effect `LEVEL` (dB). Maps onto sfizz `global_volume`,
+         * which the gain effect's static `level=` is already emitting at
+         * <global> scope, so CC just moves the same opcode at runtime. */
+        snprintf(out->opcode, sizeof(out->opcode), "global_volume");
     } else if (strcmp(ds_param, "FX_REVERB_WET_LEVEL") == 0) {
         snprintf(out->opcode, sizeof(out->opcode), "reverb_wet");
         out->scale = 100.0;
@@ -784,9 +833,17 @@ typedef struct {
                              * patch loads at the position the dspreset
                              * intended. Defaults to 127 (full) when the
                              * binding is level=instrument with no UI ctrl. */
+    int target_group;       /* Group position for group-scoped bindings
+                             * (AMP_VOLUME at level=group), -1 if the
+                             * binding is global. Group-scoped bindings are
+                             * emitted inside their `<group>` block at SFZ
+                             * emit time so per-group amp can be controlled
+                             * independently — otherwise sfizz reads
+                             * `amplitude_oncc<N>` at <global> scope and one
+                             * CC ends up affecting every group. */
 } ds_cc_binding_t;
 
-#define DS_MAX_CC 16
+#define DS_MAX_CC 32
 
 /* Parse <midi><cc> blocks and resolve each binding to a sfizz opcode + range.
  * Returns the number of bindings collected. */
@@ -843,6 +900,7 @@ static int parse_midi_bindings(const char *src, ds_cc_binding_t bindings[DS_MAX_
         const char *target_param = NULL;
         double v_at_0 = 0, v_at_127 = 0;
         int cc_at_load = 127;       /* default for level=instrument */
+        int target_group = -1;      /* set when the target binding is level=group */
 
         /* CC bindings have their own translation that maps CC 0..127 to
          * an output range. Apply it first to get values at the CC endpoints. */
@@ -853,6 +911,11 @@ static int parse_midi_bindings(const char *src, ds_cc_binding_t bindings[DS_MAX_
             target_param = param;
             v_at_0 = cc_v0;
             v_at_127 = cc_v127;
+        } else if (strcmp(level, "group") == 0) {
+            target_param = param;
+            v_at_0 = cc_v0;
+            v_at_127 = cc_v127;
+            if (pos_str[0]) target_group = atoi(pos_str);
         } else if (strcmp(level, "ui") == 0 && strcmp(param, "VALUE") == 0 &&
                    pos_str[0]) {
             int target_pos = atoi(pos_str);
@@ -883,8 +946,12 @@ static int parse_midi_bindings(const char *src, ds_cc_binding_t bindings[DS_MAX_
             memcpy(t_bind_tag, t_bind, tblen);
             t_bind_tag[tblen] = '\0';
 
-            char t_param[64];
-            xml_get_attr(t_bind_tag, "parameter", t_param, sizeof(t_param));
+            char t_param[64], t_level[32], t_pos_str[16];
+            xml_get_attr(t_bind_tag, "parameter", t_param,    sizeof(t_param));
+            xml_get_attr(t_bind_tag, "level",     t_level,    sizeof(t_level));
+            xml_get_attr(t_bind_tag, "position",  t_pos_str,  sizeof(t_pos_str));
+            if (strcmp(t_level, "group") == 0 && t_pos_str[0])
+                target_group = atoi(t_pos_str);
 
             char cmin[64], cmax[64], cval[64];
             xml_get_attr(ctrl_tag, "minValue", cmin, sizeof(cmin));
@@ -926,6 +993,7 @@ static int parse_midi_bindings(const char *src, ds_cc_binding_t bindings[DS_MAX_
             b->v_at_0 = v_at_0;
             b->v_at_127 = v_at_127;
             b->cc_at_load = cc_at_load;
+            b->target_group = target_group;
         }
 
         p = cc_close;
@@ -933,10 +1001,380 @@ static int parse_midi_bindings(const char *src, ds_cc_binding_t bindings[DS_MAX_
     return n;
 }
 
+/* Read the `name=` attribute of the Nth <group> in document order.
+ * Used as a label fallback for AMP_VOLUME/TAG_VOLUME knobs when the
+ * `<labeled-knob>` itself has an empty `label=` (common in image-themed
+ * patches like WörliTzer). Returns 1 on success. */
+static int get_group_name(const char *src, int position, char *out, int out_len) {
+    out[0] = '\0';
+    const char *p = src;
+    int idx = 0;
+    while ((p = strstr(p, "<group")) != NULL) {
+        /* Skip "<groups" tag */
+        if (p[6] == 's' || p[6] == 'S') { p += 7; continue; }
+        const char *tag_end = strchr(p, '>');
+        if (!tag_end) break;
+        if (idx == position) {
+            char tag[1024];
+            int tlen = (int)(tag_end - p);
+            if (tlen > 1023) tlen = 1023;
+            memcpy(tag, p, tlen);
+            tag[tlen] = '\0';
+            xml_get_attr(tag, "name", out, out_len);
+            return out[0] ? 1 : 0;
+        }
+        idx++;
+        p = tag_end + 1;
+    }
+    return 0;
+}
+
+/* Short fallback label derived from a CC target's DS parameter name.
+ * Returns NULL when the target has no obvious short alias. */
+static const char *target_alias(const char *ds_param) {
+    if (!ds_param || !ds_param[0]) return NULL;
+    if (strcmp(ds_param, "FX_FILTER_FREQUENCY") == 0) return "Filter";
+    if (strcmp(ds_param, "FX_FILTER_RESONANCE") == 0) return "Reso";
+    if (strcmp(ds_param, "FX_REVERB_WET_LEVEL")  == 0) return "Reverb";
+    if (strcmp(ds_param, "FX_REVERB_ROOM_SIZE")  == 0) return "Room";
+    if (strcmp(ds_param, "FX_REVERB_DAMPING")    == 0) return "Damp";
+    if (strcmp(ds_param, "ENV_ATTACK")  == 0) return "Attack";
+    if (strcmp(ds_param, "ENV_DECAY")   == 0) return "Decay";
+    if (strcmp(ds_param, "ENV_SUSTAIN") == 0) return "Sustain";
+    if (strcmp(ds_param, "ENV_RELEASE") == 0) return "Release";
+    if (strcmp(ds_param, "LEVEL")       == 0) return "Level";
+    return NULL;
+}
+
+/* Scan <midi><cc> for a `level="ui" position="N"` binding and return that
+ * CC number. Many patches (WörliTzer, ASIMOV) ship a `<midi>` block that
+ * already maps real MIDI CCs to their UI controls — when present, we
+ * reuse those CC numbers for the Move encoders so the encoder turn
+ * exercises the existing `_oncc<N>` bindings instead of trying to add a
+ * duplicate synthetic CC (which the dedupe pass would drop anyway). */
+static int find_patch_cc_for_control(const char *src, int control_position) {
+    const char *midi = strstr(src, "<midi");
+    if (!midi) return -1;
+    const char *midi_end = strstr(midi, "</midi>");
+    if (!midi_end) midi_end = src + strlen(src);
+
+    const char *p = midi;
+    while (p < midi_end) {
+        const char *cc = strstr(p, "<cc ");
+        if (!cc || cc >= midi_end) break;
+        const char *cc_tag_end = strchr(cc, '>');
+        if (!cc_tag_end) break;
+        const char *cc_close = strstr(cc_tag_end, "</cc>");
+        if (!cc_close || cc_close > midi_end) cc_close = midi_end;
+
+        char cc_tag[256];
+        int tlen = (int)(cc_tag_end - cc);
+        if (tlen > 255) tlen = 255;
+        memcpy(cc_tag, cc, tlen);
+        cc_tag[tlen] = '\0';
+        char num_str[16];
+        xml_get_attr(cc_tag, "number", num_str, sizeof(num_str));
+        int cc_num = num_str[0] ? atoi(num_str) : 0;
+
+        const char *bind = strstr(cc_tag_end, "<binding");
+        if (bind && bind < cc_close) {
+            const char *bend = strchr(bind, '>');
+            if (bend && bend < cc_close) {
+                char btag[512];
+                int blen = (int)(bend - bind);
+                if (blen > 511) blen = 511;
+                memcpy(btag, bind, blen);
+                btag[blen] = '\0';
+                char level[32], param[64], pos_str[16];
+                xml_get_attr(btag, "level",     level,   sizeof(level));
+                xml_get_attr(btag, "parameter", param,   sizeof(param));
+                xml_get_attr(btag, "position",  pos_str, sizeof(pos_str));
+                int bpos = pos_str[0] ? atoi(pos_str) : -1;
+                if (strcmp(level, "ui") == 0 &&
+                    strcmp(param, "VALUE") == 0 &&
+                    bpos == control_position &&
+                    cc_num > 0 && cc_num < 128) {
+                    return cc_num;
+                }
+            }
+        }
+        p = cc_close + 5;
+    }
+    return -1;
+}
+
+/* Allocate the next free synthetic CC from pool 102..117.
+ * 102..119 are MIDI "undefined controllers", but 118/119 are sometimes used by
+ * sfizz for poly aftertouch / channel pressure mods, so stop at 117 → 16 CCs.
+ * Skips any CC already used by the patch's own <midi><cc> bindings. */
+static int alloc_synthetic_cc(int used[128], int *cursor) {
+    while (*cursor <= 117) {
+        int cc = (*cursor)++;
+        if (!used[cc]) { used[cc] = 1; return cc; }
+    }
+    return -1;
+}
+
+/* Walk every <labeled-knob> / <control> in document order and append
+ * synthetic CC bindings — one CC per control, shared by every supported
+ * <binding> inside it (matches DS semantics where one knob can drive
+ * multiple targets, e.g. WörliTzer's Line knob → group positions 1 AND 5).
+ *
+ * Side effects:
+ *   bindings[] grows by up to MAX_DS_KNOBS entries.
+ *   *binding_count is updated.
+ *   knobs_out[] is populated with one entry per allocated synthetic CC.
+ *   *knobs_out_count returns the populated count.
+ *
+ * Controls whose every binding has an unsupported parameter (FX_DELAY_*,
+ * FX_CHORUS_*, parameterName per-tag bars, etc.) are skipped — the knob
+ * is hidden rather than shown inert. */
+static void enumerate_ui_knobs(const char *src, int fx_count,
+                               ds_cc_binding_t bindings[], int *binding_count,
+                               ds_knob_t knobs_out[MAX_DS_KNOBS],
+                               int *knobs_out_count,
+                               double group_amp_db[DS_MAX_GROUPS],
+                               int group_cc_driven[DS_MAX_GROUPS]) {
+    /* Mark CCs already claimed by the patch's own <midi> block so we don't
+     * collide. */
+    int used[128] = {0};
+    for (int i = 0; i < *binding_count; i++) {
+        int n = bindings[i].cc_number;
+        if (n >= 0 && n < 128) used[n] = 1;
+    }
+    int next_cc = 102;
+    int kc = 0;
+
+    /* Walk UI controls in **document order** (interleaved <control> and
+     * <labeled-knob>). The patch's `<midi><cc>` block references controls
+     * by their absolute document index, so processing the two element
+     * types separately would mis-align position numbers. */
+    const char *p = src;
+    int control_position = 0;
+    while (kc < MAX_DS_KNOBS) {
+        const char *c1 = strstr(p, "<control");
+        const char *c2 = strstr(p, "<labeled-knob");
+        const char *next = NULL;
+        size_t pat_len = 0;
+        if (c1 && c2) {
+            if (c1 < c2) { next = c1; pat_len = 8; }
+            else         { next = c2; pat_len = 13; }
+        } else if (c1) { next = c1; pat_len = 8; }
+        else if (c2)   { next = c2; pat_len = 13; }
+        else break;
+        {
+            p = next;
+            char nxt = p[pat_len];
+            if (nxt != ' ' && nxt != '\t' && nxt != '\n' &&
+                nxt != '\r' && nxt != '>' && nxt != '/') {
+                p += pat_len;
+                continue;
+            }
+
+            const char *tag_end = strchr(p, '>');
+            if (!tag_end) break;
+            char ctrl_tag[1024];
+            int tlen = (int)(tag_end - p);
+            if (tlen > 1023) tlen = 1023;
+            memcpy(ctrl_tag, p, tlen);
+            ctrl_tag[tlen] = '\0';
+
+            const char *bind_start = tag_end + 1;
+            int self_closed = (tag_end > p && *(tag_end - 1) == '/');
+            const char *bind_end_search;
+            int closer_skip = 0;
+            if (self_closed) {
+                bind_end_search = tag_end;
+            } else {
+                const char *c1 = strstr(bind_start, "</control>");
+                const char *c2 = strstr(bind_start, "</labeled-knob>");
+                if (c1 && c2)       bind_end_search = (c1 < c2) ? c1 : c2;
+                else if (c1)        bind_end_search = c1;
+                else if (c2)        bind_end_search = c2;
+                else { p = tag_end + 1; continue; }
+                closer_skip = (strncmp(bind_end_search, "</control>", 10) == 0) ? 10 : 15;
+            }
+
+            /* Read the control's own range + label + value (the same values
+             * apply_ui_overrides reads). */
+            char cmin[64], cmax[64], cval[64], clabel[64];
+            xml_get_attr(ctrl_tag, "minValue", cmin,   sizeof(cmin));
+            xml_get_attr(ctrl_tag, "maxValue", cmax,   sizeof(cmax));
+            xml_get_attr(ctrl_tag, "value",    cval,   sizeof(cval));
+            xml_get_attr(ctrl_tag, "label",    clabel, sizeof(clabel));
+            double minv = cmin[0] ? atof(cmin) : 0.0;
+            double maxv = cmax[0] ? atof(cmax) : 1.0;
+            double cur  = cval[0] ? atof(cval) : minv;
+
+            /* Walk every <binding> in this control and synthesize a CC
+             * binding for the first one whose target we support. If the
+             * control has multiple supported bindings, they all share the
+             * same synthetic CC — one knob, many destinations.
+             *
+             * Track the first binding's target so we can derive a label
+             * fallback when the DS knob has an empty `label=`.
+             *
+             * **CC reuse:** if the patch's own `<midi><cc>` block already
+             * routes a real MIDI CC to this control (level=ui position=N),
+             * use that CC for the knob — DS's own bindings already emit
+             * `_oncc<N>` for that CC, and the opcode-dedupe pass would
+             * otherwise drop any synthetic copy we tried to add. */
+            int patch_cc = find_patch_cc_for_control(src, control_position);
+            int cc_for_this_knob = -1;
+            char first_param[64] = "";
+            int first_position = -1;
+            int first_is_group_amp = 0;
+            const char *bp = bind_start;
+            while (bp && bp < bind_end_search) {
+                const char *bind = strstr(bp, "<binding");
+                if (!bind || bind >= bind_end_search) break;
+                const char *bend = strchr(bind, '>');
+                if (!bend || bend > bind_end_search) break;
+
+                char btag[512];
+                int blen = (int)(bend - bind);
+                if (blen > 511) blen = 511;
+                memcpy(btag, bind, blen);
+                btag[blen] = '\0';
+
+                char param[64], position_str[16];
+                xml_get_attr(btag, "parameter", param,        sizeof(param));
+                xml_get_attr(btag, "position",  position_str, sizeof(position_str));
+                int position = position_str[0] ? atoi(position_str) : 0;
+
+                cc_target_t t;
+                int resolved = param[0] && resolve_cc_target(param, &t);
+                /* Reject effect-position bindings whose effect doesn't exist
+                 * (e.g. FX_REVERB_WET_LEVEL pointing at position 2 when only
+                 * 1 effect was parsed). The static converter path already
+                 * relies on `position < fx_count`. */
+                int is_fx_target = (strncmp(param, "FX_", 3) == 0) ||
+                                    strcmp(param, "LEVEL") == 0;
+                if (resolved && is_fx_target && position >= fx_count)
+                    resolved = 0;
+
+                /* FX_REVERB_WET_LEVEL: the static reverb emit builds its
+                 * wet/dry crossfade via bus gains (directtomain/fx1tomain),
+                 * AND sets fverb's internal reverb_wet=100. Adding a CC
+                 * binding for `reverb_wet` would clobber the internal 100,
+                 * leaving wet = bus_wet × cc_wet — way too quiet. Until we
+                 * teach `cc_target_t` to drive *paired* opcodes
+                 * (directtomain neg + fx1tomain pos), reverb wet stays
+                 * static-at-load. */
+                if (resolved && strcmp(param, "FX_REVERB_WET_LEVEL") == 0)
+                    resolved = 0;
+
+                if (resolved) {
+                    if (cc_for_this_knob < 0) {
+                        cc_for_this_knob = (patch_cc >= 0)
+                            ? patch_cc
+                            : alloc_synthetic_cc(used, &next_cc);
+                        if (cc_for_this_knob < 0) break;
+                    }
+                    if (first_param[0] == '\0') {
+                        strncpy(first_param, param, sizeof(first_param) - 1);
+                        first_param[sizeof(first_param) - 1] = '\0';
+                        first_position = position;
+                        first_is_group_amp = (strcmp(param, "AMP_VOLUME") == 0 ||
+                                              strcmp(param, "TAG_VOLUME") == 0);
+                    }
+                    /* Only synthesize a new binding entry if there's no
+                     * existing patch CC for this control. Reusing patch_cc
+                     * means we ride on top of the patch's own _oncc<N>
+                     * opcodes and skip the dedupe collision entirely. */
+                    if (patch_cc < 0 && *binding_count < DS_MAX_CC) {
+                        double v0 = apply_binding_xform(btag, minv, maxv, minv);
+                        double v127 = apply_binding_xform(btag, minv, maxv, maxv);
+                        int load_cc = 127;
+                        if (maxv != minv) {
+                            double cur_t = (cur - minv) / (maxv - minv);
+                            if (cur_t < 0) cur_t = 0; if (cur_t > 1) cur_t = 1;
+                            load_cc = (int)(cur_t * 127.0 + 0.5);
+                        }
+                        ds_cc_binding_t *b = &bindings[(*binding_count)++];
+                        b->cc_number = cc_for_this_knob;
+                        b->target    = t;
+                        b->v_at_0    = v0;
+                        b->v_at_127  = v127;
+                        b->cc_at_load = load_cc;
+                        /* AMP_VOLUME/TAG_VOLUME at group level: record the
+                         * target group so the emitter scopes the binding
+                         * into that <group> instead of <global> (where all
+                         * group amps would collapse to one). */
+                        b->target_group =
+                            ((strcmp(param, "AMP_VOLUME") == 0 ||
+                              strcmp(param, "TAG_VOLUME") == 0) &&
+                             position >= 0 && position < DS_MAX_GROUPS)
+                            ? position : -1;
+                    }
+
+                    /* AMP_VOLUME-on-group: CC now drives the amplitude
+                     * multiplicatively (sfizz `amplitude_oncc<N>=100`). The
+                     * static group-emit also adds a `volume=<dB>` line from
+                     * group_amp_db[] + modVolume; that would double-apply
+                     * the knob's attenuation. Clear the static contribution
+                     * and flag the group so modVolume is skipped too. */
+                    if ((strcmp(param, "AMP_VOLUME") == 0 ||
+                         strcmp(param, "TAG_VOLUME") == 0) &&
+                        position >= 0 && position < DS_MAX_GROUPS) {
+                        group_amp_db[position] = NAN;
+                        group_cc_driven[position] = 1;
+                    }
+                }
+                bp = bend + 1;
+            }
+
+            if (cc_for_this_knob >= 0) {
+                ds_knob_t *k = &knobs_out[kc];
+                snprintf(k->key, sizeof(k->key), "knob_%d", kc);
+                /* Label fallback chain: DS label → parameterName → derived
+                 * (group `name=` for AMP_VOLUME, alias for FX/ENV) →
+                 * "Knob N". Patches like WörliTzer ship `label=""` because
+                 * they label knobs visually via images; deriving from
+                 * binding metadata gives the user something readable
+                 * (e.g. "Clean keys", "Filter", "Reverb"). */
+                if (clabel[0]) {
+                    strncpy(k->label, clabel, sizeof(k->label) - 1);
+                    k->label[sizeof(k->label) - 1] = '\0';
+                } else {
+                    char pname[64];
+                    xml_get_attr(ctrl_tag, "parameterName", pname, sizeof(pname));
+                    if (pname[0]) {
+                        snprintf(k->label, sizeof(k->label), "%s", pname);
+                    } else if (first_is_group_amp && first_position >= 0 &&
+                               get_group_name(src, first_position,
+                                              k->label, sizeof(k->label))) {
+                        /* k->label already filled by get_group_name. */
+                    } else {
+                        const char *alias = target_alias(first_param);
+                        if (alias)
+                            snprintf(k->label, sizeof(k->label), "%s", alias);
+                        else
+                            snprintf(k->label, sizeof(k->label),
+                                     "Knob %d", kc + 1);
+                    }
+                }
+                k->min = minv;
+                k->max = maxv;
+                k->current = cur;
+                k->cc_number = cc_for_this_knob;
+                kc++;
+            }
+
+            p = self_closed ? (tag_end + 1) : (bind_end_search + closer_skip);
+            control_position++;
+        }
+    }
+    *knobs_out_count = kc;
+}
+
 /* Convert a .dspreset file to SFZ text and write as a temp .sfz file.
  * Returns path to the temp .sfz file, or NULL on failure.
  * Caller must free the returned string. */
-static char *convert_dspreset_to_sfz(const char *path) {
+static char *convert_dspreset_to_sfz(const char *path,
+                                     ds_knob_t knobs_out[MAX_DS_KNOBS],
+                                     int *knob_count_out) {
+    if (knob_count_out) *knob_count_out = 0;
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
 
@@ -1011,7 +1449,11 @@ static char *convert_dspreset_to_sfz(const char *path) {
 
     char env_attack[32] = "", env_decay[32] = "";
     char env_sustain[32] = "", env_release[32] = "";
-    apply_ui_overrides(src, fx, fx_count, env_attack, env_decay, env_sustain, env_release);
+    /* NaN = "no AMP_VOLUME knob bound to this group". */
+    double group_amp_db[DS_MAX_GROUPS];
+    for (int i = 0; i < DS_MAX_GROUPS; i++) group_amp_db[i] = NAN;
+    apply_ui_overrides(src, fx, fx_count, env_attack, env_decay,
+                       env_sustain, env_release, group_amp_db);
 
     int rr_total = count_rr_groups(src);
 
@@ -1019,6 +1461,22 @@ static char *convert_dspreset_to_sfz(const char *path) {
      * a `set_cc<N>=127` initializer at <control> level so CC starts maxed. */
     ds_cc_binding_t ccs[DS_MAX_CC];
     int cc_count = parse_midi_bindings(src, ccs);
+
+    /* Walk <labeled-knob>/<control> elements and append synthetic CC
+     * bindings (one CC per knob, 102..117). Knobs whose every binding
+     * targets something we can't drive are skipped — keeps the UI honest.
+     *
+     * group_cc_driven[idx]=1 means the group's amplitude is now live-CC.
+     * Group emit uses this to skip modVolume (would double-attenuate). */
+    ds_knob_t knobs_local[MAX_DS_KNOBS];
+    int knob_count_local = 0;
+    int group_cc_driven[DS_MAX_GROUPS] = {0};
+    enumerate_ui_knobs(src, fx_count, ccs, &cc_count,
+                       knobs_local, &knob_count_local,
+                       group_amp_db, group_cc_driven);
+    if (knobs_out && knob_count_local > 0)
+        memcpy(knobs_out, knobs_local, knob_count_local * sizeof(ds_knob_t));
+    if (knob_count_out) *knob_count_out = knob_count_local;
 
     /* Locate effects we care about (first match wins by DS convention). */
     int reverb_idx = -1, lp_idx = -1, gain_idx = -1;
@@ -1029,17 +1487,18 @@ static char *convert_dspreset_to_sfz(const char *path) {
         if (gain_idx < 0 && strcmp(fx[i].type, "gain") == 0) gain_idx = i;
     }
 
-    /* === Dedupe CC bindings by target opcode ===
-     * Multiple <midi><cc> blocks can target the same SFZ opcode (e.g. Raw
-     * Violin Pad has CC11 + CC22 both modulating amplitude — global vs.
-     * per-tag in DS, but we collapse to global). sfizz mod sources sum,
-     * so emitting two amplitude_oncc<N>=100 would give 2x output. Keep
-     * only the first binding per opcode. */
+    /* === Dedupe CC bindings ===
+     * Dedup key is (opcode, target_group). Distinct group positions for the
+     * same opcode (e.g. WörliTzer's six `amplitude` bindings at groups 0–5)
+     * survive — each is emitted inside its own <group> at SFZ-emit time.
+     * Two bindings to the same opcode at the same scope would sum in sfizz
+     * (mod sources are additive), so we keep only the first. */
     int kept = 0;
     for (int i = 0; i < cc_count; i++) {
         int dup = 0;
         for (int j = 0; j < kept; j++) {
-            if (strcmp(ccs[i].target.opcode, ccs[j].target.opcode) == 0) {
+            if (strcmp(ccs[i].target.opcode, ccs[j].target.opcode) == 0 &&
+                ccs[i].target_group == ccs[j].target_group) {
                 dup = 1;
                 break;
             }
@@ -1205,6 +1664,7 @@ static char *convert_dspreset_to_sfz(const char *path) {
      * the work. */
     for (int i = 0; i < cc_count; i++) {
         if (ccs[i].target.is_reverb_bus) continue;
+        if (ccs[i].target_group >= 0) continue;  /* emitted per-group below */
         double base, delta;
         if (ccs[i].target.sustain_pct) {
             base  = ccs[i].v_at_0   * 100.0;
@@ -1224,6 +1684,7 @@ static char *convert_dspreset_to_sfz(const char *path) {
 
     /* Find each <group> */
     char *scan = src;
+    int group_idx = 0;
     while ((scan = strstr(scan, "<group")) != NULL) {
         /* Skip <groups> tag */
         if (scan[6] == 's' || scan[6] == 'S') { scan += 7; continue; }
@@ -1237,8 +1698,42 @@ static char *convert_dspreset_to_sfz(const char *path) {
         tag_buf[tlen] = '\0';
 
         pos += snprintf(sfz + pos, size * 2 - pos, "<group>\n");
+
+        /* Combine three volume sources into one `volume=NdB`:
+         *   1. <group volume="..."> — static base in dB
+         *   2. <group modVolume="..."> — 0..1 linear, the static modulator val
+         *   3. UI knob <binding parameter="AMP_VOLUME" level="group" pos=N> —
+         *      knob's load-time `value=` becomes the 0..1 amp factor
+         *
+         * Knob value wins over modVolume when both are present (the knob is
+         * what's visible to the user). For groups with neither, output is
+         * just the base `volume=` if any.
+         *
+         * Why this matters: WörliTzer ships 6 layered groups but its knobs
+         * mute several by default (value=0). Without honoring these the
+         * patch plays ~6× louder than intended and clips on every chord. */
+        double base_db = 0.0;
+        int has_base = 0;
         xml_get_attr(tag_buf, "volume", val, sizeof(val));
-        if (val[0]) pos += snprintf(sfz + pos, size * 2 - pos, "volume=%s\n", val);
+        if (val[0]) { base_db = atof(val); has_base = 1; }
+
+        double extra_db = 0.0;
+        int has_extra = 0;
+        int cc_driven = (group_idx < DS_MAX_GROUPS && group_cc_driven[group_idx]);
+        if (group_idx < DS_MAX_GROUPS && !isnan(group_amp_db[group_idx])) {
+            extra_db = group_amp_db[group_idx];
+            has_extra = 1;
+        } else if (!cc_driven) {
+            /* When the group's amp is CC-driven, the live CC already does
+             * what modVolume was statically expressing — skip it. */
+            xml_get_attr(tag_buf, "modVolume", val, sizeof(val));
+            if (val[0]) { extra_db = lin_to_db(atof(val)); has_extra = 1; }
+        }
+
+        if (has_base || has_extra) {
+            pos += snprintf(sfz + pos, size * 2 - pos,
+                            "volume=%.2f\n", base_db + extra_db);
+        }
         xml_get_attr(tag_buf, "ampVelTrack", val, sizeof(val));
         if (val[0]) pos += snprintf(sfz + pos, size * 2 - pos, "amp_veltrack=%s\n", val);
         xml_get_attr(tag_buf, "attack", val, sizeof(val));
@@ -1264,6 +1759,31 @@ static char *convert_dspreset_to_sfz(const char *path) {
                                 "seq_length=%d\nseq_position=%s\n",
                                 rr_total, rr_pos);
             }
+        }
+
+        /* Per-group CC bindings — emit `amplitude_oncc<N>` etc. scoped to
+         * THIS group so each group's volume knob is independent. Without
+         * this, all AMP_VOLUME bindings sit at <global> and one CC
+         * affects every group at once (which is why WörliTzer's six
+         * group volumes collapsed to a single "Line" knob). */
+        for (int i = 0; i < cc_count; i++) {
+            if (ccs[i].target_group != group_idx) continue;
+            if (ccs[i].target.is_reverb_bus) continue;
+            double base, delta;
+            if (ccs[i].target.sustain_pct) {
+                base  = ccs[i].v_at_0   * 100.0;
+                delta = (ccs[i].v_at_127 - ccs[i].v_at_0) * 100.0;
+            } else {
+                base  = ccs[i].v_at_0   * ccs[i].target.scale;
+                delta = (ccs[i].v_at_127 - ccs[i].v_at_0) * ccs[i].target.scale;
+            }
+            if (delta > -1e-6 && delta < 1e-6) continue;
+            if (!ccs[i].target.multiplicative_mod) {
+                pos += snprintf(sfz + pos, size * 2 - pos, "%s=%g\n",
+                                ccs[i].target.opcode, base);
+            }
+            pos += snprintf(sfz + pos, size * 2 - pos, "%s_oncc%d=%g\n",
+                            ccs[i].target.opcode, ccs[i].cc_number, delta);
         }
 
         /* Find <sample> tags within this group */
@@ -1337,6 +1857,7 @@ static char *convert_dspreset_to_sfz(const char *path) {
         }
 
         scan = group_end;
+        group_idx++;
     }
 
     free(src);
@@ -1360,6 +1881,57 @@ static char *convert_dspreset_to_sfz(const char *path) {
     plugin_log(log_msg);
 
     return tmp_path;
+}
+
+/* Walk a (loaded) SFZ file, find every `sample=` directive, and hint the
+ * kernel to read the file into the page cache via POSIX_FADV_WILLNEED.
+ *
+ * Why: sfizz only preloads the first ~3 s per region but streams the rest
+ * from disk on demand. Heavy multi-mic patches (WörliTzer = 447 unique WAV
+ * files / 747 MB) trigger many *cold* file opens at note-on — one per
+ * sample whose region just fired — and the disk reads serialize, blocking
+ * sfizz's streaming thread and producing audible attack clicks. After the
+ * OS has cached the files (i.e., after playing once) the same notes play
+ * cleanly, which confirms the root cause is cold-disk I/O, not CPU.
+ *
+ * WILLNEED is a kernel hint, not a synchronous read — the load function
+ * returns quickly and the kernel reads asynchronously in the background.
+ * We don't pin pages or force memory pressure; the kernel can still evict.
+ *
+ * Why not just bump `sfizz_set_preload_size`: that would multiply memory
+ * usage by every region (447 × N bytes), and Move's RAM is already tight
+ * with the parent app at ~1.4 GB resident. Filesystem cache is shared
+ * across all open files and decays gracefully under pressure. */
+static void prewarm_samples(const char *sfz_path, const char *base_dir) {
+    FILE *f = fopen(sfz_path, "r");
+    if (!f) return;
+    char line[1024];
+    char fullpath[2048];
+    int count = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "sample=", 7) != 0) continue;
+        char *p = line + 7;
+        /* Trim CR/LF and leading whitespace. */
+        char *nl = strchr(p, '\n'); if (nl) *nl = '\0';
+        char *cr = strchr(p, '\r'); if (cr) *cr = '\0';
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) continue;
+        if (*p == '/') {
+            snprintf(fullpath, sizeof(fullpath), "%s", p);
+        } else {
+            snprintf(fullpath, sizeof(fullpath), "%s/%s", base_dir, p);
+        }
+        int fd = open(fullpath, O_RDONLY);
+        if (fd >= 0) {
+            posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
+            close(fd);
+            count++;
+        }
+    }
+    fclose(f);
+    char msg[64];
+    snprintf(msg, sizeof(msg), "Pre-warmed %d sample files into OS cache", count);
+    plugin_log(msg);
 }
 
 /* Load a .sfz or .dspreset file into the synth.
@@ -1390,8 +1962,13 @@ static int load_sfz_file(sfz_instance_t *inst, const char *path,
     const char *ext = strrchr(path, '.');
     const char *format = NULL;
 
+    /* Reset live knob state — every preset load re-publishes it. */
+    inst->knob_count = 0;
+
     if (ext && strcasecmp(ext, ".dspreset") == 0) {
-        char *converted_path = convert_dspreset_to_sfz(path);
+        char *converted_path = convert_dspreset_to_sfz(path,
+                                                       inst->knobs,
+                                                       &inst->knob_count);
         if (converted_path) {
             if (!sfizz_load_file(inst->synth, converted_path)) {
                 snprintf(msg, sizeof(msg), "Failed to load converted SFZ: %s",
@@ -1404,6 +1981,15 @@ static int load_sfz_file(sfz_instance_t *inst, const char *path,
                 return -1;
             }
             format = "DecentSampler instrument";
+            /* Pre-warm OS file cache for the sample files this dspreset
+             * references — eliminates cold-disk attack clicks on the
+             * first chord. The converted SFZ uses paths relative to the
+             * dspreset's directory. */
+            char base[MAX_PATH_LEN];
+            snprintf(base, sizeof(base), "%s", path);
+            char *bslash = strrchr(base, '/');
+            if (bslash) *bslash = '\0';
+            prewarm_samples(converted_path, base);
             /* unlink(converted_path); */
             free(converted_path);
         } else {
@@ -1423,6 +2009,11 @@ static int load_sfz_file(sfz_instance_t *inst, const char *path,
                      "Failed to load instrument file");
             return -1;
         }
+        char base[MAX_PATH_LEN];
+        snprintf(base, sizeof(base), "%s", path);
+        char *bslash = strrchr(base, '/');
+        if (bslash) *bslash = '\0';
+        prewarm_samples(path, base);
     }
 
     int num_regions = sfizz_get_num_regions(inst->synth);
@@ -1608,9 +2199,19 @@ static void* v2_create_instance(const char *module_dir, const char *json_default
     int sample_rate = g_host ? g_host->sample_rate : MOVE_SAMPLE_RATE;
     sfizz_set_sample_rate(inst->synth, (float)sample_rate);
     sfizz_set_samples_per_block(inst->synth, MOVE_FRAMES_PER_BLOCK);
-    sfizz_set_num_voices(inst->synth, 24);
-    sfizz_set_preload_size(inst->synth, 131072); /* 128K samples - covers large offsets */
-    sfizz_set_volume(inst->synth, inst->gain);
+    /* Default 24 voices — measured at ~23 µs/voice in steady state on
+     * Move, so 24 ≈ 550 µs/block ≈ 20 % of the 2.9 ms audio budget.
+     * That leaves room for 3 other tracks with their own modules to
+     * share the same single-threaded audio path without overrun. User
+     * can raise via the `voices` param when soloing or running a sparse
+     * mix; lower if running many heavy SFZ tracks. Voice rendering
+     * inside sfizz is single-threaded — see investigation log. */
+    inst->voices = 24;
+    sfizz_set_num_voices(inst->synth, inst->voices);
+    sfizz_set_oversampling_factor(inst->synth, SFIZZ_OVERSAMPLING_X1);
+    sfizz_set_preload_size(inst->synth, 131072);
+    sfizz_set_sample_quality(inst->synth, SFIZZ_PROCESS_LIVE, 1);
+    sfizz_set_volume(inst->synth, (float)lin_to_db(inst->gain));
 
     snprintf(msg, sizeof(msg), "sfizz initialized: sample_rate=%d, block=%d",
              sample_rate, MOVE_FRAMES_PER_BLOCK);
@@ -1759,7 +2360,26 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         if (inst->gain < 0.0f) inst->gain = 0.0f;
         if (inst->gain > 2.0f) inst->gain = 2.0f;
         if (inst->synth) {
-            sfizz_set_volume(inst->synth, inst->gain);
+            sfizz_set_volume(inst->synth, (float)lin_to_db(inst->gain));
+        }
+    } else if (strcmp(key, "voices") == 0) {
+        int v = atoi(val);
+        if (v < 4)   v = 4;
+        if (v > 128) v = 128;
+        inst->voices = v;
+        if (inst->synth) sfizz_set_num_voices(inst->synth, v);
+    } else if (strncmp(key, "knob_", 5) == 0) {
+        /* Live DS knob update. The shell sends a normalized 0..1 fraction
+         * (chain_params declares min=0,max=1,step=0.02); we map back to the
+         * knob's DS range for `current` and forward the fraction straight
+         * to sfizz as a hdcc — sfizz's `_oncc<N>` opcodes handle the rest. */
+        int idx = atoi(key + 5);
+        if (idx >= 0 && idx < inst->knob_count && inst->synth) {
+            ds_knob_t *k = &inst->knobs[idx];
+            double t = atof(val);
+            if (t < 0) t = 0; if (t > 1) t = 1;
+            k->current = k->min + t * (k->max - k->min);
+            sfizz_send_hdcc(inst->synth, 0, k->cc_number, (float)t);
         }
     } else if (strcmp(key, "all_notes_off") == 0 || strcmp(key, "panic") == 0) {
         if (inst->synth) sfizz_all_sound_off(inst->synth);
@@ -1791,7 +2411,14 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             inst->gain = f;
             if (inst->gain < 0.0f) inst->gain = 0.0f;
             if (inst->gain > 2.0f) inst->gain = 2.0f;
-            if (inst->synth) sfizz_set_volume(inst->synth, inst->gain);
+            if (inst->synth) sfizz_set_volume(inst->synth, (float)lin_to_db(inst->gain));
+        }
+        if (json_get_number(val, "voices", &f) == 0) {
+            int v = (int)f;
+            if (v < 4)   v = 4;
+            if (v > 128) v = 128;
+            inst->voices = v;
+            if (inst->synth) sfizz_set_num_voices(inst->synth, v);
         }
     }
 }
@@ -1812,11 +2439,17 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
         return snprintf(buf, buf_len, "%d", inst->current_preset);
     } else if (strcmp(key, "preset_count") == 0 || strcmp(key, "total_patches") == 0) {
         return snprintf(buf, buf_len, "%d", inst->preset_count);
-    } else if (strcmp(key, "preset_name") == 0 || strcmp(key, "patch_name") == 0 ||
-               strcmp(key, "name") == 0) {
+    } else if (strcmp(key, "preset_name") == 0 || strcmp(key, "patch_name") == 0) {
         strncpy(buf, inst->preset_name, buf_len - 1);
         buf[buf_len - 1] = '\0';
         return strlen(buf);
+    }
+    /* `name` is used by the shadow encoder display as a short plugin tag
+     * (e.g. "S2: SFZ Tone"). Returning the long preset name here wastes
+     * screen width and clips the parameter label. Return the short
+     * module name; preset name remains available via `preset_name`. */
+    else if (strcmp(key, "name") == 0) {
+        return snprintf(buf, buf_len, "SFZ");
     }
     /* Bank = instrument (jump menu). bank_count > 1 enables Shift+L/R to
      * jump between instruments via set_param('bank_index', N). */
@@ -1844,6 +2477,110 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
         return snprintf(buf, buf_len, "%d", inst->octave_transpose);
     } else if (strcmp(key, "gain") == 0) {
         return snprintf(buf, buf_len, "%.2f", inst->gain);
+    } else if (strcmp(key, "voices") == 0) {
+        return snprintf(buf, buf_len, "%d", inst->voices);
+    }
+    /* DS knob value lookup + the shell's per-encoder name/value display
+     * keys (`knob_<i>_name`, `knob_<i>_value`, 1-indexed). The live row has
+     * octave at #1, gain at #2, then DS knob 0..5 at #3..#8.
+     *
+     * Plain `knob_<N>` returns the DS knob's current value (used by the
+     * shadow param editor's get_param probe). */
+    else if (strncmp(key, "knob_", 5) == 0) {
+        const char *suffix = strchr(key + 5, '_');
+        if (suffix && strcmp(suffix, "_name") == 0) {
+            /* 1-based encoder index maps directly to DS knob: encoder N
+             * controls knob_(N-1). Octave/Gain live in the params menu. */
+            int n = atoi(key + 5);
+            int idx = n - 1;
+            if (idx >= 0 && idx < inst->knob_count)
+                return snprintf(buf, buf_len, "%s", inst->knobs[idx].label);
+            return snprintf(buf, buf_len, "—");
+        }
+        if (suffix && strcmp(suffix, "_value") == 0) {
+            int n = atoi(key + 5);
+            int idx = n - 1;
+            if (idx >= 0 && idx < inst->knob_count)
+                return snprintf(buf, buf_len, "%g", inst->knobs[idx].current);
+            return snprintf(buf, buf_len, "-");
+        }
+        /* For shadow's get_param probe: return the normalized 0..1 position
+         * so the encoder's "Default" / display matches what set_param sees. */
+        int idx = atoi(key + 5);
+        if (idx >= 0 && idx < inst->knob_count) {
+            ds_knob_t *k = &inst->knobs[idx];
+            double t = (k->max != k->min)
+                ? (k->current - k->min) / (k->max - k->min) : 0.0;
+            if (t < 0) t = 0; if (t > 1) t = 1;
+            return snprintf(buf, buf_len, "%g", t);
+        }
+        return 0;
+    }
+    /* DS knob inventory (all of them) for the params menu. */
+    else if (strcmp(key, "knob_list") == 0) {
+        int written = 0;
+        written += snprintf(buf + written, buf_len - written, "[");
+        for (int i = 0; i < inst->knob_count && written < buf_len - 80; i++) {
+            if (i > 0) written += snprintf(buf + written, buf_len - written, ",");
+            written += snprintf(buf + written, buf_len - written,
+                "{\"key\":\"%s\",\"label\":\"%s\","
+                "\"min\":%g,\"max\":%g,\"value\":%g}",
+                inst->knobs[i].key, inst->knobs[i].label,
+                inst->knobs[i].min, inst->knobs[i].max,
+                inst->knobs[i].current);
+        }
+        written += snprintf(buf + written, buf_len - written, "]");
+        return written;
+    }
+    else if (strcmp(key, "knob_count") == 0) {
+        return snprintf(buf, buf_len, "%d", inst->knob_count);
+    }
+    /* Dynamic chain_params — the shell asks for this when routing encoders
+     * for the live row and rendering knob labels.
+     *
+     * DS knobs are always exposed as **normalized 0..1 with step=0.02**.
+     * Raw DS ranges vary wildly (Tone 220–22000 Hz, AMP_VOLUME 0–1, attack
+     * 0–4 s, etc.) — encoder ticks at the raw scale would either crawl
+     * (Tone = 1 Hz per click) or skip (Volume = 1.0 in one click). The
+     * plugin maps 0..1 → the knob's actual DS range internally before
+     * sending the CC, so the user gets uniform encoder feel across every
+     * patch and parameter type. */
+    else if (strcmp(key, "chain_params") == 0) {
+        int written = 0;
+        written += snprintf(buf + written, buf_len - written,
+            "[{\"key\":\"preset\",\"name\":\"Instrument\","
+             "\"type\":\"int\",\"min\":0,\"max_param\":\"preset_count\","
+             "\"default\":0},"
+             "{\"key\":\"octave_transpose\",\"name\":\"Octave\","
+             "\"type\":\"int\",\"min\":-4,\"max\":4,\"default\":0},"
+             "{\"key\":\"gain\",\"name\":\"Gain\","
+             "\"type\":\"float\",\"min\":0,\"max\":2,\"default\":1.0,"
+             "\"step\":0.02},"
+             "{\"key\":\"voices\",\"name\":\"Voices\","
+             "\"type\":\"int\",\"min\":4,\"max\":128,\"default\":24}");
+        for (int i = 0; i < 8; i++) {
+            if (i < inst->knob_count) {
+                ds_knob_t *k = &inst->knobs[i];
+                /* Current fraction: where the DS author's value= sits inside
+                 * [min,max]. Drives the encoder's initial position. */
+                double t = (k->max != k->min)
+                    ? (k->current - k->min) / (k->max - k->min) : 0.0;
+                if (t < 0) t = 0; if (t > 1) t = 1;
+                written += snprintf(buf + written, buf_len - written,
+                    ",{\"key\":\"%s\",\"name\":\"%s\","
+                    "\"type\":\"float\",\"min\":0,\"max\":1,"
+                    "\"default\":%g,\"step\":0.02,\"unit\":\"%%\"}",
+                    k->key, k->label, t);
+            } else {
+                written += snprintf(buf + written, buf_len - written,
+                    ",{\"key\":\"knob_%d\",\"name\":\"—\","
+                    "\"type\":\"float\",\"min\":0,\"max\":1,"
+                    "\"default\":0,\"step\":0.02}",
+                    i);
+            }
+        }
+        written += snprintf(buf + written, buf_len - written, "]");
+        return written;
     }
     /* Flat preset list — every preset across all instruments. Each entry's
      * label is "Instrument / Preset" so the menu reads in context. */
@@ -1894,44 +2631,59 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
     else if (strcmp(key, "state") == 0) {
         return snprintf(buf, buf_len,
             "{\"preset_name\":\"%s\",\"instrument_name\":\"%s\","
-            "\"preset\":%d,\"octave_transpose\":%d,\"gain\":%.2f}",
+            "\"preset\":%d,\"octave_transpose\":%d,\"gain\":%.2f,"
+            "\"voices\":%d}",
             inst->preset_name, inst->instrument_name,
-            inst->current_preset, inst->octave_transpose, inst->gain);
+            inst->current_preset, inst->octave_transpose, inst->gain,
+            inst->voices);
     }
-    /* UI hierarchy for shadow parameter editor */
+    /* UI hierarchy for shadow parameter editor.
+     *
+     * Built dynamically per-call so each preset switch can publish its own
+     * DS-knob inventory. The full encoder row is dedicated to DS knobs
+     * (knob_0..knob_7); octave/gain stay in the params menu. */
     else if (strcmp(key, "ui_hierarchy") == 0) {
-        const char *hierarchy = "{"
-            "\"modes\":null,"
-            "\"levels\":{"
-                "\"root\":{"
-                    "\"label\":\"SFZ\","
-                    "\"list_param\":\"preset\","
-                    "\"count_param\":\"preset_count\","
-                    "\"name_param\":\"preset_name\","
-                    "\"children\":null,"
-                    "\"knobs\":[\"octave_transpose\",\"gain\"],"
-                    "\"params\":["
-                        "{\"key\":\"octave_transpose\",\"label\":\"Octave\"},"
-                        "{\"key\":\"gain\",\"label\":\"Gain\"},"
-                        "{\"level\":\"jump\",\"label\":\"Jump To Library\"}"
-                    "]"
-                "},"
-                "\"jump\":{"
-                    "\"label\":\"Library\","
-                    "\"items_param\":\"instrument_list\","
-                    "\"select_param\":\"bank_index\","
-                    "\"children\":null,"
-                    "\"knobs\":[],"
-                    "\"params\":[]"
-                "}"
-            "}"
-        "}";
-        int len = strlen(hierarchy);
-        if (len < buf_len) {
-            strcpy(buf, hierarchy);
-            return len;
+        char dbg[64];
+        snprintf(dbg, sizeof(dbg),
+                 "get_param(ui_hierarchy) called, knob_count=%d",
+                 inst->knob_count);
+        plugin_log(dbg);
+        int written = 0;
+        written += snprintf(buf + written, buf_len - written,
+            "{\"modes\":null,\"levels\":{\"root\":{"
+            "\"label\":\"SFZ\","
+            "\"list_param\":\"preset\","
+            "\"count_param\":\"preset_count\","
+            "\"name_param\":\"preset_name\","
+            "\"children\":null,"
+            "\"knobs\":[");
+        for (int i = 0; i < DS_KNOB_LIVE_COUNT; i++) {
+            written += snprintf(buf + written, buf_len - written,
+                                "%s\"knob_%d\"", (i ? "," : ""), i);
         }
-        return -1;
+        written += snprintf(buf + written, buf_len - written,
+            "],\"params\":["
+                "{\"key\":\"octave_transpose\",\"label\":\"Octave\"},"
+                "{\"key\":\"gain\",\"label\":\"Gain\"},"
+                "{\"key\":\"voices\",\"label\":\"Voices\"}");
+        for (int i = 0; i < inst->knob_count; i++) {
+            written += snprintf(buf + written, buf_len - written,
+                ",{\"key\":\"%s\",\"label\":\"%s\","
+                "\"min\":%g,\"max\":%g}",
+                inst->knobs[i].key, inst->knobs[i].label,
+                inst->knobs[i].min, inst->knobs[i].max);
+        }
+        written += snprintf(buf + written, buf_len - written,
+            ",{\"level\":\"jump\",\"label\":\"Jump To Library\"}"
+            "]},"
+            "\"jump\":{"
+                "\"label\":\"Library\","
+                "\"items_param\":\"instrument_list\","
+                "\"select_param\":\"bank_index\","
+                "\"children\":null,"
+                "\"knobs\":[],\"params\":[]"
+            "}}}");
+        return written;
     }
 
     return -1;
@@ -1967,19 +2719,62 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
         do_load_preset(inst);
     }
 
+    /* One-shot: try to reduce migration jitter by pinning this audio
+     * thread to a dedicated core and raising scheduler priority. The
+     * goal is to remove jitter that adds peak time on top of sfizz's
+     * actual rendering cost, not to add more compute.
+     *
+     * SCHED_FIFO will fail without CAP_SYS_NICE — we don't run as root,
+     * so this is best-effort. Affinity should succeed regardless. */
+    static int rt_setup_done = 0;
+    if (!rt_setup_done) {
+        rt_setup_done = 1;
+        cpu_set_t cs;
+        CPU_ZERO(&cs);
+        CPU_SET(3, &cs);   /* core 3: typically the quietest on 4-core ARM */
+        int aff = sched_setaffinity(0, sizeof(cs), &cs);
+        struct sched_param sp = { .sched_priority = 50 };
+        int rt  = sched_setscheduler(0, SCHED_FIFO, &sp);
+        char msg[96];
+        snprintf(msg, sizeof(msg),
+                 "RT setup: affinity(core 3)=%s, SCHED_FIFO(50)=%s",
+                 aff == 0 ? "OK" : "FAIL",
+                 rt  == 0 ? "OK" : "FAIL");
+        plugin_log(msg);
+    }
+
     /* sfizz renders to separate float channel buffers */
     float *channels[2] = { inst->left_buf, inst->right_buf };
+    /* Profile: how long does sfizz take per block, and how many voices
+     * are alive? Log when a block overruns the 2.9 ms RT budget or when
+     * active-voice count changes — this is the data we need to tell
+     * disk vs. CPU vs. voice-stealing apart. */
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     sfizz_render_block(inst->synth, channels, 2, frames);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long us = (t1.tv_sec - t0.tv_sec) * 1000000L +
+              (t1.tv_nsec - t0.tv_nsec) / 1000L;
+    int active = sfizz_get_num_active_voices(inst->synth);
+    static int last_active = -1;
+    static long peak_us = 0;
+    static int peak_active = 0;
+    if (us > peak_us) { peak_us = us; peak_active = active; }
+    if (us > 2500 || (active != last_active && (active % 4 == 0 || active == 0))) {
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+                 "render block: %ld us, voices=%d (peak %ld us @ %d voices)",
+                 us, active, peak_us, peak_active);
+        plugin_log(msg);
+        last_active = active;
+    }
 
-    /* Interleave and convert to int16 */
+    /* Interleave and convert to int16. Soft-clip (tanh) instead of brick-wall
+     * so chord-stack overshoots compress gently rather than producing harsh
+     * digital clipping. tanh is unity at small signals and asymptotes to ±1. */
     for (int i = 0; i < frames; i++) {
-        float left = inst->left_buf[i];
-        float right = inst->right_buf[i];
-
-        if (left > 1.0f) left = 1.0f;
-        if (left < -1.0f) left = -1.0f;
-        if (right > 1.0f) right = 1.0f;
-        if (right < -1.0f) right = -1.0f;
+        float left = tanhf(inst->left_buf[i]);
+        float right = tanhf(inst->right_buf[i]);
 
         out_interleaved_lr[i * 2] = (int16_t)(left * 32767.0f);
         out_interleaved_lr[i * 2 + 1] = (int16_t)(right * 32767.0f);

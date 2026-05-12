@@ -45,11 +45,25 @@
               "min": 0,
               "max": 2,
               "default": 1.0
+            },
+            {
+              "key": "voices",
+              "label": "Voices",
+              "type": "int",
+              "min": 4,
+              "max": 128,
+              "default": 24
             }
           ],
           "knobs": [
-            "octave_transpose",
-            "gain"
+            "knob_0",
+            "knob_1",
+            "knob_2",
+            "knob_3",
+            "knob_4",
+            "knob_5",
+            "knob_6",
+            "knob_7"
           ]
         }
       }

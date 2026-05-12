@@ -337,6 +337,190 @@ static int resolve_sample_path_ci(const char *base, const char *rel,
     return 1;
 }
 
+/* DS UI-knob binding info. Used both to bake static values and to emit
+ * `_oncc<N>` opcodes so xsynth's per-voice modulation hears CC moves. */
+typedef enum {
+    DS_TARGET_NONE = 0,
+    DS_TARGET_CUTOFF,         /* cutoff_oncc<N>, delta in Hz */
+    DS_TARGET_GROUP_VOLUME,   /* per-group volume_oncc<N>, delta in dB */
+    DS_TARGET_PAN,            /* pan_oncc<N>, delta -100..100 */
+} ds_target_t;
+
+typedef struct {
+    int cc_number;           /* synthetic CC 102..117 */
+    ds_target_t target;
+    int target_group;        /* group index for GROUP_VOLUME, else -1 */
+    double v_at_0;           /* value when knob is at min (CC=0) */
+    double v_at_127;         /* value when knob is at max (CC=127) */
+    int cc_at_load;          /* initial CC value derived from knob.value= */
+} ds_cc_emit_t;
+
+#define DS_MAX_CC_EMIT 64
+
+static double clamp01(double v) {
+    if (v < 0) return 0;
+    if (v > 1) return 1;
+    return v;
+}
+
+/* Walk every <control>/<labeled-knob>. For each, examine its <binding>s.
+ * For each supported binding, allocate a synthetic CC (102..117), emit
+ * an entry into `emits` describing what _oncc opcode to write, and append
+ * a ds_xsynth_knob_t entry the host can surface as a parameter. */
+static void enumerate_ui_knobs(const char *src, int lp_idx,
+                               ds_cc_emit_t emits[DS_MAX_CC_EMIT],
+                               int *emit_count,
+                               ds_xsynth_knob_t knobs_out[DS_MAX_KNOBS],
+                               int *knob_count_out,
+                               int group_cc_driven[DS_MAX_GROUPS]) {
+    *emit_count = 0;
+    *knob_count_out = 0;
+    int next_cc = 102;
+    static const char *patterns[2] = { "<control", "<labeled-knob" };
+    /* Single doc-order walk so knob indices line up with the UI. */
+    const char *p = src;
+    int kc = 0;
+    while (kc < DS_MAX_KNOBS) {
+        const char *c1 = strstr(p, "<control");
+        const char *c2 = strstr(p, "<labeled-knob");
+        const char *next = NULL; size_t pat_len = 0;
+        if (c1 && c2) {
+            if (c1 < c2) { next = c1; pat_len = 8; }
+            else         { next = c2; pat_len = 13; }
+        } else if (c1) { next = c1; pat_len = 8; }
+        else if (c2)   { next = c2; pat_len = 13; }
+        else break;
+        (void)patterns;
+        p = next;
+        char nxt = p[pat_len];
+        if (nxt != ' ' && nxt != '\t' && nxt != '\n' &&
+            nxt != '\r' && nxt != '>' && nxt != '/') { p += pat_len; continue; }
+        const char *tag_end = strchr(p, '>');
+        if (!tag_end) break;
+        char ctrl_tag[1024];
+        int tlen = (int)(tag_end - p);
+        if (tlen > 1023) tlen = 1023;
+        memcpy(ctrl_tag, p, tlen);
+        ctrl_tag[tlen] = '\0';
+
+        const char *bind_start = tag_end + 1;
+        const char *bind_end_search;
+        int self_closed = (tag_end > p && *(tag_end - 1) == '/');
+        int closer_skip = 0;
+        if (self_closed) { bind_end_search = tag_end; }
+        else {
+            const char *e1 = strstr(bind_start, "</control>");
+            const char *e2 = strstr(bind_start, "</labeled-knob>");
+            if (e1 && e2)       bind_end_search = (e1 < e2) ? e1 : e2;
+            else if (e1)        bind_end_search = e1;
+            else if (e2)        bind_end_search = e2;
+            else { p = tag_end + 1; continue; }
+            closer_skip = (strncmp(bind_end_search, "</control>", 10) == 0) ? 10 : 15;
+        }
+
+        char cmin[64], cmax[64], cval[64], clabel[64], pname[64];
+        xml_get_attr(ctrl_tag, "minValue",      cmin,   sizeof(cmin));
+        xml_get_attr(ctrl_tag, "maxValue",      cmax,   sizeof(cmax));
+        xml_get_attr(ctrl_tag, "value",         cval,   sizeof(cval));
+        xml_get_attr(ctrl_tag, "label",         clabel, sizeof(clabel));
+        xml_get_attr(ctrl_tag, "parameterName", pname,  sizeof(pname));
+        double minv = cmin[0] ? atof(cmin) : 0.0;
+        double maxv = cmax[0] ? atof(cmax) : 1.0;
+        double cur  = cval[0] ? atof(cval) : minv;
+
+        int cc_for_this = -1;
+        int produced_any = 0;
+        const char *bp = bind_start;
+        while (bp && bp < bind_end_search) {
+            const char *bind = strstr(bp, "<binding");
+            if (!bind || bind >= bind_end_search) break;
+            const char *bend = strchr(bind, '>');
+            if (!bend || bend > bind_end_search) break;
+            char btag[512];
+            int blen = (int)(bend - bind);
+            if (blen > 511) blen = 511;
+            memcpy(btag, bind, blen);
+            btag[blen] = '\0';
+
+            char param[64] = "", position_str[16] = "", level[32] = "";
+            xml_get_attr(btag, "parameter", param, sizeof(param));
+            xml_get_attr(btag, "position",  position_str, sizeof(position_str));
+            xml_get_attr(btag, "level",     level, sizeof(level));
+            int position = position_str[0] ? atoi(position_str) : 0;
+
+            ds_target_t target = DS_TARGET_NONE;
+            int target_group = -1;
+            if (strcmp(param, "FX_FILTER_FREQUENCY") == 0 &&
+                lp_idx >= 0 && position == lp_idx) {
+                target = DS_TARGET_CUTOFF;
+            } else if ((strcmp(param, "AMP_VOLUME") == 0 ||
+                        strcmp(param, "TAG_VOLUME") == 0) &&
+                       strcmp(level, "group") == 0 &&
+                       position >= 0 && position < DS_MAX_GROUPS) {
+                target = DS_TARGET_GROUP_VOLUME;
+                target_group = position;
+            } else if (strcmp(param, "PAN") == 0) {
+                target = DS_TARGET_PAN;
+            }
+
+            if (target != DS_TARGET_NONE && *emit_count < DS_MAX_CC_EMIT) {
+                if (cc_for_this < 0) {
+                    if (next_cc > 117) break;
+                    cc_for_this = next_cc++;
+                }
+                double v0 = apply_binding_xform(btag, minv, maxv, minv);
+                double v127 = apply_binding_xform(btag, minv, maxv, maxv);
+
+                /* For GROUP_VOLUME the input v is a 0..1 linear amp;
+                 * xsynth volume_oncc is in dB. Map endpoints to dB. */
+                if (target == DS_TARGET_GROUP_VOLUME) {
+                    v0   = lin_to_db(v0);
+                    v127 = lin_to_db(v127);
+                }
+                /* For PAN, DS gives -1..1; xsynth pan range is -100..100. */
+                if (target == DS_TARGET_PAN) {
+                    v0   *= 100.0;
+                    v127 *= 100.0;
+                }
+
+                ds_cc_emit_t *e = &emits[(*emit_count)++];
+                e->cc_number = cc_for_this;
+                e->target = target;
+                e->target_group = target_group;
+                e->v_at_0 = v0;
+                e->v_at_127 = v127;
+                double cur_t = (maxv != minv) ? (cur - minv) / (maxv - minv) : 0.0;
+                e->cc_at_load = (int)(clamp01(cur_t) * 127.0 + 0.5);
+
+                /* GROUP_VOLUME claims the group's amp — disable static
+                 * volume so we don't double-apply. */
+                if (target == DS_TARGET_GROUP_VOLUME &&
+                    target_group >= 0 && target_group < DS_MAX_GROUPS) {
+                    group_cc_driven[target_group] = 1;
+                }
+                produced_any = 1;
+            }
+            bp = bend + 1;
+        }
+
+        if (produced_any) {
+            ds_xsynth_knob_t *k = &knobs_out[kc];
+            snprintf(k->key, sizeof(k->key), "knob_%d", kc);
+            if (clabel[0])      snprintf(k->label, sizeof(k->label), "%s", clabel);
+            else if (pname[0])  snprintf(k->label, sizeof(k->label), "%s", pname);
+            else                snprintf(k->label, sizeof(k->label), "Knob %d", kc + 1);
+            double t01 = (maxv != minv) ? clamp01((cur - minv) / (maxv - minv)) : 0.0;
+            k->current_t01 = t01;
+            k->dspreset_t01 = t01;
+            k->cc_number = cc_for_this;
+            kc++;
+        }
+
+        p = self_closed ? (tag_end + 1) : (bind_end_search + closer_skip);
+    }
+    *knob_count_out = kc;
+}
+
 static int count_rr_groups(const char *src) {
     int count = 0;
     const char *p = src;
@@ -358,7 +542,11 @@ static int count_rr_groups(const char *src) {
 
 /* --- converter ----------------------------------------------------------- */
 
-char *convert_dspreset_to_xsynth_sfz(const char *path) {
+char *convert_dspreset_to_xsynth_sfz(
+    const char *path,
+    ds_xsynth_knob_t knobs_out[DS_MAX_KNOBS],
+    int *knob_count_out
+) {
     /* Base directory for sample-path resolution (the dspreset's parent). */
     char base_dir[1024];
     snprintf(base_dir, sizeof(base_dir), "%s", path);
@@ -437,6 +625,22 @@ char *convert_dspreset_to_xsynth_sfz(const char *path) {
         if (gain_idx < 0 && strcmp(fx[i].type, "gain") == 0) gain_idx = i;
     }
 
+    /* MOVE FORK Phase 3: enumerate UI knobs and emit `<param>_oncc<N>`
+     * bindings so xsynth's per-voice modulation responds to live CC moves.
+     * Knobs targeting AMP_VOLUME at group level mark that group as
+     * CC-driven, suppressing the static volume= emit below to avoid
+     * double-attenuation. */
+    ds_cc_emit_t cc_emits[DS_MAX_CC_EMIT];
+    int cc_emit_count = 0;
+    int group_cc_driven[DS_MAX_GROUPS] = {0};
+    int knob_count_local = 0;
+    ds_xsynth_knob_t knobs_local[DS_MAX_KNOBS];
+    enumerate_ui_knobs(src, lp_idx, cc_emits, &cc_emit_count,
+                       knobs_local, &knob_count_local, group_cc_driven);
+    if (knobs_out && knob_count_local > 0)
+        memcpy(knobs_out, knobs_local, knob_count_local * sizeof(ds_xsynth_knob_t));
+    if (knob_count_out) *knob_count_out = knob_count_local;
+
     /* === <global>: combined static defaults === */
     char *groups_tag = strstr(src, "<groups");
     char wrap_attack[64] = "", wrap_decay[64] = "";
@@ -504,9 +708,29 @@ char *convert_dspreset_to_xsynth_sfz(const char *path) {
                                  ? "lpf_4p" : "lpf_2p";
         const char *cutoff = fx[lp_idx].freq[0]      ? fx[lp_idx].freq      : "22000";
         const char *q      = fx[lp_idx].resonance[0] ? fx[lp_idx].resonance : "0.7";
+        /* Base cutoff is the bound knob's `value=` (applied statically by
+         * apply_ui_overrides above). The _oncc<N>=delta below stacks live
+         * modulation on top: effective = base + (cc/127) * delta. To make
+         * a Tone knob actually sweep the full range we set base = v_at_0
+         * (the value at cc=0) and delta = v_at_127 - v_at_0. */
+        double base_cut = atof(cutoff);
+        double delta_cut = 0.0;
+        int cutoff_cc = -1;
+        for (int i = 0; i < cc_emit_count; i++) {
+            if (cc_emits[i].target == DS_TARGET_CUTOFF) {
+                base_cut = cc_emits[i].v_at_0;
+                delta_cut = cc_emits[i].v_at_127 - cc_emits[i].v_at_0;
+                cutoff_cc = cc_emits[i].cc_number;
+                break;
+            }
+        }
         pos += snprintf(sfz + pos, out_cap - pos,
-                        "fil_type=%s\ncutoff=%s\nresonance=%s\n",
-                        fil_type, cutoff, q);
+                        "fil_type=%s\ncutoff=%g\nresonance=%s\n",
+                        fil_type, base_cut, q);
+        if (cutoff_cc >= 0 && (delta_cut > 1e-6 || delta_cut < -1e-6)) {
+            pos += snprintf(sfz + pos, out_cap - pos,
+                            "cutoff_oncc%d=%g\n", cutoff_cc, delta_cut);
+        }
     }
 
     /* === walk <group>s === */
@@ -526,23 +750,53 @@ char *convert_dspreset_to_xsynth_sfz(const char *path) {
 
         /* Group volume: <group volume="dB"> + knob-AMP_VOLUME dB + modVolume
          * (linear → dB). Without honoring these, multi-group patches like
-         * WörliTzer play ~6× too loud. */
+         * WörliTzer play ~6× too loud. When a CC knob is bound to this
+         * group's amp, skip the static contribution from group_amp_db /
+         * modVolume — the volume_oncc<N> below stacks on top of base_db,
+         * and double-applying would attenuate twice. */
+        int gcc = (group_idx < DS_MAX_GROUPS) ? group_cc_driven[group_idx] : 0;
         double base_db = 0.0; int has_base = 0;
         xml_get_attr(tag_buf, "volume", val, sizeof(val));
         if (val[0]) { base_db = atof(val); has_base = 1; }
 
         double extra_db = 0.0; int has_extra = 0;
-        if (group_idx < DS_MAX_GROUPS && !isnan(group_amp_db[group_idx])) {
+        if (!gcc && group_idx < DS_MAX_GROUPS && !isnan(group_amp_db[group_idx])) {
             extra_db = group_amp_db[group_idx]; has_extra = 1;
-        } else {
+        } else if (!gcc) {
             xml_get_attr(tag_buf, "modVolume", val, sizeof(val));
             if (val[0]) { extra_db = lin_to_db(atof(val)); has_extra = 1; }
+        }
+        /* When CC-driven we still want a base; emit just the group's
+         * authored volume=, falling back to the v_at_0 of the binding so
+         * the load-time CC actually sweeps from the right starting point. */
+        if (gcc) {
+            for (int i = 0; i < cc_emit_count; i++) {
+                if (cc_emits[i].target == DS_TARGET_GROUP_VOLUME &&
+                    cc_emits[i].target_group == group_idx) {
+                    base_db = cc_emits[i].v_at_0;
+                    has_base = 1;
+                    break;
+                }
+            }
         }
         if (has_base || has_extra) {
             double v = base_db + extra_db;
             if (v < -144) v = -144;
             if (v >  6.0) v =  6.0;
             pos += snprintf(sfz + pos, out_cap - pos, "volume=%.2f\n", v);
+        }
+
+        /* Emit any volume_oncc<N> bindings for this group. */
+        for (int i = 0; i < cc_emit_count; i++) {
+            if (cc_emits[i].target == DS_TARGET_GROUP_VOLUME &&
+                cc_emits[i].target_group == group_idx) {
+                double delta = cc_emits[i].v_at_127 - cc_emits[i].v_at_0;
+                if (delta > 1e-6 || delta < -1e-6) {
+                    pos += snprintf(sfz + pos, out_cap - pos,
+                                    "volume_oncc%d=%g\n",
+                                    cc_emits[i].cc_number, delta);
+                }
+            }
         }
 
         xml_get_attr(tag_buf, "ampVelTrack", val, sizeof(val));

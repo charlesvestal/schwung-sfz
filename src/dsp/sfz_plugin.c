@@ -111,6 +111,13 @@ typedef struct {
     int octave_transpose;
     int voices;                     /* sfizz polyphony cap */
     float gain;
+    int  pending_knob_resend;       /* set on state restore; next
+                                     * render_block re-sends every
+                                     * knob CC so saved values stick
+                                     * after sfizz's load-time defaults
+                                     * settle. Otherwise the audible
+                                     * state matches dspreset defaults
+                                     * until the user touches a knob. */
     instrument_entry_t instruments[MAX_INSTRUMENTS];
     preset_entry_t presets[MAX_PRESETS];
     char preset_name[MAX_NAME_LEN];
@@ -2231,6 +2238,11 @@ static void* v2_create_instance(const char *module_dir, const char *json_default
                 sfizz_send_hdcc(inst->synth, 0, kn->cc_number, (float)t);
             }
         }
+        /* Defer a re-send: the audible CC state can come out at the
+         * dspreset's set_cc<N> defaults rather than the restored values
+         * until the user nudges a knob. Re-applying once on the next
+         * render block (when sfizz has settled past load) fixes it. */
+        inst->pending_knob_resend = 1;
     }
 
     plugin_log("Instance created");
@@ -2423,6 +2435,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
                     sfizz_send_hdcc(inst->synth, 0, kn->cc_number, (float)t);
             }
         }
+        inst->pending_knob_resend = 1;
     }
 }
 
@@ -2752,6 +2765,24 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
                  aff == 0 ? "OK" : "FAIL",
                  rt  == 0 ? "OK" : "FAIL");
         plugin_log(msg);
+    }
+
+    /* Deferred knob CC resend after a state restore: re-apply each
+     * knob's saved value once before sfizz renders the first block of
+     * audio. Empirically the restored CC values can be clobbered by
+     * sfizz's load-time set_cc<N> defaults if sent too eagerly — the
+     * audible effect is "saved patch sounds like its dspreset defaults
+     * until you nudge any knob". One re-send per state restore is
+     * harmless if the original sends already took. */
+    if (inst->pending_knob_resend) {
+        inst->pending_knob_resend = 0;
+        for (int i = 0; i < inst->knob_count; i++) {
+            ds_knob_t *k = &inst->knobs[i];
+            double t = (k->max != k->min)
+                ? (k->current - k->min) / (k->max - k->min) : 0.0;
+            if (t < 0) t = 0; if (t > 1) t = 1;
+            sfizz_send_hdcc(inst->synth, 0, k->cc_number, (float)t);
+        }
     }
 
     /* sfizz renders to separate float channel buffers */

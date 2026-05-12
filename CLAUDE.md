@@ -63,6 +63,28 @@ in `src/dsp/sfz_plugin.c`. Spec source: the official
 - UI knob default values: `<control>`/`<labeled-knob>` `value=` is applied to
   the bound parameter at load time, with `factor=` and
   `translation="linear"`/`"table"` (with `translationTable=`) honored.
+- **Dynamic per-preset knob mapping**: every supported `<labeled-knob>` /
+  `<control>` in the dspreset is enumerated at convert time and exposed as a
+  Move parameter (`knob_0`…`knob_15`). The first `DS_KNOB_LIVE_COUNT-2` knobs
+  (default 6, after `octave_transpose` + `gain`) join the live encoder row;
+  every knob shows in the params menu. Each knob owns one synthetic MIDI CC
+  (allocated from 102..117) and the converter emits `<param>_oncc<N>=delta`
+  opcodes for every supported binding inside the control — a single knob can
+  drive multiple sfizz targets when its dspreset has multiple `<binding>`
+  children (e.g. WörliTzer's "Line" knob driving group positions 1 AND 5).
+  Runtime: `set_param("knob_3", "0.75")` calls
+  `sfizz_send_hdcc(synth, 0, cc, t)` — zero glitch, sample-accurate. Knob
+  position resets to the dspreset's `value=` on every preset load (no
+  per-preset persistence yet).
+- AMP_VOLUME-on-group knobs claim the group's amplitude — the static
+  `modVolume`/`group_amp_db` contribution is skipped (would double-attenuate
+  on top of the CC-driven amplitude).
+- Knobs targeting `FX_REVERB_WET_LEVEL` stay static-at-load (no CC binding) —
+  the static reverb path crossfades via `directtomain`/`fx1tomain` and a CC
+  on `reverb_wet` would multiply against that crossfade.
+- Knobs whose every binding hits an unsupported target (FX_DELAY_*, FX_CHORUS_*,
+  parameterName= per-tag bars, etc.) are skipped entirely — the UI doesn't
+  show a knob that can't move sound.
 - MIDI CC bindings (`<midi><cc>`): emit `<param>_oncc<N>` opcodes with
   the load-time CC value derived from the target knob's `value=`. `level=ui`
   bindings chain through the target control's own translation. Degenerate

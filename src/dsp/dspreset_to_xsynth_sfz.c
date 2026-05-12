@@ -23,6 +23,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <strings.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 #define DS_MAX_FX     8
 #define DS_MAX_GROUPS 32
@@ -271,6 +274,69 @@ static void apply_ui_overrides(const char *src,
     }
 }
 
+/* Case-insensitive directory lookup. If `<base>/<rel>` exists exactly, copy
+ * it through. Otherwise walk each path segment of `rel` against the on-disk
+ * directory listing case-insensitively and emit the actual filenames. xsynth
+ * is strict about case; many DS libraries mix `Samples/foo.aif` with
+ * `samples/bar.wav` in the same .dspreset, which works on macOS / case-
+ * insensitive HFS+ but breaks on Move's case-sensitive ext4. */
+static int resolve_sample_path_ci(const char *base, const char *rel,
+                                  char *out, int out_len) {
+    /* Fast path: exact match exists. */
+    char trial[1024];
+    snprintf(trial, sizeof(trial), "%s/%s", base, rel);
+    struct stat st;
+    if (stat(trial, &st) == 0) {
+        snprintf(out, out_len, "%s", rel);
+        return 1;
+    }
+
+    /* Walk segments, fixing case at each step. */
+    char working_dir[1024];
+    snprintf(working_dir, sizeof(working_dir), "%s", base);
+
+    /* Tokenize rel by '/'. */
+    char relbuf[512];
+    snprintf(relbuf, sizeof(relbuf), "%s", rel);
+    char fixed_rel[512];
+    int fr_pos = 0;
+    fixed_rel[0] = '\0';
+
+    char *save = NULL;
+    char *seg = strtok_r(relbuf, "/", &save);
+    while (seg) {
+        /* Look in working_dir for a case-insensitive match for seg. */
+        DIR *d = opendir(working_dir);
+        if (!d) return 0;
+        struct dirent *de;
+        char matched[256] = "";
+        while ((de = readdir(d)) != NULL) {
+            if (strcasecmp(de->d_name, seg) == 0) {
+                snprintf(matched, sizeof(matched), "%s", de->d_name);
+                break;
+            }
+        }
+        closedir(d);
+        if (!matched[0]) return 0;
+
+        /* Advance working_dir + accumulate fixed segments. */
+        int wlen = (int)strlen(working_dir);
+        snprintf(working_dir + wlen, sizeof(working_dir) - wlen, "/%s", matched);
+        if (fr_pos > 0)
+            fr_pos += snprintf(fixed_rel + fr_pos, sizeof(fixed_rel) - fr_pos,
+                               "/%s", matched);
+        else
+            fr_pos += snprintf(fixed_rel, sizeof(fixed_rel), "%s", matched);
+
+        seg = strtok_r(NULL, "/", &save);
+    }
+
+    /* Confirm final path exists. */
+    if (stat(working_dir, &st) != 0) return 0;
+    snprintf(out, out_len, "%s", fixed_rel);
+    return 1;
+}
+
 static int count_rr_groups(const char *src) {
     int count = 0;
     const char *p = src;
@@ -293,6 +359,13 @@ static int count_rr_groups(const char *src) {
 /* --- converter ----------------------------------------------------------- */
 
 char *convert_dspreset_to_xsynth_sfz(const char *path) {
+    /* Base directory for sample-path resolution (the dspreset's parent). */
+    char base_dir[1024];
+    snprintf(base_dir, sizeof(base_dir), "%s", path);
+    char *last_slash = strrchr(base_dir, '/');
+    if (last_slash) *last_slash = '\0';
+    else base_dir[0] = '\0';
+
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
     fseek(f, 0, SEEK_END);
@@ -542,7 +615,16 @@ char *convert_dspreset_to_xsynth_sfz(const char *path) {
             if (val[0]) {
                 /* Windows backslash → forward slash. */
                 for (char *p = val; *p; p++) if (*p == '\\') *p = '/';
-                pos += snprintf(sfz + pos, out_cap - pos, "sample=%s\n", val);
+                /* Case-insensitive fixup so xsynth (strict on case) finds
+                 * the sample even when the dspreset uses `samples/foo.wav`
+                 * but the on-disk dir is `Samples/foo.wav`. */
+                char fixed[512];
+                if (base_dir[0] &&
+                    resolve_sample_path_ci(base_dir, val, fixed, sizeof(fixed))) {
+                    pos += snprintf(sfz + pos, out_cap - pos, "sample=%s\n", fixed);
+                } else {
+                    pos += snprintf(sfz + pos, out_cap - pos, "sample=%s\n", val);
+                }
             }
             xml_get_attr(stag, "loNote", val, sizeof(val));
             if (val[0]) pos += snprintf(sfz + pos, out_cap - pos, "lokey=%s\n", val);

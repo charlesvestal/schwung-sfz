@@ -20,4 +20,7 @@ symphonia = { version = "0.5.4", default-features = false, features = ["aiff"] }
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-panic = "abort"
+# `unwind` (not `abort`) so catch_unwind in the shim can intercept symphonia /
+# xsynth panics and surface them as a normal load error instead of killing the
+# whole schwung process.
+panic = "unwind"

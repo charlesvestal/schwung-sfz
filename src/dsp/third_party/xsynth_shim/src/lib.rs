@@ -24,7 +24,7 @@ fn set_last_error<S: Into<String>>(msg: S) {
 
 use xsynth_core::{
     AudioPipe, AudioStreamParams, ChannelCount,
-    channel::{ChannelAudioEvent, ChannelEvent, ChannelConfigEvent, ChannelInitOptions, ControlEvent},
+    channel::{ChannelAudioEvent, ChannelEvent, ChannelConfigEvent, ChannelInitOptions, ControlEvent, SoundfontDropSink},
     channel_group::{
         ChannelGroup, ChannelGroupConfig, ParallelismOptions, SynthEvent, SynthFormat,
     },
@@ -51,6 +51,11 @@ struct LoadWorker {
 pub struct XSynthHandle {
     group: ChannelGroup,
     worker: Option<LoadWorker>,
+    /// Old soundfonts pushed here by the audio thread on SetSoundfonts; the
+    /// gc thread below drains and drops them off-thread.
+    drop_sink: SoundfontDropSink,
+    gc_alive: Arc<AtomicBool>,
+    gc_handle: Option<thread::JoinHandle<()>>,
 }
 
 /* Install once: panic hook that writes the panic message + a short backtrace
@@ -95,8 +100,42 @@ pub unsafe extern "C" fn xshim_create(sample_rate: u32, channels: u32) -> *mut X
             audio_params: AudioStreamParams::new(sample_rate, cc),
             parallelism: ParallelismOptions::AUTO_PER_CHANNEL,
         };
-        let group = ChannelGroup::new(cfg);
-        Box::into_raw(Box::new(XSynthHandle { group, worker: None }))
+        let mut group = ChannelGroup::new(cfg);
+
+        // Wire deferred-drop sink + GC worker for old soundfonts.
+        let drop_sink: SoundfontDropSink =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        group.set_soundfont_drop_sink(drop_sink.clone());
+
+        let gc_alive = Arc::new(AtomicBool::new(true));
+        let gc_alive_t = gc_alive.clone();
+        let drop_sink_t = drop_sink.clone();
+        let gc_handle = thread::Builder::new()
+            .name("xshim-sf-gc".into())
+            .spawn(move || {
+                while gc_alive_t.load(Ordering::Relaxed) {
+                    let drained = {
+                        if let Ok(mut q) = drop_sink_t.lock() {
+                            std::mem::take(&mut *q)
+                        } else { Vec::new() }
+                    };
+                    // Drop here, off the audio thread. The Vec going out of
+                    // scope drops each Arc<dyn SoundfontBase> — if no other
+                    // refs (no live voices), this is where the heavy
+                    // sample buffers actually free.
+                    drop(drained);
+                    thread::sleep(std::time::Duration::from_millis(50));
+                }
+            })
+            .ok();
+
+        Box::into_raw(Box::new(XSynthHandle {
+            group,
+            worker: None,
+            drop_sink,
+            gc_alive,
+            gc_handle,
+        }))
     }))
     .unwrap_or(ptr::null_mut())
 }
@@ -107,6 +146,9 @@ pub unsafe extern "C" fn xshim_destroy(handle: *mut XSynthHandle) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         let mut boxed = Box::from_raw(handle);
         cancel_inflight(&mut boxed);
+        // Tell the gc worker to exit, then join it.
+        boxed.gc_alive.store(false, Ordering::Release);
+        if let Some(jh) = boxed.gc_handle.take() { let _ = jh.join(); }
         drop(boxed);
     }));
 }
@@ -228,11 +270,19 @@ pub unsafe extern "C" fn xshim_all_notes_off(handle: *mut XSynthHandle) {
 #[no_mangle]
 pub unsafe extern "C" fn xshim_render(handle: *mut XSynthHandle, out: *mut f32, num_samples: usize) {
     if handle.is_null() || out.is_null() || num_samples == 0 { return; }
-    let _ = catch_unwind(AssertUnwindSafe(|| {
+    let result = catch_unwind(AssertUnwindSafe(|| {
         let h = &mut *handle;
         let slc = std::slice::from_raw_parts_mut(out, num_samples);
         h.group.read_samples(slc);
     }));
+    if let Err(e) = result {
+        let msg = if let Some(s) = e.downcast_ref::<&str>() { s.to_string() }
+            else if let Some(s) = e.downcast_ref::<String>() { s.clone() }
+            else { "<no payload>".to_string() };
+        set_last_error(format!("panic in render: {msg}"));
+        // Zero the output so we hand the C side silence rather than UB.
+        std::ptr::write_bytes(out, 0, num_samples);
+    }
 }
 
 #[no_mangle]

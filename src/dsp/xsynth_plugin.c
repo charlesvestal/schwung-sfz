@@ -67,6 +67,16 @@ extern void          xshim_all_notes_off(XSynthHandle*);
 extern void          xshim_render(XSynthHandle*, float *out_interleaved, size_t num_samples);
 extern uint64_t      xshim_voice_count(const XSynthHandle*);
 extern size_t        xshim_last_error(char *out_buf, size_t out_len);
+extern int           xshim_load_sfz_async(XSynthHandle*, const char *path);
+extern int           xshim_load_status(const XSynthHandle*);
+extern void          xshim_load_cancel(XSynthHandle*);
+extern int           xshim_load_apply(XSynthHandle*);
+extern void          xshim_load_clear_status(XSynthHandle*);
+#define XSHIM_LOAD_IDLE      0
+#define XSHIM_LOAD_LOADING   1
+#define XSHIM_LOAD_READY     2
+#define XSHIM_LOAD_ERROR     3
+#define XSHIM_LOAD_CANCELLED 4
 
 static const host_api_v1_t *g_host = NULL;
 
@@ -74,7 +84,11 @@ static const host_api_v1_t *g_host = NULL;
 #define MAX_PRESETS 1024
 #define MAX_PATH_LEN 512
 #define MAX_NAME_LEN 128
-#define DEBOUNCE_BLOCKS 56
+/* ~900ms at 44.1k/128. Longer than the sfizz default (~150ms) because xsynth
+ * loads take 2-15s for big DS libraries, and accidentally landing on a heavy
+ * patch while scrolling past it locks the audio thread for that whole load.
+ * 900ms gives the user a wide window to keep scrolling without committing. */
+#define DEBOUNCE_BLOCKS 310
 
 typedef struct {
     char name[MAX_NAME_LEN];
@@ -108,6 +122,9 @@ typedef struct {
     char load_error[256];
     int debounce_remaining;
     int pending_load;
+    int loading_active;            /* 1 while xshim_load_sfz is in flight or
+                                    * a debounced load is pending; UI uses
+                                    * this to show "Loading…". */
     int suppress_next_preset_set;
     float *render_buf;             /* interleaved L/R/L/R..., 2 * frames */
 } xsynth_instance_t;
@@ -328,9 +345,12 @@ static void sync_preset_display(xsynth_instance_t *inst) {
     }
 }
 
+/* Kicks off an async load via the shim. Returns immediately. Caller polls
+ * xshim_load_status from the render loop and calls xshim_load_apply once it
+ * goes Ready, or xshim_load_cancel + new dispatch if the user moved on. */
 static int load_sfz_file(xsynth_instance_t *inst, const char *path) {
     char msg[512];
-    snprintf(msg, sizeof(msg), "Loading: %s", path);
+    snprintf(msg, sizeof(msg), "Loading (async): %s", path);
     plugin_log(msg);
     struct stat st;
     if (stat(path, &st) != 0) {
@@ -338,10 +358,12 @@ static int load_sfz_file(xsynth_instance_t *inst, const char *path) {
         return -1;
     }
 
-    /* .dspreset → convert to .converted.sfz next to source, load that. */
+    /* .dspreset → convert to .converted.sfz alongside the source. The
+     * conversion is fast (~100 ms even for the heavy patches); only the
+     * sample decoding inside xsynth needs the background thread. */
     const char *ext = strrchr(path, '.');
-    const char *load_path = path;
     char *converted = NULL;
+    const char *load_path = path;
     if (ext && strcasecmp(ext, ".dspreset") == 0) {
         converted = convert_dspreset_to_xsynth_sfz(path);
         if (!converted) {
@@ -355,21 +377,16 @@ static int load_sfz_file(xsynth_instance_t *inst, const char *path) {
         load_path = converted;
     }
 
-    int rc = xshim_load_sfz(inst->synth, load_path);
+    int rc = xshim_load_sfz_async(inst->synth, load_path);
+    free(converted);
     if (rc != 0) {
         char err[256] = {0};
         xshim_last_error(err, sizeof(err));
-        snprintf(msg, sizeof(msg), "xshim_load_sfz failed for %s: %s",
-                 load_path, err[0] ? err : "(no detail)");
-        plugin_log(msg);
         snprintf(inst->load_error, sizeof(inst->load_error),
-                 "xsynth load failed: %s", err[0] ? err : "unknown");
-        free(converted);
+                 "xsynth async load failed: %s", err[0] ? err : "unknown");
         return -1;
     }
     inst->load_error[0] = '\0';
-    plugin_log("xsynth: SFZ loaded");
-    free(converted);
     return 0;
 }
 
@@ -391,7 +408,12 @@ static void set_preset_index(xsynth_instance_t *inst, int index) {
     inst->current_preset = index;
     sync_preset_display(inst);
     xshim_all_notes_off(inst->synth);
+    /* If a load is already running for a different preset, cancel it so the
+     * worker thread aborts at the next sample boundary instead of forcing us
+     * to wait through 15s of decoding for a patch we no longer want. */
+    xshim_load_cancel(inst->synth);
     inst->pending_load = 1;
+    inst->loading_active = 1;
     inst->debounce_remaining = DEBOUNCE_BLOCKS;
 }
 
@@ -402,8 +424,10 @@ static void set_preset_index_immediate(xsynth_instance_t *inst, int index) {
     inst->current_preset = index;
     sync_preset_display(inst);
     xshim_all_notes_off(inst->synth);
+    xshim_load_cancel(inst->synth);
     inst->pending_load = 0;
     inst->debounce_remaining = 0;
+    inst->loading_active = 1;
     do_load_preset(inst);
 }
 
@@ -625,10 +649,15 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
     else if (strcmp(key, "preset_count") == 0 || strcmp(key, "total_patches") == 0)
         return snprintf(buf, buf_len, "%d", inst->preset_count);
     else if (strcmp(key, "preset_name") == 0 || strcmp(key, "patch_name") == 0) {
+        if (inst->loading_active)
+            return snprintf(buf, buf_len, "Loading… %s", inst->preset_name);
         strncpy(buf, inst->preset_name, buf_len - 1);
         buf[buf_len - 1] = '\0';
         return strlen(buf);
     }
+    /* Also expose as a separate flag in case the host can subscribe. */
+    else if (strcmp(key, "loading") == 0)
+        return snprintf(buf, buf_len, "%d", inst->loading_active ? 1 : 0);
     else if (strcmp(key, "name") == 0)
         return snprintf(buf, buf_len, "SFZ");
     else if (strcmp(key, "bank_name") == 0 || strcmp(key, "instrument_name") == 0) {
@@ -754,6 +783,7 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
         return;
     }
 
+    /* Debounce window: user is still scrolling, hold off on dispatching. */
     if (inst->pending_load) {
         if (inst->debounce_remaining > 0) {
             inst->debounce_remaining--;
@@ -761,7 +791,35 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
             return;
         }
         inst->pending_load = 0;
+        /* Async dispatch — returns immediately. From here on the load runs
+         * in a background thread; we poll status below. */
         do_load_preset(inst);
+    }
+
+    /* Poll the async load. While loading: render silence. On Ready: swap in.
+     * On Error/Cancelled: log + clear status. */
+    int load_st = xshim_load_status(inst->synth);
+    if (load_st == XSHIM_LOAD_LOADING) {
+        inst->loading_active = 1;
+        memset(out_interleaved_lr, 0, frames * 2 * sizeof(int16_t));
+        return;
+    } else if (load_st == XSHIM_LOAD_READY) {
+        xshim_load_apply(inst->synth);
+        inst->loading_active = 0;
+        plugin_log("xsynth: async SFZ ready and applied");
+    } else if (load_st == XSHIM_LOAD_ERROR) {
+        char err[256] = {0};
+        xshim_last_error(err, sizeof(err));
+        snprintf(inst->load_error, sizeof(inst->load_error),
+                 "xsynth load failed: %s", err[0] ? err : "unknown");
+        xshim_load_clear_status(inst->synth);
+        inst->loading_active = 0;
+    } else if (load_st == XSHIM_LOAD_CANCELLED) {
+        xshim_load_clear_status(inst->synth);
+        /* loading_active stays 1 if the cancel was triggered by a new
+         * preset that's still in its debounce window — set_preset_index
+         * already set it. Otherwise clear it. */
+        if (!inst->pending_load) inst->loading_active = 0;
     }
 
     /* One-shot CPU/scheduler setup. Matches what sfz_plugin.c does — pin to

@@ -4,12 +4,21 @@
 // crate pulls cpal + alsa via xsynth-realtime, which we don't use, so we wrap
 // xsynth-core directly here and avoid the audio-backend dep chain.
 
+use std::cell::RefCell;
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::Arc;
+
+thread_local! {
+    static LAST_ERROR: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+fn set_last_error<S: Into<String>>(msg: S) {
+    LAST_ERROR.with(|cell| *cell.borrow_mut() = msg.into());
+}
 
 use xsynth_core::{
     AudioPipe, AudioStreamParams, ChannelCount,
@@ -56,7 +65,7 @@ pub unsafe extern "C" fn xshim_load_sfz(handle: *mut XSynthHandle, path: *const 
         let h = &mut *handle;
         let cstr = match CStr::from_ptr(path).to_str() {
             Ok(s) => s,
-            Err(_) => return -1,
+            Err(_) => { eprintln!("[xshim] path is not valid UTF-8"); return -1; }
         };
         let pb = PathBuf::from(cstr);
         let stream_params = AudioStreamParams::new(44100, ChannelCount::Stereo);
@@ -69,7 +78,10 @@ pub unsafe extern "C" fn xshim_load_sfz(handle: *mut XSynthHandle, path: *const 
         };
         let sf = match SampleSoundfont::new(pb, stream_params, opts) {
             Ok(sf) => sf,
-            Err(_) => return -1,
+            Err(e) => {
+                set_last_error(format!("SampleSoundfont::new: {e:?}"));
+                return -1;
+            }
         };
         let arc: Arc<dyn SoundfontBase> = Arc::new(sf);
         h.group.send_event(SynthEvent::AllChannels(ChannelEvent::Config(
@@ -77,7 +89,10 @@ pub unsafe extern "C" fn xshim_load_sfz(handle: *mut XSynthHandle, path: *const 
         )));
         0
     }));
-    result.unwrap_or(-1)
+    match result {
+        Ok(rc) => rc,
+        Err(_) => { eprintln!("[xshim] xshim_load_sfz panicked"); -1 }
+    }
 }
 
 #[no_mangle]
@@ -147,6 +162,19 @@ pub unsafe extern "C" fn xshim_render(handle: *mut XSynthHandle, out: *mut f32, 
         let slc = std::slice::from_raw_parts_mut(out, num_samples);
         h.group.read_samples(slc);
     }));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn xshim_last_error(out_buf: *mut c_char, out_len: usize) -> usize {
+    if out_buf.is_null() || out_len == 0 { return 0; }
+    LAST_ERROR.with(|cell| {
+        let msg = cell.borrow();
+        let bytes = msg.as_bytes();
+        let n = bytes.len().min(out_len - 1);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf as *mut u8, n);
+        *out_buf.add(n) = 0;
+        n
+    })
 }
 
 #[no_mangle]

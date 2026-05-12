@@ -52,6 +52,8 @@ typedef struct plugin_api_v2 {
     void (*render_block)(void *instance, int16_t *out_interleaved_lr, int frames);
 } plugin_api_v2_t;
 
+#include "dspreset_to_xsynth_sfz.h"
+
 /* xsynth_shim C ABI */
 typedef struct XSynthHandle XSynthHandle;
 extern XSynthHandle* xshim_create(uint32_t sample_rate, uint32_t channels);
@@ -64,6 +66,7 @@ extern void          xshim_pitch_bend(XSynthHandle*, uint8_t ch, float value);
 extern void          xshim_all_notes_off(XSynthHandle*);
 extern void          xshim_render(XSynthHandle*, float *out_interleaved, size_t num_samples);
 extern uint64_t      xshim_voice_count(const XSynthHandle*);
+extern size_t        xshim_last_error(char *out_buf, size_t out_len);
 
 static const host_api_v1_t *g_host = NULL;
 
@@ -146,10 +149,17 @@ static int json_get_string(const char *json, const char *key, char *out, int out
     return len;
 }
 
-/* Phase 1: native .sfz only. .dspreset support returns in Phase 2 with a
- * converter that emits xsynth-compatible output. */
+/* Phase 2: .sfz native + .dspreset via dspreset_to_xsynth_sfz converter. */
 static int is_supported_instrument(const char *ext) {
-    return strcasecmp(ext, ".sfz") == 0;
+    return strcasecmp(ext, ".sfz") == 0 || strcasecmp(ext, ".dspreset") == 0;
+}
+
+/* Skip the converter's own temp files (.converted.sfz) so they don't show up
+ * as variants alongside the source .dspreset. */
+static int is_temp_converted_sfz(const char *filename) {
+    const char *suffix = ".converted.sfz";
+    size_t flen = strlen(filename), slen = strlen(suffix);
+    return flen >= slen && strcasecmp(filename + flen - slen, suffix) == 0;
 }
 
 #define SCAN_MAX_DEPTH 5
@@ -192,7 +202,8 @@ static void collect_presets(xsynth_instance_t *inst, const char *path,
             collect_presets(inst, child, instrument_idx, depth + 1);
         } else if (S_ISREG(st.st_mode)) {
             const char *ext = strrchr(entry->d_name, '.');
-            if (ext && is_supported_instrument(ext))
+            if (ext && is_supported_instrument(ext) &&
+                !is_temp_converted_sfz(entry->d_name))
                 add_preset(inst, path, entry->d_name, instrument_idx);
         }
     }
@@ -235,6 +246,7 @@ static void scan_instruments(xsynth_instance_t *inst, const char *module_dir) {
         } else if (S_ISREG(st.st_mode)) {
             const char *ext = strrchr(de->d_name, '.');
             if (!ext || !is_supported_instrument(ext)) continue;
+            if (is_temp_converted_sfz(de->d_name)) continue;
             e->is_dir = 0;
             int nlen = (int)(ext - de->d_name);
             if (nlen >= MAX_NAME_LEN) nlen = MAX_NAME_LEN - 1;
@@ -325,13 +337,39 @@ static int load_sfz_file(xsynth_instance_t *inst, const char *path) {
         snprintf(inst->load_error, sizeof(inst->load_error), "Instrument file not found");
         return -1;
     }
-    if (xshim_load_sfz(inst->synth, path) != 0) {
+
+    /* .dspreset → convert to .converted.sfz next to source, load that. */
+    const char *ext = strrchr(path, '.');
+    const char *load_path = path;
+    char *converted = NULL;
+    if (ext && strcasecmp(ext, ".dspreset") == 0) {
+        converted = convert_dspreset_to_xsynth_sfz(path);
+        if (!converted) {
+            plugin_log("DS converter returned NULL");
+            snprintf(inst->load_error, sizeof(inst->load_error),
+                     "DecentSampler conversion failed");
+            return -1;
+        }
+        snprintf(msg, sizeof(msg), "Converted dspreset → %s", converted);
+        plugin_log(msg);
+        load_path = converted;
+    }
+
+    int rc = xshim_load_sfz(inst->synth, load_path);
+    if (rc != 0) {
+        char err[256] = {0};
+        xshim_last_error(err, sizeof(err));
+        snprintf(msg, sizeof(msg), "xshim_load_sfz failed for %s: %s",
+                 load_path, err[0] ? err : "(no detail)");
+        plugin_log(msg);
         snprintf(inst->load_error, sizeof(inst->load_error),
-                 "xsynth failed to load (unsupported opcodes? sample format?)");
+                 "xsynth load failed: %s", err[0] ? err : "unknown");
+        free(converted);
         return -1;
     }
     inst->load_error[0] = '\0';
     plugin_log("xsynth: SFZ loaded");
+    free(converted);
     return 0;
 }
 

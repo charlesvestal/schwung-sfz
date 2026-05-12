@@ -53,12 +53,15 @@ fi
 # --- Step 2: Compile and link the plugin ---
 echo ""
 echo "=== Compiling DSP plugin ==="
-${CROSS_PREFIX}gcc -O3 -fPIC \
-    -march=armv8-a -mtune=cortex-a72 \
-    -DNDEBUG \
-    -c src/dsp/xsynth_plugin.c \
-    -o build/xsynth_plugin.o \
-    -Isrc/dsp
+for src in src/dsp/xsynth_plugin.c src/dsp/dspreset_to_xsynth_sfz.c; do
+    obj="build/$(basename "$src" .c).o"
+    ${CROSS_PREFIX}gcc -O3 -fPIC \
+        -march=armv8-a -mtune=cortex-a72 \
+        -DNDEBUG \
+        -c "$src" \
+        -o "$obj" \
+        -Isrc/dsp
+done
 
 # Link the plugin as a shared lib. The shim staticlib pulls in xsynth-core,
 # symphonia (audio decoders), rayon, and the rest of the Rust runtime. C++
@@ -68,6 +71,7 @@ echo "=== Linking dsp.so ==="
 ${CROSS_PREFIX}gcc -O3 -shared -fPIC \
     -march=armv8-a -mtune=cortex-a72 \
     build/xsynth_plugin.o \
+    build/dspreset_to_xsynth_sfz.o \
     "$XSHIM_A" \
     -o build/dsp.so \
     -lm -lpthread -ldl -lrt

@@ -10,6 +10,11 @@ crate-type = ["staticlib"]
 
 [dependencies]
 xsynth-core = { path = "../xsynth/core" }
+# Cargo merges features across the dep tree: enabling `aiff` here turns it on
+# inside xsynth-core's symphonia probe too. Required for the AIFF samples
+# many DecentSampler libraries ship (WörliTzer, etc.). symphonia's `wav`
+# feature is pulled implicitly by xsynth-core; we only need to add aiff.
+symphonia = { version = "0.5.4", default-features = false, features = ["aiff"] }
 
 [profile.release]
 opt-level = 3

@@ -1883,57 +1883,6 @@ static char *convert_dspreset_to_sfz(const char *path,
     return tmp_path;
 }
 
-/* Walk a (loaded) SFZ file, find every `sample=` directive, and hint the
- * kernel to read the file into the page cache via POSIX_FADV_WILLNEED.
- *
- * Why: sfizz only preloads the first ~3 s per region but streams the rest
- * from disk on demand. Heavy multi-mic patches (WörliTzer = 447 unique WAV
- * files / 747 MB) trigger many *cold* file opens at note-on — one per
- * sample whose region just fired — and the disk reads serialize, blocking
- * sfizz's streaming thread and producing audible attack clicks. After the
- * OS has cached the files (i.e., after playing once) the same notes play
- * cleanly, which confirms the root cause is cold-disk I/O, not CPU.
- *
- * WILLNEED is a kernel hint, not a synchronous read — the load function
- * returns quickly and the kernel reads asynchronously in the background.
- * We don't pin pages or force memory pressure; the kernel can still evict.
- *
- * Why not just bump `sfizz_set_preload_size`: that would multiply memory
- * usage by every region (447 × N bytes), and Move's RAM is already tight
- * with the parent app at ~1.4 GB resident. Filesystem cache is shared
- * across all open files and decays gracefully under pressure. */
-static void prewarm_samples(const char *sfz_path, const char *base_dir) {
-    FILE *f = fopen(sfz_path, "r");
-    if (!f) return;
-    char line[1024];
-    char fullpath[2048];
-    int count = 0;
-    while (fgets(line, sizeof(line), f)) {
-        if (strncmp(line, "sample=", 7) != 0) continue;
-        char *p = line + 7;
-        /* Trim CR/LF and leading whitespace. */
-        char *nl = strchr(p, '\n'); if (nl) *nl = '\0';
-        char *cr = strchr(p, '\r'); if (cr) *cr = '\0';
-        while (*p == ' ' || *p == '\t') p++;
-        if (!*p) continue;
-        if (*p == '/') {
-            snprintf(fullpath, sizeof(fullpath), "%s", p);
-        } else {
-            snprintf(fullpath, sizeof(fullpath), "%s/%s", base_dir, p);
-        }
-        int fd = open(fullpath, O_RDONLY);
-        if (fd >= 0) {
-            posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
-            close(fd);
-            count++;
-        }
-    }
-    fclose(f);
-    char msg[64];
-    snprintf(msg, sizeof(msg), "Pre-warmed %d sample files into OS cache", count);
-    plugin_log(msg);
-}
-
 /* Load a .sfz or .dspreset file into the synth.
  * root_path is the instrument root folder, used as fallback for
  * sample resolution when the .sfz is in a subdirectory. */
@@ -1981,15 +1930,6 @@ static int load_sfz_file(sfz_instance_t *inst, const char *path,
                 return -1;
             }
             format = "DecentSampler instrument";
-            /* Pre-warm OS file cache for the sample files this dspreset
-             * references — eliminates cold-disk attack clicks on the
-             * first chord. The converted SFZ uses paths relative to the
-             * dspreset's directory. */
-            char base[MAX_PATH_LEN];
-            snprintf(base, sizeof(base), "%s", path);
-            char *bslash = strrchr(base, '/');
-            if (bslash) *bslash = '\0';
-            prewarm_samples(converted_path, base);
             /* unlink(converted_path); */
             free(converted_path);
         } else {
@@ -2009,11 +1949,6 @@ static int load_sfz_file(sfz_instance_t *inst, const char *path,
                      "Failed to load instrument file");
             return -1;
         }
-        char base[MAX_PATH_LEN];
-        snprintf(base, sizeof(base), "%s", path);
-        char *bslash = strrchr(base, '/');
-        if (bslash) *bslash = '\0';
-        prewarm_samples(path, base);
     }
 
     int num_regions = sfizz_get_num_regions(inst->synth);
@@ -2220,29 +2155,82 @@ static void* v2_create_instance(const char *module_dir, const char *json_default
     /* Scan instruments */
     scan_instruments(inst, module_dir);
 
-    /* Restore preset selection from defaults. Prefer name-based lookup so the
-     * same patch survives reorderings; fall back to index. */
+    /* Restore preset selection from defaults. Each fallback only fires if
+     * the previous one didn't find a match — preset_name is the most
+     * reliable across rescans, so we don't let a stale saved `preset`
+     * index clobber a successful name match.
+     *
+     * Bug previously: when a set was saved with preset_name="WörliTzer 01"
+     * at index 139, then the user added more libraries shifting indices,
+     * load would find the name (idx=newIdx) then the `preset` line
+     * unconditionally overwrote with the stale 139 — pointing at the
+     * wrong patch until the user manually scrolled. */
     int start_preset = 0;
+    int found = 0;
     if (json_defaults) {
         float f;
         char name[MAX_NAME_LEN];
-        if (json_get_string(json_defaults, "preset_name", name, sizeof(name)) > 0) {
+        if (!found && json_get_string(json_defaults, "preset_name", name,
+                                       sizeof(name)) > 0) {
             int idx = find_preset_by_name(inst, name);
-            if (idx >= 0) start_preset = idx;
-        } else if (json_get_string(json_defaults, "instrument_name", name,
-                                   sizeof(name)) > 0) {
-            int ii = find_instrument_by_name(inst, name);
-            if (ii >= 0 && inst->instruments[ii].first_preset >= 0)
-                start_preset = inst->instruments[ii].first_preset;
+            if (idx >= 0) { start_preset = idx; found = 1; }
         }
-        if (json_get_number(json_defaults, "preset", &f) == 0) {
+        if (!found && json_get_string(json_defaults, "instrument_name", name,
+                                       sizeof(name)) > 0) {
+            int ii = find_instrument_by_name(inst, name);
+            if (ii >= 0 && inst->instruments[ii].first_preset >= 0) {
+                start_preset = inst->instruments[ii].first_preset;
+                found = 1;
+            }
+        }
+        if (!found && json_get_number(json_defaults, "preset", &f) == 0) {
             int idx = (int)f;
-            if (idx >= 0 && idx < inst->preset_count) start_preset = idx;
+            if (idx >= 0 && idx < inst->preset_count) {
+                start_preset = idx;
+                found = 1;
+            }
         }
     }
 
     if (inst->preset_count > 0) {
         set_preset_index_immediate(inst, start_preset);
+    }
+
+    /* Restore octave/gain/voices/knob positions from the saved set.
+     * Must happen AFTER set_preset_index_immediate so inst->knobs[] is
+     * populated by the preset's converter pass — a knob restore otherwise
+     * targets stale knob slots. */
+    if (json_defaults) {
+        float f;
+        if (json_get_number(json_defaults, "octave_transpose", &f) == 0) {
+            inst->octave_transpose = (int)f;
+            if (inst->octave_transpose < -4) inst->octave_transpose = -4;
+            if (inst->octave_transpose >  4) inst->octave_transpose =  4;
+        }
+        if (json_get_number(json_defaults, "gain", &f) == 0) {
+            inst->gain = f;
+            if (inst->gain < 0.0f) inst->gain = 0.0f;
+            if (inst->gain > 2.0f) inst->gain = 2.0f;
+            sfizz_set_volume(inst->synth, (float)lin_to_db(inst->gain));
+        }
+        if (json_get_number(json_defaults, "voices", &f) == 0) {
+            int v = (int)f;
+            if (v < 4)   v = 4;
+            if (v > 128) v = 128;
+            inst->voices = v;
+            sfizz_set_num_voices(inst->synth, v);
+        }
+        for (int i = 0; i < inst->knob_count; i++) {
+            char k[16];
+            snprintf(k, sizeof(k), "knob_%d", i);
+            if (json_get_number(json_defaults, k, &f) == 0) {
+                ds_knob_t *kn = &inst->knobs[i];
+                double t = f;
+                if (t < 0) t = 0; if (t > 1) t = 1;
+                kn->current = kn->min + t * (kn->max - kn->min);
+                sfizz_send_hdcc(inst->synth, 0, kn->cc_number, (float)t);
+            }
+        }
     }
 
     plugin_log("Instance created");
@@ -2419,6 +2407,21 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             if (v > 128) v = 128;
             inst->voices = v;
             if (inst->synth) sfizz_set_num_voices(inst->synth, v);
+        }
+        /* Knob restore — must happen AFTER the preset reload above so
+         * inst->knobs[] is populated for the new preset. Saved values are
+         * normalized 0..1 fractions. */
+        for (int i = 0; i < inst->knob_count; i++) {
+            char k[16];
+            snprintf(k, sizeof(k), "knob_%d", i);
+            if (json_get_number(val, k, &f) == 0) {
+                ds_knob_t *kn = &inst->knobs[i];
+                double t = f;
+                if (t < 0) t = 0; if (t > 1) t = 1;
+                kn->current = kn->min + t * (kn->max - kn->min);
+                if (inst->synth)
+                    sfizz_send_hdcc(inst->synth, 0, kn->cc_number, (float)t);
+            }
         }
     }
 }
@@ -2627,15 +2630,28 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
         written += snprintf(buf + written, buf_len - written, "]");
         return written;
     }
-    /* State serialization */
+    /* State serialization. Knob positions are saved as normalized 0..1
+     * fractions (the same form the encoder sends in via set_param) so
+     * they restore cleanly even if a future build changes a knob's
+     * underlying DS range. */
     else if (strcmp(key, "state") == 0) {
-        return snprintf(buf, buf_len,
+        int written = snprintf(buf, buf_len,
             "{\"preset_name\":\"%s\",\"instrument_name\":\"%s\","
             "\"preset\":%d,\"octave_transpose\":%d,\"gain\":%.2f,"
-            "\"voices\":%d}",
+            "\"voices\":%d",
             inst->preset_name, inst->instrument_name,
             inst->current_preset, inst->octave_transpose, inst->gain,
             inst->voices);
+        for (int i = 0; i < inst->knob_count && written < buf_len - 32; i++) {
+            ds_knob_t *k = &inst->knobs[i];
+            double t = (k->max != k->min)
+                ? (k->current - k->min) / (k->max - k->min) : 0.0;
+            if (t < 0) t = 0; if (t > 1) t = 1;
+            written += snprintf(buf + written, buf_len - written,
+                                ",\"knob_%d\":%g", i, t);
+        }
+        written += snprintf(buf + written, buf_len - written, "}");
+        return written;
     }
     /* UI hierarchy for shadow parameter editor.
      *
@@ -2643,11 +2659,6 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
      * DS-knob inventory. The full encoder row is dedicated to DS knobs
      * (knob_0..knob_7); octave/gain stay in the params menu. */
     else if (strcmp(key, "ui_hierarchy") == 0) {
-        char dbg[64];
-        snprintf(dbg, sizeof(dbg),
-                 "get_param(ui_hierarchy) called, knob_count=%d",
-                 inst->knob_count);
-        plugin_log(dbg);
         int written = 0;
         written += snprintf(buf + written, buf_len - written,
             "{\"modes\":null,\"levels\":{\"root\":{"
@@ -2745,29 +2756,7 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
 
     /* sfizz renders to separate float channel buffers */
     float *channels[2] = { inst->left_buf, inst->right_buf };
-    /* Profile: how long does sfizz take per block, and how many voices
-     * are alive? Log when a block overruns the 2.9 ms RT budget or when
-     * active-voice count changes — this is the data we need to tell
-     * disk vs. CPU vs. voice-stealing apart. */
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
     sfizz_render_block(inst->synth, channels, 2, frames);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    long us = (t1.tv_sec - t0.tv_sec) * 1000000L +
-              (t1.tv_nsec - t0.tv_nsec) / 1000L;
-    int active = sfizz_get_num_active_voices(inst->synth);
-    static int last_active = -1;
-    static long peak_us = 0;
-    static int peak_active = 0;
-    if (us > peak_us) { peak_us = us; peak_active = active; }
-    if (us > 2500 || (active != last_active && (active % 4 == 0 || active == 0))) {
-        char msg[128];
-        snprintf(msg, sizeof(msg),
-                 "render block: %ld us, voices=%d (peak %ld us @ %d voices)",
-                 us, active, peak_us, peak_active);
-        plugin_log(msg);
-        last_active = active;
-    }
 
     /* Interleave and convert to int16. Soft-clip (tanh) instead of brick-wall
      * so chord-stack overshoots compress gently rather than producing harsh

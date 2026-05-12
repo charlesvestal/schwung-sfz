@@ -33,8 +33,37 @@ pub struct XSynthHandle {
     group: ChannelGroup,
 }
 
+/* Install once: panic hook that writes the panic message + a short backtrace
+ * to /tmp/xshim_panic.log before the process aborts. catch_unwind can miss
+ * panics in foreign threads or alloc-failure aborts; this hook fires earlier
+ * in the panic path so we get diagnostics either way. */
+use std::sync::Once;
+static PANIC_HOOK_INIT: Once = Once::new();
+
+fn install_panic_hook() {
+    PANIC_HOOK_INIT.call_once(|| {
+        std::panic::set_hook(Box::new(|info| {
+            let payload = if let Some(s) = info.payload().downcast_ref::<&str>() { s.to_string() }
+                else if let Some(s) = info.payload().downcast_ref::<String>() { s.clone() }
+                else { "<no message>".to_string() };
+            let loc = info.location()
+                .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+                .unwrap_or_else(|| "<no location>".to_string());
+            let entry = format!("[xshim panic] {loc}: {payload}\n");
+            set_last_error(format!("panic at {loc}: {payload}"));
+            // Best-effort: write to a known file so we can inspect even when
+            // catch_unwind doesn't catch (e.g., aborts on thread panics).
+            let _ = std::fs::OpenOptions::new()
+                .create(true).append(true)
+                .open("/data/UserData/schwung/tmp/xshim_panic.log")
+                .and_then(|mut f| std::io::Write::write_all(&mut f, entry.as_bytes()));
+        }));
+    });
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn xshim_create(sample_rate: u32, channels: u32) -> *mut XSynthHandle {
+    install_panic_hook();
     catch_unwind(AssertUnwindSafe(|| {
         let cc = match channels {
             1 => ChannelCount::Mono,
@@ -76,6 +105,18 @@ pub unsafe extern "C" fn xshim_load_sfz(handle: *mut XSynthHandle, path: *const 
             use_effects: true,
             interpolator: Interpolator::Linear,
         };
+
+        /* MOVE: Kill voices + drop the existing soundfont BEFORE constructing
+         * the new one. Otherwise old samples (e.g. WörliTzer's ~800 MB) and
+         * new samples (e.g. WobbliTzer's ~800 MB) both live in RAM at peak,
+         * exceeding the device's free memory and triggering an abort. */
+        h.group.send_event(SynthEvent::AllChannels(
+            ChannelEvent::Audio(ChannelAudioEvent::AllNotesKilled),
+        ));
+        h.group.send_event(SynthEvent::AllChannels(ChannelEvent::Config(
+            ChannelConfigEvent::SetSoundfonts(Vec::new()),
+        )));
+
         let sf = match SampleSoundfont::new(pb, stream_params, opts) {
             Ok(sf) => sf,
             Err(e) => {
@@ -91,7 +132,13 @@ pub unsafe extern "C" fn xshim_load_sfz(handle: *mut XSynthHandle, path: *const 
     }));
     match result {
         Ok(rc) => rc,
-        Err(_) => { eprintln!("[xshim] xshim_load_sfz panicked"); -1 }
+        Err(e) => {
+            let msg = if let Some(s) = e.downcast_ref::<&str>() { s.to_string() }
+                else if let Some(s) = e.downcast_ref::<String>() { s.clone() }
+                else { "unknown panic payload".to_string() };
+            set_last_error(format!("panic during load: {msg}"));
+            -1
+        }
     }
 }
 

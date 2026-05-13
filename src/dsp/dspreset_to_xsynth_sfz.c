@@ -524,6 +524,17 @@ char *convert_dspreset_to_xsynth_sfz(const char *path) {
 
         pos += snprintf(sfz + pos, out_cap - pos, "<group>\n");
 
+        /* trigger="release" → emit `trigger=release` so xsynth fires these
+         * regions on NoteOff (release sample / key-up thump) and NOT on
+         * NoteOn. Without this, key-up samples bleed into every note as
+         * a granular/clicky background layer at the group's static
+         * volume. xsynth's SFZ parser maps "attack"/"release"/"first"/
+         * "legato" — anything else silently defaults to Attack. */
+        xml_get_attr(tag_buf, "trigger", val, sizeof(val));
+        if (strcmp(val, "release") == 0) {
+            pos += snprintf(sfz + pos, out_cap - pos, "trigger=release\n");
+        }
+
         /* Group volume: <group volume="dB"> + knob-AMP_VOLUME dB + modVolume
          * (linear → dB). Without honoring these, multi-group patches like
          * WörliTzer play ~6× too loud. */

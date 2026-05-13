@@ -542,7 +542,14 @@ char *convert_dspreset_to_xsynth_sfz(const char *path) {
             double v = base_db + extra_db;
             if (v < -144) v = -144;
             if (v >  6.0) v =  6.0;
-            pos += snprintf(sfz + pos, out_cap - pos, "volume=%.2f\n", v);
+            /* xsynth's SFZ parser uses `parse_i16_in_range(val, -144..=6)`
+             * for `volume` — it REJECTS decimals (e.g. "-16.48") and
+             * silently drops the opcode on parse failure, leaving the
+             * group at the 0 dB default. We round to integer dB so all
+             * the layer volumes (and the -80 dB "silent" buckets for
+             * knobs at 0) actually take effect. */
+            int vi = (int)(v >= 0 ? v + 0.5 : v - 0.5);
+            pos += snprintf(sfz + pos, out_cap - pos, "volume=%d\n", vi);
         }
 
         xml_get_attr(tag_buf, "ampVelTrack", val, sizeof(val));

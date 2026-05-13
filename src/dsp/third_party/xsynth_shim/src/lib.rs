@@ -196,9 +196,13 @@ pub unsafe extern "C" fn xshim_load_sfz(handle: *mut XSynthHandle, path: *const 
         h.group.send_event(SynthEvent::AllChannels(
             ChannelEvent::Audio(ChannelAudioEvent::AllNotesKilled),
         ));
-        h.group.send_event(SynthEvent::AllChannels(ChannelEvent::Config(
-            ChannelConfigEvent::SetSoundfonts(Vec::new()),
-        )));
+        // MOVE FORK: target channel 0 (see comment in xshim_load_apply
+        // below — broadcast to all 16 channels caused 94 ms audio
+        // stalls on preset switch).
+        h.group.send_event(SynthEvent::Channel(
+            0,
+            ChannelEvent::Config(ChannelConfigEvent::SetSoundfonts(Vec::new())),
+        ));
 
         let sf = match SampleSoundfont::new(pb, stream_params, opts) {
             Ok(sf) => sf,
@@ -208,9 +212,17 @@ pub unsafe extern "C" fn xshim_load_sfz(handle: *mut XSynthHandle, path: *const 
             }
         };
         let arc: Arc<dyn SoundfontBase> = Arc::new(sf);
-        h.group.send_event(SynthEvent::AllChannels(ChannelEvent::Config(
-            ChannelConfigEvent::SetSoundfonts(vec![arc]),
-        )));
+        // MOVE FORK: target channel 0 only. The plugin's MIDI routing
+        // sends everything to channel 0 (see xshim_note_on / xshim_cc
+        // hardcoding `ch=0`), so the other 15 channels never carry
+        // voices. Broadcasting SetSoundfonts via AllChannels still
+        // forces a rebuild_matrix on each idle channel — 16 × 128 × 128
+        // spawner-list builds = enough audio-thread work (~94 ms peaks
+        // in production) to drop Move's audio chain entirely.
+        h.group.send_event(SynthEvent::Channel(
+            0,
+            ChannelEvent::Config(ChannelConfigEvent::SetSoundfonts(vec![arc])),
+        ));
         0
     }));
     match result {
@@ -344,9 +356,11 @@ unsafe fn dispatch_drop_old(h: &mut XSynthHandle) {
     h.group.send_event(SynthEvent::AllChannels(
         ChannelEvent::Audio(ChannelAudioEvent::AllNotesKilled),
     ));
-    h.group.send_event(SynthEvent::AllChannels(ChannelEvent::Config(
-        ChannelConfigEvent::SetSoundfonts(Vec::new()),
-    )));
+    // MOVE FORK: target channel 0 only (see xshim_load_sfz comment).
+    h.group.send_event(SynthEvent::Channel(
+        0,
+        ChannelEvent::Config(ChannelConfigEvent::SetSoundfonts(Vec::new())),
+    ));
 }
 
 #[no_mangle]
@@ -376,13 +390,29 @@ pub unsafe extern "C" fn xshim_load_sfz_async(handle: *mut XSynthHandle, path: *
         .spawn(move || {
             // Drop any pending old soundfont(s) FIRST so we don't have OLD +
             // NEW resident at the same time.
+            let t_drain = std::time::Instant::now();
             {
                 let owned = {
                     if let Ok(mut q) = drop_sink_t.lock() {
                         std::mem::take(&mut *q)
                     } else { Vec::new() }
                 };
+                let drain_count = owned.len();
+                let t_locked = t_drain.elapsed().as_micros();
                 drop(owned);
+                let t_dropped = t_drain.elapsed().as_micros();
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/data/UserData/schwung/tmp/xsynth_debug.log")
+                {
+                    let _ = writeln!(
+                        f,
+                        "[xshim] worker drain: count={} lock={}us drop={}us",
+                        drain_count, t_locked, t_dropped - t_locked
+                    );
+                }
             }
             let stream_params = AudioStreamParams::new(44100, ChannelCount::Stereo);
             let opts = SoundfontInitOptions {
@@ -482,9 +512,12 @@ pub unsafe extern "C" fn xshim_load_apply(handle: *mut XSynthHandle) -> c_int {
     let sf_opt = w.result.lock().unwrap().take();
     let Some(sf) = sf_opt else { return -1; };
     let arc: Arc<dyn SoundfontBase> = Arc::new(sf);
-    h.group.send_event(SynthEvent::AllChannels(ChannelEvent::Config(
-        ChannelConfigEvent::SetSoundfonts(vec![arc]),
-    )));
+    // MOVE FORK: channel 0 only — broadcast forces rebuild_matrix on
+    // all 16 idle channels which spikes audio thread to ~94 ms.
+    h.group.send_event(SynthEvent::Channel(
+        0,
+        ChannelEvent::Config(ChannelConfigEvent::SetSoundfonts(vec![arc])),
+    ));
     if let Some(jh) = w.handle.take() { let _ = jh.join(); }
     h.worker = None;
     0

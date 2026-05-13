@@ -831,17 +831,13 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
         xshim_load_clear_status(inst->synth);
     }
 
-    /* One-shot CPU/scheduler setup. Matches what sfz_plugin.c does — pin to
-     * a core and request SCHED_FIFO. Best-effort; SCHED_FIFO needs
-     * CAP_SYS_NICE which we don't have, so it'll usually fail silently. */
-    static int rt_setup_done = 0;
-    if (!rt_setup_done) {
-        rt_setup_done = 1;
-        cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(3, &cs);
-        sched_setaffinity(0, sizeof(cs), &cs);
-        struct sched_param sp = { .sched_priority = 50 };
-        sched_setscheduler(0, SCHED_FIFO, &sp);
-    }
+    /* MOVE FORK: SCHED_FIFO 50 disabled — when our render path spikes
+     * to 100ms+ (e.g. rebuild_matrix on Splendid → Rhodes switch with
+     * heavy soundfont teardown), the kernel can't preempt us at FIFO
+     * priority and the ENTIRE device locks up (display, USB, network).
+     * Running at normal priority means occasional audio glitches under
+     * load, but the device stays responsive. We'd ALSO drop CPU
+     * affinity — pinning to core 3 isn't worth it without RT priority. */
 
     /* Snapshot NoteOn count for THIS block before render. Splits perf log
      * into spawn-heavy (sequence chord lands) vs sustain-heavy (voices ring

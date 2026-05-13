@@ -356,9 +356,211 @@ static int count_rr_groups(const char *src) {
     return count;
 }
 
+/* --- knob enumeration ---------------------------------------------------- */
+
+/* Short fallback label derived from a binding's DS `parameter=` name.
+ * Returns NULL when the target has no obvious short alias (caller falls
+ * back to "Knob" / group-name lookup). */
+static const char *target_alias(const char *ds_param) {
+    if (!ds_param || !ds_param[0]) return NULL;
+    if (strcmp(ds_param, "FX_FILTER_FREQUENCY") == 0) return "Filter";
+    if (strcmp(ds_param, "FX_FILTER_RESONANCE") == 0) return "Reso";
+    if (strcmp(ds_param, "FX_REVERB_WET_LEVEL")  == 0) return "Reverb";
+    if (strcmp(ds_param, "FX_REVERB_ROOM_SIZE")  == 0) return "Room";
+    if (strcmp(ds_param, "FX_REVERB_DAMPING")    == 0) return "Damp";
+    if (strcmp(ds_param, "FX_DELAY_TIME")        == 0) return "DlyTime";
+    if (strcmp(ds_param, "FX_DELAY_FEEDBACK")    == 0) return "DlyFb";
+    if (strcmp(ds_param, "FX_WET_LEVEL")         == 0) return "Wet";
+    if (strcmp(ds_param, "FX_CHORUS_DEPTH")      == 0) return "ChrDepth";
+    if (strcmp(ds_param, "FX_CHORUS_RATE")       == 0) return "ChrRate";
+    if (strcmp(ds_param, "ENV_ATTACK")  == 0) return "Attack";
+    if (strcmp(ds_param, "ENV_DECAY")   == 0) return "Decay";
+    if (strcmp(ds_param, "ENV_SUSTAIN") == 0) return "Sustain";
+    if (strcmp(ds_param, "ENV_RELEASE") == 0) return "Release";
+    if (strcmp(ds_param, "LEVEL")       == 0) return "Level";
+    if (strcmp(ds_param, "MOD_AMOUNT")  == 0) return "Mod";
+    if (strcmp(ds_param, "FREQUENCY")   == 0) return "Freq";
+    return NULL;
+}
+
+/* Read the `name=` attribute of the Nth <group> in document order.
+ * Used as a label fallback for AMP_VOLUME / TAG_VOLUME knobs when the
+ * `<labeled-knob>` has an empty `label=` (common in image-themed
+ * patches like WörliTzer where the knob graphic carries the label). */
+static int get_group_name_for_position(const char *src, int position,
+                                        char *out, int out_len) {
+    out[0] = '\0';
+    const char *p = src;
+    int idx = 0;
+    while ((p = strstr(p, "<group")) != NULL) {
+        if (p[6] == 's' || p[6] == 'S') { p += 7; continue; }
+        const char *tag_end = strchr(p, '>');
+        if (!tag_end) break;
+        if (idx == position) {
+            char tag[1024];
+            int tlen = (int)(tag_end - p);
+            if (tlen > 1023) tlen = 1023;
+            memcpy(tag, p, tlen);
+            tag[tlen] = '\0';
+            xml_get_attr(tag, "name", out, out_len);
+            return out[0] ? 1 : 0;
+        }
+        idx++;
+        p = tag_end + 1;
+    }
+    return 0;
+}
+
+/* Test if a `<binding parameter="X">` target is one that xsynth honors
+ * for live CC modulation today. Currently: only ampeg-family targets
+ * route through our ARIA `_oncc` baker which is the only path that
+ * recomputes static values from CC state. Everything else bakes its
+ * default-position value statically at load and doesn't respond to
+ * subsequent CC changes — yet (Phase B2 work to be done in xsynth). */
+static int binding_param_is_live(const char *parameter) {
+    if (!parameter || !parameter[0]) return 0;
+    return strcmp(parameter, "ENV_ATTACK") == 0 ||
+           strcmp(parameter, "ENV_DECAY") == 0 ||
+           strcmp(parameter, "ENV_SUSTAIN") == 0 ||
+           strcmp(parameter, "ENV_RELEASE") == 0 ||
+           strcmp(parameter, "ENV_HOLD") == 0;
+}
+
+/* Walk every `<labeled-knob>` / `<control>` element in document order and
+ * populate `knobs_out` with one entry per UI knob. Each knob is assigned
+ * a synthetic CC number (102..117) so the plugin can route knob movement
+ * to `xshim_cc`. Returns the populated knob count. */
+static int enumerate_ui_knobs(const char *src,
+                              ds_knob_t knobs_out[DS_MAX_KNOBS]) {
+    int kc = 0;
+    int next_cc = 102;
+    const char *p = src;
+
+    while (kc < DS_MAX_KNOBS) {
+        const char *c1 = strstr(p, "<control");
+        const char *c2 = strstr(p, "<labeled-knob");
+        const char *next = NULL;
+        size_t pat_len = 0;
+        if (c1 && c2) {
+            if (c1 < c2) { next = c1; pat_len = 8; }
+            else         { next = c2; pat_len = 13; }
+        } else if (c1) { next = c1; pat_len = 8; }
+        else if (c2)   { next = c2; pat_len = 13; }
+        else break;
+
+        p = next;
+        char nxt = p[pat_len];
+        if (nxt != ' ' && nxt != '\t' && nxt != '\n' &&
+            nxt != '\r' && nxt != '>' && nxt != '/') {
+            p += pat_len;
+            continue;
+        }
+        const char *tag_end = strchr(p, '>');
+        if (!tag_end) break;
+
+        char ctrl_tag[1024];
+        int tlen = (int)(tag_end - p);
+        if (tlen > 1023) tlen = 1023;
+        memcpy(ctrl_tag, p, tlen);
+        ctrl_tag[tlen] = '\0';
+
+        char cmin[64], cmax[64], cval[64], clabel[64], clabelp[64];
+        xml_get_attr(ctrl_tag, "minValue",      cmin,    sizeof(cmin));
+        xml_get_attr(ctrl_tag, "maxValue",      cmax,    sizeof(cmax));
+        xml_get_attr(ctrl_tag, "value",         cval,    sizeof(cval));
+        xml_get_attr(ctrl_tag, "label",         clabel,  sizeof(clabel));
+        xml_get_attr(ctrl_tag, "parameterName", clabelp, sizeof(clabelp));
+
+        /* Scan bindings inside this control to determine if any of them
+         * have a live-capable target. Even if no bindings parse, we still
+         * surface the knob (it'll just save/restore state without live
+         * audio response). */
+        int self_closed = (tag_end > p && *(tag_end - 1) == '/');
+        const char *bind_start = tag_end + 1;
+        const char *bind_end;
+        if (self_closed) {
+            bind_end = tag_end;
+        } else {
+            const char *e1 = strstr(bind_start, "</control>");
+            const char *e2 = strstr(bind_start, "</labeled-knob>");
+            if (e1 && e2)       bind_end = (e1 < e2) ? e1 : e2;
+            else if (e1)        bind_end = e1;
+            else if (e2)        bind_end = e2;
+            else                bind_end = bind_start;
+        }
+        int any_live = 0;
+        char first_param[64] = "";
+        int first_position = -1;
+        const char *bp = bind_start;
+        while (bp < bind_end) {
+            const char *bind = strstr(bp, "<binding");
+            if (!bind || bind >= bind_end) break;
+            const char *bend = strchr(bind, '>');
+            if (!bend || bend > bind_end) break;
+            char btag[512];
+            int blen = (int)(bend - bind);
+            if (blen > 511) blen = 511;
+            memcpy(btag, bind, blen);
+            btag[blen] = '\0';
+            char param[64], pos_str[16];
+            xml_get_attr(btag, "parameter", param, sizeof(param));
+            xml_get_attr(btag, "position",  pos_str, sizeof(pos_str));
+            if (binding_param_is_live(param)) any_live = 1;
+            if (first_param[0] == '\0' && param[0]) {
+                strncpy(first_param, param, sizeof(first_param) - 1);
+                first_param[sizeof(first_param) - 1] = '\0';
+                first_position = pos_str[0] ? atoi(pos_str) : -1;
+            }
+            bp = bend + 1;
+        }
+
+        ds_knob_t *k = &knobs_out[kc];
+        snprintf(k->key, sizeof(k->key), "knob_%d", kc);
+
+        /* Label fallback chain: explicit DS `label=` > `parameterName=` >
+         * group name (AMP_VOLUME/TAG_VOLUME) > short alias for the
+         * binding's parameter > "Knob N". This handles image-themed
+         * patches like WörliTzer where most `<labeled-knob>` elements
+         * leave `label=` empty and rely on the graphic; the binding's
+         * target identifies what the knob actually does. */
+        const char *lbl = NULL;
+        char group_name[64];
+        if (clabel[0]) {
+            lbl = clabel;
+        } else if (clabelp[0]) {
+            lbl = clabelp;
+        } else if ((strcmp(first_param, "AMP_VOLUME") == 0 ||
+                    strcmp(first_param, "TAG_VOLUME") == 0) &&
+                   first_position >= 0 &&
+                   get_group_name_for_position(src, first_position,
+                                                group_name, sizeof(group_name))) {
+            lbl = group_name;
+        } else {
+            lbl = target_alias(first_param);
+        }
+        if (!lbl || !lbl[0]) {
+            snprintf(k->label, sizeof(k->label), "Knob %d", kc + 1);
+        } else {
+            snprintf(k->label, sizeof(k->label), "%s", lbl);
+        }
+        k->min_value     = cmin[0] ? atof(cmin) : 0.0;
+        k->max_value     = cmax[0] ? atof(cmax) : 1.0;
+        k->default_value = cval[0] ? atof(cval) : k->min_value;
+        k->cc_number     = next_cc++;
+        k->live          = any_live;
+
+        kc++;
+        p = self_closed ? tag_end + 1 : bind_end + 15; /* skip past closer */
+    }
+    return kc;
+}
+
 /* --- converter ----------------------------------------------------------- */
 
-char *convert_dspreset_to_xsynth_sfz(const char *path) {
+char *convert_dspreset_to_xsynth_sfz(const char *path,
+                                      ds_knob_t *out_knobs,
+                                      int *out_knob_count) {
+    if (out_knob_count) *out_knob_count = 0;
     /* Base directory for sample-path resolution (the dspreset's parent). */
     char base_dir[1024];
     snprintf(base_dir, sizeof(base_dir), "%s", path);
@@ -420,6 +622,13 @@ char *convert_dspreset_to_xsynth_sfz(const char *path) {
 
     ds_effect_t fx[DS_MAX_FX] = {0};
     int fx_count = parse_effects(src, fx);
+
+    /* MOVE FORK: enumerate UI knobs once src is loaded. Caller may pass
+     * NULL out_knobs to skip extraction (e.g. converter CLI). */
+    if (out_knobs && out_knob_count) {
+        int kc = enumerate_ui_knobs(src, out_knobs);
+        *out_knob_count = kc;
+    }
 
     char env_attack[32] = "", env_decay[32] = "";
     char env_sustain[32] = "", env_release[32] = "";

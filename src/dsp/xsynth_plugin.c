@@ -140,6 +140,11 @@ typedef struct {
     int knob_count;
     double knob_current[DS_MAX_KNOBS]; /* current logical value in [min,max] */
     float *render_buf;             /* interleaved L/R/L/R..., 2 * frames */
+    /* MOVE FORK: countdown — force-log render_before/render_after for the
+     * N blocks following a soundfont apply, so we can see exactly when
+     * the post-apply audio thread freezes. Decremented each block, 0 =
+     * normal throttled logging. */
+    int just_applied_post_log;
 } xsynth_instance_t;
 
 static void plugin_log(const char *msg) {
@@ -491,6 +496,16 @@ static void* v2_create_instance(const char *module_dir, const char *json_default
         free(inst->render_buf); free(inst); return NULL;
     }
 
+    /* MOVE FORK: disable xsynth-core's per-key layer cap (default
+     * Some(4)). For sample-based DS presets that intentionally stack
+     * 5+ layers per key (e.g. WörliTzer: 10 regions at E5 across 6
+     * groups), the layer cap silently drops voices and clipped the
+     * authored sound. Performance is managed via the polyphony cap
+     * (set_polyphony_cap, exposed as `voices` param) which limits
+     * total active note-groups across the channel — the right knob
+     * for tradeoffs. 0 → None means unlimited per key. */
+    xshim_set_layer_count(inst->synth, 0);
+
     snprintf(msg, sizeof(msg), "xsynth initialized: sample_rate=%d, block=%d",
              sample_rate, MOVE_FRAMES_PER_BLOCK);
     plugin_log(msg);
@@ -746,17 +761,23 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
         return snprintf(buf, buf_len, "%d", inst->preset_count);
     else if (strcmp(key, "preset_name") == 0 || strcmp(key, "patch_name") == 0) {
         /* During an async load (set_preset_index → apply), prepend a
-         * "Loading..." marker + a 4-frame spinner so the preset browser
-         * shows the device is still working through the 5-15s sample-read
-         * window heavy DS libraries need. ~10 Hz spinner driven off
-         * CLOCK_MONOTONIC — independent of UI poll rate. */
+         * 4-frame spinner so the preset browser shows the device is
+         * still working through the 5-15s sample-read window heavy DS
+         * libraries need. ~10 Hz spinner driven off CLOCK_MONOTONIC,
+         * independent of UI poll rate. */
         if (inst->is_loading) {
             struct timespec ts;
             clock_gettime(CLOCK_MONOTONIC, &ts);
             int frame = (int)(((ts.tv_sec * 10) + (ts.tv_nsec / 100000000L)) & 3);
             static const char spin[4] = {'|', '/', '-', '\\'};
-            return snprintf(buf, buf_len, "Loading... %s %c",
-                            inst->preset_name, spin[frame]);
+            /* The '|' glyph is roughly half the width of '/' '-' '\' in
+             * the UI's proportional font, so it visually shifts the
+             * following name when its frame is shown. Pad the '|' frame
+             * with an extra trailing space — '|' + 2 spaces ≈ wide
+             * glyph + 1 space in practice, keeping the name's column
+             * stable. */
+            const char *fmt = (spin[frame] == '|') ? "%c  %s" : "%c %s";
+            return snprintf(buf, buf_len, fmt, spin[frame], inst->preset_name);
         }
         strncpy(buf, inst->preset_name, buf_len - 1);
         buf[buf_len - 1] = '\0';
@@ -991,6 +1012,31 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
     } else if (load_st == XSHIM_LOAD_READY) {
         xshim_load_apply(inst->synth);
         inst->is_loading = 0;
+        /* Phase 3 step 1: push each knob's current CC value so the
+         * NEW soundfont's voices see the authored start position from
+         * the first block. State-restore has its own resend path; this
+         * covers fresh loads (e.g. switching to a different preset).
+         * No effect today because no `_oncc<N>` opcode targets these
+         * synthetic CCs yet — events route to xsynth's `_ => {}`
+         * default arm. Lands the resend now so subsequent Phase 3 steps
+         * can wire up bindings against it. */
+        for (int i = 0; i < inst->knob_count; i++) {
+            ds_knob_t *k = &inst->knobs[i];
+            double t = (k->max_value != k->min_value)
+                ? (inst->knob_current[i] - k->min_value) /
+                  (k->max_value - k->min_value)
+                : 0.0;
+            if (t < 0.0) t = 0.0; if (t > 1.0) t = 1.0;
+            int cc_val = (int)(t * 127.0 + 0.5);
+            if (cc_val < 0) cc_val = 0; if (cc_val > 127) cc_val = 127;
+            xshim_cc(inst->synth, 0, (uint8_t)k->cc_number, (uint8_t)cc_val);
+        }
+        /* MOVE FORK: mark the next 16 blocks for unconditional render
+         * logging (bypasses 256-block heartbeat throttle). The freeze
+         * happens AFTER apply on a non-heartbeat block, so we'd
+         * otherwise miss it. 16 blocks ≈ 46 ms — covers event drain +
+         * first voice spawns. */
+        inst->just_applied_post_log = 16;
         plugin_log("xsynth: async SFZ ready and applied");
     } else if (load_st == XSHIM_LOAD_ERROR) {
         char err[256] = {0};
@@ -1018,6 +1064,42 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
     uint32_t noteons_this_block = xshim_take_noteon_count(inst->synth);
     uint64_t voices_before = xshim_voice_count(inst->synth);
 
+    /* MOVE FORK: render heartbeat — diagnostic for the audio-thread freeze
+     * that's seen on rapid preset switching. Logs a fixed-cadence marker
+     * (every 256 blocks ≈ 750 ms @ 44.1 kHz / 128 frames) BEFORE the
+     * xshim_render call. If the freeze is inside xshim_render, the
+     * subsequent `render_after` line in xsynth_debug.log will be missing.
+     * Also captures MemAvailable so we can correlate freeze with memory
+     * pressure. */
+    static uint64_t s_block_counter = 0;
+    s_block_counter++;
+    long mem_avail_kb = -1;
+    int should_log_this_block =
+        (s_block_counter % 256 == 0) || (inst->just_applied_post_log > 0);
+    if (should_log_this_block) {
+        FILE *mf = fopen("/proc/meminfo", "r");
+        if (mf) {
+            char line[256];
+            while (fgets(line, sizeof(line), mf)) {
+                if (strncmp(line, "MemAvailable:", 13) == 0) {
+                    mem_avail_kb = atol(line + 13);
+                    break;
+                }
+            }
+            fclose(mf);
+        }
+        FILE *f = fopen("/data/UserData/schwung/tmp/xsynth_debug.log", "a");
+        if (f) {
+            fprintf(f, "[plugin] render_before blk=%llu voices=%llu mem_avail=%ldKB is_loading=%d noteons=%u post_apply=%d\n",
+                    (unsigned long long)s_block_counter,
+                    (unsigned long long)voices_before,
+                    mem_avail_kb, inst->is_loading,
+                    (unsigned)noteons_this_block,
+                    inst->just_applied_post_log);
+            fclose(f);
+        }
+    }
+
     /* xsynth renders interleaved f32 stereo directly into render_buf. */
     struct timespec _t0, _t1;
     clock_gettime(CLOCK_MONOTONIC, &_t0);
@@ -1025,6 +1107,23 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
     clock_gettime(CLOCK_MONOTONIC, &_t1);
     long render_us = (_t1.tv_sec - _t0.tv_sec) * 1000000L +
                      (_t1.tv_nsec - _t0.tv_nsec) / 1000L;
+
+    /* MOVE FORK: pair with render_before above. If freeze is in render
+     * loop, we'll see render_before with no matching render_after. */
+    if (should_log_this_block) {
+        FILE *f = fopen("/data/UserData/schwung/tmp/xsynth_debug.log", "a");
+        if (f) {
+            fprintf(f, "[plugin] render_after  blk=%llu render_us=%ld voices_after=%llu\n",
+                    (unsigned long long)s_block_counter, render_us,
+                    (unsigned long long)xshim_voice_count(inst->synth));
+            fclose(f);
+        }
+    }
+    /* Decrement the post-apply countdown after both before/after logs
+     * fired so the current block is fully captured. */
+    if (inst->just_applied_post_log > 0) {
+        inst->just_applied_post_log--;
+    }
 
     /* Log perf when there was a spawn burst, render was heavy, or every
      * 256 blocks for baseline. Breakdown: par = event drain + per-key

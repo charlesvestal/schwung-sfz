@@ -29,6 +29,20 @@
 
 #define DS_MAX_FX     8
 #define DS_MAX_GROUPS 32
+/* Worst-case oncc bindings: every knob × every group, since one knob's
+ * binding list can target multiple groups (e.g. WörliTzer "Line" knob
+ * driving group 1 AND group 5 volumes). */
+#define DS_MAX_GROUP_ONCC (DS_MAX_KNOBS * DS_MAX_GROUPS)
+
+/* One live `volume_oncc<N>=<dB>` binding the converter discovered.
+ * Emitted by the main loop as an SFZ opcode inside the matching
+ * group. The voice spawner reads it from RegionParams.volume_oncc;
+ * a future SIMD generator will sample CC<N> at render time. */
+typedef struct {
+    int    group_position;  /* DS group index (0-based, matches `position=`) */
+    int    cc_number;       /* Knob's synthetic MIDI CC (102..117) */
+    double db_delta;        /* dB at knob_max minus dB at knob_min */
+} ds_group_oncc_t;
 
 /* --- helpers -------------------------------------------------------------- */
 
@@ -176,101 +190,158 @@ static int compute_binding_value(const char *ctrl_tag, const char *bind_tag,
     return 1;
 }
 
-/* Walk every <control>/<labeled-knob>, resolve each <binding> to a static
- * SFZ-target value (knob's `value=` baked in). Writes into ENV_* /
- * filter-effect / group-amp_db buckets. CC-driven bindings (no fixed value)
- * are also resolved with the knob at its load-time position — that's the
- * static snapshot we want for xsynth. */
+/* Walk every <control>/<labeled-knob> IN DOCUMENT ORDER (same as
+ * enumerate_ui_knobs), resolve each <binding> to a static SFZ-target
+ * value (knob's `value=` baked in). Writes into ENV_* / filter-effect /
+ * group-amp_db buckets. CC-driven bindings (no fixed value) are also
+ * resolved with the knob at its load-time position — that's the static
+ * snapshot.
+ *
+ * Document-order iteration aligns `knob_idx` with `knobs[]` (filled by
+ * enumerate_ui_knobs), so we can look up each binding's owning knob and
+ * its synthetic CC number. AMP_VOLUME / TAG_VOLUME group-level bindings
+ * additionally record a `volume_oncc` entry the main emit loop writes
+ * as `volume_oncc<CC>=<dB-delta>` opcodes per group. */
 static void apply_ui_overrides(const char *src,
                                ds_effect_t fx[DS_MAX_FX], int fx_count,
                                char env_attack[32], char env_decay[32],
                                char env_sustain[32], char env_release[32],
-                               double group_amp_db[DS_MAX_GROUPS]) {
-    static const char *patterns[2] = { "<control", "<labeled-knob" };
-    for (int pi = 0; pi < 2; pi++) {
-        const char *p = src;
-        size_t pat_len = strlen(patterns[pi]);
-        while ((p = strstr(p, patterns[pi])) != NULL) {
-            char nxt = p[pat_len];
-            if (nxt != ' ' && nxt != '\t' && nxt != '\n' &&
-                nxt != '\r' && nxt != '>' && nxt != '/') {
-                p += pat_len; continue;
-            }
-            const char *tag_end = strchr(p, '>');
-            if (!tag_end) break;
-            char ctrl_tag[1024];
-            int tlen = (int)(tag_end - p);
-            if (tlen > 1023) tlen = 1023;
-            memcpy(ctrl_tag, p, tlen);
-            ctrl_tag[tlen] = '\0';
+                               double group_amp_db[DS_MAX_GROUPS],
+                               const ds_knob_t *knobs, int knob_count,
+                               ds_group_oncc_t oncc_out[DS_MAX_GROUP_ONCC],
+                               int *oncc_count_io) {
+    int knob_idx = 0;
+    const char *p = src;
+    while (1) {
+        /* Pick the next <control or <labeled-knob, whichever comes
+         * first — matches enumerate_ui_knobs's iteration so knob_idx
+         * stays aligned with knobs[]. */
+        const char *c1 = strstr(p, "<control");
+        const char *c2 = strstr(p, "<labeled-knob");
+        const char *next = NULL;
+        size_t pat_len = 0;
+        if (c1 && c2) {
+            if (c1 < c2) { next = c1; pat_len = 8; }
+            else         { next = c2; pat_len = 13; }
+        } else if (c1) { next = c1; pat_len = 8; }
+        else if (c2)   { next = c2; pat_len = 13; }
+        else break;
 
-            const char *bind_search_start = tag_end + 1;
-            const char *bind_search_end;
-            int self_closed = (tag_end > p && *(tag_end - 1) == '/');
-            int closer_skip = 0;
-            if (self_closed) {
-                bind_search_end = tag_end;
-            } else {
-                const char *c1 = strstr(bind_search_start, "</control>");
-                const char *c2 = strstr(bind_search_start, "</labeled-knob>");
-                if (c1 && c2)       bind_search_end = (c1 < c2) ? c1 : c2;
-                else if (c1)        bind_search_end = c1;
-                else if (c2)        bind_search_end = c2;
-                else { p = tag_end + 1; continue; }
-                if (strncmp(bind_search_end, "</control>", 10) == 0)       closer_skip = 10;
-                else if (strncmp(bind_search_end, "</labeled-knob>", 15) == 0) closer_skip = 15;
-            }
-
-            const char *bp = bind_search_start;
-            while (bp && bp < bind_search_end) {
-                const char *binding = strstr(bp, "<binding");
-                if (!binding || binding >= bind_search_end) break;
-                const char *bind_end = strchr(binding, '>');
-                if (!bind_end || bind_end > bind_search_end) break;
-                char bind_tag[512];
-                int blen = (int)(bind_end - binding);
-                if (blen > 511) blen = 511;
-                memcpy(bind_tag, binding, blen);
-                bind_tag[blen] = '\0';
-
-                char param[64] = "", position_str[16] = "", level[32] = "";
-                xml_get_attr(bind_tag, "parameter", param,        sizeof(param));
-                xml_get_attr(bind_tag, "position",  position_str, sizeof(position_str));
-                xml_get_attr(bind_tag, "level",     level,        sizeof(level));
-
-                char effective[64];
-                if (param[0] && compute_binding_value(ctrl_tag, bind_tag,
-                                                     effective, sizeof(effective))) {
-                    int position = position_str[0] ? atoi(position_str) : 0;
-                    if (strcmp(param, "ENV_ATTACK") == 0) {
-                        strncpy(env_attack, effective, 31); env_attack[31] = '\0';
-                    } else if (strcmp(param, "ENV_DECAY") == 0) {
-                        strncpy(env_decay, effective, 31); env_decay[31] = '\0';
-                    } else if (strcmp(param, "ENV_SUSTAIN") == 0) {
-                        strncpy(env_sustain, effective, 31); env_sustain[31] = '\0';
-                    } else if (strcmp(param, "ENV_RELEASE") == 0) {
-                        strncpy(env_release, effective, 31); env_release[31] = '\0';
-                    } else if ((strcmp(param, "AMP_VOLUME") == 0 ||
-                                strcmp(param, "TAG_VOLUME") == 0) &&
-                               strcmp(level, "group") == 0 &&
-                               position >= 0 && position < DS_MAX_GROUPS) {
-                        /* 0..1 linear amp factor → dB, composes additively
-                         * with the group's <group volume=...> attr. */
-                        group_amp_db[position] = lin_to_db(atof(effective));
-                    } else if (position >= 0 && position < fx_count) {
-                        ds_effect_t *f = &fx[position];
-                        if (strcmp(param, "FX_FILTER_FREQUENCY") == 0) {
-                            strncpy(f->freq, effective, 31); f->freq[31] = '\0';
-                        } else if (strcmp(param, "FX_FILTER_RESONANCE") == 0) {
-                            strncpy(f->resonance, effective, 31); f->resonance[31] = '\0';
-                        }
-                        /* Reverb knobs: skip — xsynth has no reverb anyway. */
-                    }
-                }
-                bp = bind_end + 1;
-            }
-            p = self_closed ? (tag_end + 1) : (bind_search_end + closer_skip);
+        p = next;
+        char nxt = p[pat_len];
+        if (nxt != ' ' && nxt != '\t' && nxt != '\n' &&
+            nxt != '\r' && nxt != '>' && nxt != '/') {
+            p += pat_len; continue;
         }
+        const char *tag_end = strchr(p, '>');
+        if (!tag_end) break;
+        char ctrl_tag[1024];
+        int tlen = (int)(tag_end - p);
+        if (tlen > 1023) tlen = 1023;
+        memcpy(ctrl_tag, p, tlen);
+        ctrl_tag[tlen] = '\0';
+
+        const char *bind_search_start = tag_end + 1;
+        const char *bind_search_end;
+        int self_closed = (tag_end > p && *(tag_end - 1) == '/');
+        int closer_skip = 0;
+        if (self_closed) {
+            bind_search_end = tag_end;
+        } else {
+            const char *e1 = strstr(bind_search_start, "</control>");
+            const char *e2 = strstr(bind_search_start, "</labeled-knob>");
+            if (e1 && e2)       bind_search_end = (e1 < e2) ? e1 : e2;
+            else if (e1)        bind_search_end = e1;
+            else if (e2)        bind_search_end = e2;
+            else { p = tag_end + 1; knob_idx++; continue; }
+            if (strncmp(bind_search_end, "</control>", 10) == 0)       closer_skip = 10;
+            else if (strncmp(bind_search_end, "</labeled-knob>", 15) == 0) closer_skip = 15;
+        }
+
+        /* Knob endpoints for volume_oncc delta: dB at minValue vs dB at
+         * maxValue, both via apply_binding_xform so any DS translation
+         * table is honored. */
+        char cmin[64], cmax[64];
+        xml_get_attr(ctrl_tag, "minValue", cmin, sizeof(cmin));
+        xml_get_attr(ctrl_tag, "maxValue", cmax, sizeof(cmax));
+        double knob_min = cmin[0] ? atof(cmin) : 0.0;
+        double knob_max = cmax[0] ? atof(cmax) : 1.0;
+        int knob_cc = (knob_idx < knob_count) ? knobs[knob_idx].cc_number : -1;
+
+        const char *bp = bind_search_start;
+        while (bp && bp < bind_search_end) {
+            const char *binding = strstr(bp, "<binding");
+            if (!binding || binding >= bind_search_end) break;
+            const char *bind_end = strchr(binding, '>');
+            if (!bind_end || bind_end > bind_search_end) break;
+            char bind_tag[512];
+            int blen = (int)(bind_end - binding);
+            if (blen > 511) blen = 511;
+            memcpy(bind_tag, binding, blen);
+            bind_tag[blen] = '\0';
+
+            char param[64] = "", position_str[16] = "", level[32] = "";
+            xml_get_attr(bind_tag, "parameter", param,        sizeof(param));
+            xml_get_attr(bind_tag, "position",  position_str, sizeof(position_str));
+            xml_get_attr(bind_tag, "level",     level,        sizeof(level));
+
+            char effective[64];
+            if (param[0] && compute_binding_value(ctrl_tag, bind_tag,
+                                                 effective, sizeof(effective))) {
+                int position = position_str[0] ? atoi(position_str) : 0;
+                if (strcmp(param, "ENV_ATTACK") == 0) {
+                    strncpy(env_attack, effective, 31); env_attack[31] = '\0';
+                } else if (strcmp(param, "ENV_DECAY") == 0) {
+                    strncpy(env_decay, effective, 31); env_decay[31] = '\0';
+                } else if (strcmp(param, "ENV_SUSTAIN") == 0) {
+                    strncpy(env_sustain, effective, 31); env_sustain[31] = '\0';
+                } else if (strcmp(param, "ENV_RELEASE") == 0) {
+                    strncpy(env_release, effective, 31); env_release[31] = '\0';
+                } else if ((strcmp(param, "AMP_VOLUME") == 0 ||
+                            strcmp(param, "TAG_VOLUME") == 0) &&
+                           strcmp(level, "group") == 0 &&
+                           position >= 0 && position < DS_MAX_GROUPS) {
+                    /* Static bake (unchanged from before Phase 3): the
+                     * knob's CURRENT-position dB feeds group_amp_db so
+                     * the SFZ `volume=` opcode reflects what the user
+                     * sees. Step 6 will switch this to the silent
+                     * endpoint once the voice generator consumes the
+                     * volume_oncc delta. For now both lines are emitted
+                     * so the data flow exists end-to-end even though
+                     * the SIMD generator isn't reading it yet. */
+                    group_amp_db[position] = lin_to_db(atof(effective));
+
+                    /* Also record the knob → group volume_oncc binding
+                     * for emission later. Delta = dB at knob_max minus
+                     * dB at knob_min (full sweep range). */
+                    if (knob_cc >= 0 &&
+                        oncc_count_io && *oncc_count_io < DS_MAX_GROUP_ONCC) {
+                        double v_at_min = apply_binding_xform(bind_tag, knob_min,
+                                                              knob_max, knob_min);
+                        double v_at_max = apply_binding_xform(bind_tag, knob_min,
+                                                              knob_max, knob_max);
+                        double db_min = lin_to_db(v_at_min);
+                        double db_max = lin_to_db(v_at_max);
+                        ds_group_oncc_t *e = &oncc_out[*oncc_count_io];
+                        e->group_position = position;
+                        e->cc_number      = knob_cc;
+                        e->db_delta       = db_max - db_min;
+                        (*oncc_count_io)++;
+                    }
+                } else if (position >= 0 && position < fx_count) {
+                    ds_effect_t *f = &fx[position];
+                    if (strcmp(param, "FX_FILTER_FREQUENCY") == 0) {
+                        strncpy(f->freq, effective, 31); f->freq[31] = '\0';
+                    } else if (strcmp(param, "FX_FILTER_RESONANCE") == 0) {
+                        strncpy(f->resonance, effective, 31); f->resonance[31] = '\0';
+                    }
+                    /* Reverb knobs: skip — xsynth has no reverb anyway. */
+                }
+            }
+            bp = bind_end + 1;
+        }
+        p = self_closed ? (tag_end + 1) : (bind_search_end + closer_skip);
+        knob_idx++;
     }
 }
 
@@ -412,18 +483,23 @@ static int get_group_name_for_position(const char *src, int position,
 }
 
 /* Test if a `<binding parameter="X">` target is one that xsynth honors
- * for live CC modulation today. Currently: only ampeg-family targets
- * route through our ARIA `_oncc` baker which is the only path that
- * recomputes static values from CC state. Everything else bakes its
- * default-position value statically at load and doesn't respond to
- * subsequent CC changes — yet (Phase B2 work to be done in xsynth). */
+ * for live CC modulation today.
+ *  - ENV_*: routed through the ARIA `_oncc` baker which folds CC state
+ *    into static values at load time (knob position frozen at load).
+ *  - AMP_VOLUME / TAG_VOLUME: converter emits `volume_oncc<CC>=<dB>`
+ *    alongside the static `volume=`. RegionParams collects them; a
+ *    future voice-side generator (Phase 3 step 5) will sample CC live.
+ *    Already useful as a knob-surface signal even before the
+ *    generator lands. */
 static int binding_param_is_live(const char *parameter) {
     if (!parameter || !parameter[0]) return 0;
     return strcmp(parameter, "ENV_ATTACK") == 0 ||
            strcmp(parameter, "ENV_DECAY") == 0 ||
            strcmp(parameter, "ENV_SUSTAIN") == 0 ||
            strcmp(parameter, "ENV_RELEASE") == 0 ||
-           strcmp(parameter, "ENV_HOLD") == 0;
+           strcmp(parameter, "ENV_HOLD") == 0 ||
+           strcmp(parameter, "AMP_VOLUME") == 0 ||
+           strcmp(parameter, "TAG_VOLUME") == 0;
 }
 
 /* Walk every `<labeled-knob>` / `<control>` element in document order and
@@ -624,18 +700,27 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
     int fx_count = parse_effects(src, fx);
 
     /* MOVE FORK: enumerate UI knobs once src is loaded. Caller may pass
-     * NULL out_knobs to skip extraction (e.g. converter CLI). */
+     * NULL out_knobs to skip extraction (e.g. converter CLI). We need
+     * the knob list inside apply_ui_overrides for CC lookups on live
+     * volume_oncc bindings; if the caller skipped extraction we
+     * enumerate into a local buffer for use within this call. */
+    ds_knob_t local_knobs[DS_MAX_KNOBS];
+    ds_knob_t *use_knobs = out_knobs ? out_knobs : local_knobs;
+    int knob_count_local = enumerate_ui_knobs(src, use_knobs);
     if (out_knobs && out_knob_count) {
-        int kc = enumerate_ui_knobs(src, out_knobs);
-        *out_knob_count = kc;
+        *out_knob_count = knob_count_local;
     }
 
     char env_attack[32] = "", env_decay[32] = "";
     char env_sustain[32] = "", env_release[32] = "";
     double group_amp_db[DS_MAX_GROUPS];
     for (int i = 0; i < DS_MAX_GROUPS; i++) group_amp_db[i] = NAN;
+    ds_group_oncc_t group_oncc[DS_MAX_GROUP_ONCC];
+    int group_oncc_count = 0;
     apply_ui_overrides(src, fx, fx_count, env_attack, env_decay,
-                       env_sustain, env_release, group_amp_db);
+                       env_sustain, env_release, group_amp_db,
+                       use_knobs, knob_count_local,
+                       group_oncc, &group_oncc_count);
 
     int rr_total = count_rr_groups(src);
 
@@ -797,6 +882,25 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
              * knobs at 0) actually take effect. */
             int vi = (int)(v >= 0 ? v + 0.5 : v - 0.5);
             pos += snprintf(sfz + pos, out_cap - pos, "volume=%d\n", vi);
+        }
+
+        /* Phase 3 step 3: emit live `volume_oncc<CC>=<dB>` opcodes for
+         * every AMP_VOLUME / TAG_VOLUME knob bound to this group. The
+         * static `volume=` above STILL reflects the knob's current
+         * position (unchanged from prior behavior) — these opcodes
+         * add a parsed-but-unused field on RegionParams.volume_oncc.
+         * Step 5 will wire a SIMD generator that multiplies the voice
+         * amp by `db_to_amp(Σ delta·cc/127)`. Step 6 will switch the
+         * static baseline to the knob's silent endpoint so the delta
+         * brings audio UP from silence as the user turns the knob. */
+        for (int oi = 0; oi < group_oncc_count; oi++) {
+            const ds_group_oncc_t *e = &group_oncc[oi];
+            if (e->group_position != group_idx) continue;
+            double d = e->db_delta;
+            if (d < -144.0) d = -144.0;
+            if (d >  144.0) d =  144.0;
+            pos += snprintf(sfz + pos, out_cap - pos,
+                            "volume_oncc%d=%.2f\n", e->cc_number, d);
         }
 
         xml_get_attr(tag_buf, "ampVelTrack", val, sizeof(val));

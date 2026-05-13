@@ -129,6 +129,7 @@ fn install_panic_hook() {
 #[no_mangle]
 pub unsafe extern "C" fn xshim_create(sample_rate: u32, channels: u32) -> *mut XSynthHandle {
     install_panic_hook();
+    install_phase_heartbeat();
     catch_unwind(AssertUnwindSafe(|| {
         let cc = match channels {
             1 => ChannelCount::Mono,
@@ -151,6 +152,73 @@ pub unsafe extern "C" fn xshim_create(sample_rate: u32, channels: u32) -> *mut X
         }))
     }))
     .unwrap_or(ptr::null_mut())
+}
+
+/* MOVE FORK: phase-trace heartbeat. A dedicated thread polls the
+ * RENDER_PHASE / RENDER_KEY / RENDER_BLOCK_COUNTER atomics every 50 ms.
+ * If the audio thread freezes inside push_key_events_and_render, the
+ * phase atomic stays pinned at its last value and the heartbeat keeps
+ * echoing it to xsynth_debug.log — that's how we identify which stage
+ * (event drain / voice spawn / per-key render / fx) hangs.
+ *
+ * The heartbeat only writes a log line when SOMETHING changes (phase
+ * advances or block counter increments) OR when it detects a stuck
+ * block (counter unchanged for >100 ms but phase != 0). Quiet during
+ * normal rendering. */
+static PHASE_HEARTBEAT_INIT: Once = Once::new();
+
+fn install_phase_heartbeat() {
+    PHASE_HEARTBEAT_INIT.call_once(|| {
+        thread::Builder::new()
+            .name("xshim-phase-hb".into())
+            .spawn(|| {
+                let mut last_block: u32 = 0;
+                let mut stuck_count: u32 = 0;
+                loop {
+                    thread::sleep(std::time::Duration::from_millis(50));
+                    let blk = xsynth_core::channel::RENDER_BLOCK_COUNTER
+                        .load(Ordering::Relaxed);
+                    let ph = xsynth_core::channel::RENDER_PHASE
+                        .load(Ordering::Relaxed);
+                    let key = xsynth_core::channel::RENDER_KEY
+                        .load(Ordering::Relaxed);
+
+                    let advanced = blk != last_block;
+
+                    // STUCK = block counter hasn't advanced across this
+                    // tick. Don't trust the phase value alone — the
+                    // audio thread may be stuck BEFORE the first phase
+                    // store (still in flush_events, channel_group
+                    // setup, etc.), in which case phase shows the
+                    // previous block's terminal value (8) or initial
+                    // (0). We declare a freeze after 4 consecutive
+                    // no-advance ticks (200 ms), so 30 ms rebuild
+                    // pauses don't false-positive.
+                    if !advanced {
+                        stuck_count += 1;
+                        if stuck_count >= 4 {
+                            use std::io::Write;
+                            if let Ok(mut f) = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open("/data/UserData/schwung/tmp/xsynth_debug.log")
+                            {
+                                let _ = writeln!(
+                                    f,
+                                    "[hb] STUCK blk={} phase={} key={} stuck_ticks={} (~{}ms)",
+                                    blk, ph, key, stuck_count,
+                                    stuck_count * 50,
+                                );
+                            }
+                        }
+                    } else {
+                        stuck_count = 0;
+                    }
+                    last_block = blk;
+                }
+            })
+            .ok();
+    });
 }
 
 unsafe fn cancel_inflight(h: &mut XSynthHandle) {
@@ -392,6 +460,7 @@ pub unsafe extern "C" fn xshim_load_sfz_async(handle: *mut XSynthHandle, path: *
             // NEW resident at the same time.
             let t_drain = std::time::Instant::now();
             {
+                let mem_before = available_memory_mb();
                 let owned = {
                     if let Ok(mut q) = drop_sink_t.lock() {
                         std::mem::take(&mut *q)
@@ -401,6 +470,7 @@ pub unsafe extern "C" fn xshim_load_sfz_async(handle: *mut XSynthHandle, path: *
                 let t_locked = t_drain.elapsed().as_micros();
                 drop(owned);
                 let t_dropped = t_drain.elapsed().as_micros();
+                let mem_after = available_memory_mb();
                 use std::io::Write;
                 if let Ok(mut f) = std::fs::OpenOptions::new()
                     .create(true)
@@ -409,8 +479,8 @@ pub unsafe extern "C" fn xshim_load_sfz_async(handle: *mut XSynthHandle, path: *
                 {
                     let _ = writeln!(
                         f,
-                        "[xshim] worker drain: count={} lock={}us drop={}us",
-                        drain_count, t_locked, t_dropped - t_locked
+                        "[xshim] worker drain: count={} lock={}us drop={}us mem_before={}MB mem_after={}MB",
+                        drain_count, t_locked, t_dropped - t_locked, mem_before, mem_after,
                     );
                 }
             }
@@ -446,9 +516,27 @@ pub unsafe extern "C" fn xshim_load_sfz_async(handle: *mut XSynthHandle, path: *
                 status_t.store(STATUS_ERROR, Ordering::Release);
                 return;
             }
+            let t_load_start = std::time::Instant::now();
+            let mem_pre_load = available_memory_mb();
             let load_res = catch_unwind(AssertUnwindSafe(|| {
                 SampleSoundfont::new_sfz_cancellable(pb, stream_params, opts, Some(cancel_t))
             }));
+            let load_us = t_load_start.elapsed().as_micros();
+            let mem_post_load = available_memory_mb();
+            {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/data/UserData/schwung/tmp/xsynth_debug.log")
+                {
+                    let _ = writeln!(
+                        f,
+                        "[xshim] worker load_done: elapsed={}us mem_pre={}MB mem_post={}MB",
+                        load_us, mem_pre_load, mem_post_load,
+                    );
+                }
+            }
             match load_res {
                 Ok(Ok(sf)) => {
                     *result_t.lock().unwrap() = Some(sf);
@@ -512,6 +600,22 @@ pub unsafe extern "C" fn xshim_load_apply(handle: *mut XSynthHandle) -> c_int {
     let sf_opt = w.result.lock().unwrap().take();
     let Some(sf) = sf_opt else { return -1; };
     let arc: Arc<dyn SoundfontBase> = Arc::new(sf);
+    // MOVE FORK: diagnostic — snapshot memory at the critical moment of
+    // swapping in the new soundfont. The OLD soundfont may still be
+    // referenced by active voices; the NEW one is about to be installed.
+    // Compared against subsequent render_before heartbeats this shows
+    // whether the freeze coincides with a memory drop.
+    {
+        use std::io::Write;
+        let mem_avail = available_memory_mb();
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/data/UserData/schwung/tmp/xsynth_debug.log")
+        {
+            let _ = writeln!(f, "[xshim] load_apply: mem_avail={}MB", mem_avail);
+        }
+    }
     // MOVE FORK: channel 0 only — broadcast forces rebuild_matrix on
     // all 16 idle channels which spikes audio thread to ~94 ms.
     h.group.send_event(SynthEvent::Channel(

@@ -67,6 +67,10 @@ extern void          xshim_all_notes_off(XSynthHandle*);
 extern void          xshim_render(XSynthHandle*, float *out_interleaved, size_t num_samples);
 extern uint64_t      xshim_voice_count(const XSynthHandle*);
 extern void          xshim_set_layer_count(XSynthHandle*, uint32_t layers);
+extern void          xshim_set_polyphony_cap(XSynthHandle*, uint32_t cap);
+extern void          xshim_set_spawn_burst_limit(XSynthHandle*, uint32_t limit);
+extern uint32_t      xshim_take_noteon_count(XSynthHandle*);
+extern void          xshim_take_render_breakdown(XSynthHandle*, uint32_t *out4);
 extern size_t        xshim_last_error(char *out_buf, size_t out_len);
 extern int           xshim_load_sfz_async(XSynthHandle*, const char *path);
 extern int           xshim_load_status(const XSynthHandle*);
@@ -106,10 +110,12 @@ typedef struct {
     int instrument_count;
     int preset_count;
     int octave_transpose;
-    int voices;                    /* User-facing polyphony hint. xsynth's
-                                    * per-key parallelism caps voices via its
-                                    * channel config; we surface the param
-                                    * but the active cap may differ. */
+    int voices;                    /* Polyphony cap (one unit per note-on).
+                                    * Wired to xshim_set_polyphony_cap. */
+    int spawn_burst;               /* Max NoteOn events drained per render
+                                    * block. Caps voice-spawn cost during
+                                    * quantized chord bursts; surplus events
+                                    * defer to next block (~3 ms each). */
     float gain;
     instrument_entry_t instruments[MAX_INSTRUMENTS];
     preset_entry_t presets[MAX_PRESETS];
@@ -433,8 +439,14 @@ static void* v2_create_instance(const char *module_dir, const char *json_default
     strncpy(inst->module_dir, module_dir, sizeof(inst->module_dir) - 1);
     strcpy(inst->preset_name, "No preset");
     inst->gain = 1.0f;
-    inst->voices = 64;     /* nominal cap; xsynth's actual concurrency is
-                            * governed by channel config */
+    inst->voices = 14;     /* polyphony cap (note-groups). 14 polyphony
+                            * × WörliTzer's 5 voices/note ≈ 70 voices,
+                            * which is the safe ceiling at current
+                            * per-voice render cost. */
+    inst->spawn_burst = 3;  /* hidden — defaults to 3 NoteOn/block.
+                             * Quantized chord bursts spread spawn cost
+                             * across blocks; 3 keeps burst-block render
+                             * cost bounded. */
 
     inst->render_buf = calloc(MOVE_FRAMES_PER_BLOCK * 2, sizeof(float));
     if (!inst->render_buf) { free(inst); return NULL; }
@@ -494,10 +506,15 @@ static void* v2_create_instance(const char *module_dir, const char *json_default
         }
     }
 
-    /* Push the initial per-key polyphony cap to xsynth. xsynth defaults to
-     * Some(4) per key on channel construction; if our nominal cap differs,
-     * sync it so set_param("voices") and reality agree from frame 1. */
-    if (inst->synth) xshim_set_layer_count(inst->synth, (uint32_t)inst->voices);
+    /* Polyphony cap applies at the channel level, dropping oldest releasing
+     * groups when the user-set N polyphony budget is exceeded. We push the
+     * default (typically 64 → ~13 notes for a 5-layer WörliTzer, plenty for
+     * a Bass patch) so even tracks that never touch the knob get a bounded
+     * worst-case render time. */
+    if (inst->synth) {
+        xshim_set_polyphony_cap(inst->synth, (uint32_t)inst->voices);
+        xshim_set_spawn_burst_limit(inst->synth, (uint32_t)inst->spawn_burst);
+    }
 
     plugin_log("Instance created");
     return inst;
@@ -585,7 +602,17 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         if (v < 4)   v = 4;
         if (v > 128) v = 128;
         inst->voices = v;
-        if (inst->synth) xshim_set_layer_count(inst->synth, (uint32_t)v);
+        /* User-facing "Voices" knob = polyphony cap (one unit per note),
+         * not per-key layer cap. Multi-layer presets like WörliTzer spend
+         * 5 internal voices per polyphony unit; the cap is musically
+         * intuitive regardless. */
+        if (inst->synth) xshim_set_polyphony_cap(inst->synth, (uint32_t)v);
+    } else if (strcmp(key, "spawn_burst") == 0) {
+        int v = atoi(val);
+        if (v < 1)  v = 1;
+        if (v > 64) v = 64;
+        inst->spawn_burst = v;
+        if (inst->synth) xshim_set_spawn_burst_limit(inst->synth, (uint32_t)v);
     } else if (strcmp(key, "all_notes_off") == 0 || strcmp(key, "panic") == 0) {
         if (inst->synth) xshim_all_notes_off(inst->synth);
     } else if (strcmp(key, "state") == 0) {
@@ -619,7 +646,14 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             if (v < 4)   v = 4;
             if (v > 128) v = 128;
             inst->voices = v;
-            if (inst->synth) xshim_set_layer_count(inst->synth, (uint32_t)v);
+            if (inst->synth) xshim_set_polyphony_cap(inst->synth, (uint32_t)v);
+        }
+        if (json_get_number(val, "spawn_burst", &f) == 0) {
+            int v = (int)f;
+            if (v < 1)  v = 1;
+            if (v > 64) v = 64;
+            inst->spawn_burst = v;
+            if (inst->synth) xshim_set_spawn_burst_limit(inst->synth, (uint32_t)v);
         }
     }
 }
@@ -670,6 +704,8 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
         return snprintf(buf, buf_len, "%.2f", inst->gain);
     else if (strcmp(key, "voices") == 0)
         return snprintf(buf, buf_len, "%d", inst->voices);
+    else if (strcmp(key, "spawn_burst") == 0)
+        return snprintf(buf, buf_len, "%d", inst->spawn_burst);
     else if (strcmp(key, "chain_params") == 0) {
         /* Phase 1: no DS knobs. octave/gain/voices live in the params menu. */
         return snprintf(buf, buf_len,
@@ -680,8 +716,8 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
              "\"type\":\"int\",\"min\":-4,\"max\":4,\"default\":0},"
              "{\"key\":\"gain\",\"name\":\"Gain\","
              "\"type\":\"float\",\"min\":0,\"max\":2,\"default\":1.0,\"step\":0.02},"
-             "{\"key\":\"voices\",\"name\":\"Voices\","
-             "\"type\":\"int\",\"min\":4,\"max\":128,\"default\":64}]");
+             "{\"key\":\"voices\",\"name\":\"Polyphony\","
+             "\"type\":\"int\",\"min\":4,\"max\":128,\"default\":14}]");
     }
     else if (strcmp(key, "preset_list") == 0) {
         int written = snprintf(buf, buf_len, "[");
@@ -721,10 +757,10 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
         return snprintf(buf, buf_len,
             "{\"preset_name\":\"%s\",\"instrument_name\":\"%s\","
             "\"preset\":%d,\"octave_transpose\":%d,\"gain\":%.2f,"
-            "\"voices\":%d}",
+            "\"voices\":%d,\"spawn_burst\":%d}",
             inst->preset_name, inst->instrument_name,
             inst->current_preset, inst->octave_transpose, inst->gain,
-            inst->voices);
+            inst->voices, inst->spawn_burst);
     }
     else if (strcmp(key, "ui_hierarchy") == 0) {
         return snprintf(buf, buf_len,
@@ -737,7 +773,7 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
             "\"knobs\":[],\"params\":["
                 "{\"key\":\"octave_transpose\",\"label\":\"Octave\"},"
                 "{\"key\":\"gain\",\"label\":\"Gain\"},"
-                "{\"key\":\"voices\",\"label\":\"Voices\"},"
+                "{\"key\":\"voices\",\"label\":\"Polyphony\"},"
                 "{\"level\":\"jump\",\"label\":\"Jump To Library\"}"
             "]},"
             "\"jump\":{"
@@ -807,6 +843,12 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
         sched_setscheduler(0, SCHED_FIFO, &sp);
     }
 
+    /* Snapshot NoteOn count for THIS block before render. Splits perf log
+     * into spawn-heavy (sequence chord lands) vs sustain-heavy (voices ring
+     * under pedal) categories. */
+    uint32_t noteons_this_block = xshim_take_noteon_count(inst->synth);
+    uint64_t voices_before = xshim_voice_count(inst->synth);
+
     /* xsynth renders interleaved f32 stereo directly into render_buf. */
     struct timespec _t0, _t1;
     clock_gettime(CLOCK_MONOTONIC, &_t0);
@@ -815,20 +857,28 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
     long render_us = (_t1.tv_sec - _t0.tv_sec) * 1000000L +
                      (_t1.tv_nsec - _t0.tv_nsec) / 1000L;
 
-    /* Log perf when an attack burst just happened or the render is heavy. */
-    static long last_log_us = 0;
-    static int  log_throttle = 0;
-    if ((render_us > 800 || ++log_throttle >= 256)) {
+    /* Log perf when there was a spawn burst, render was heavy, or every
+     * 256 blocks for baseline. Breakdown: par = event drain + per-key
+     * render inside rayon. sum = serial mix of per-key bufs. fx = volume
+     * + pan + cutoff sweep. tot = total inside push_key_events_and_render
+     * (xsynth side). The (render - tot) gap is shim/render_to wrapping
+     * overhead. */
+    static int log_throttle = 0;
+    if (render_us > 800 || noteons_this_block > 0 || ++log_throttle >= 256) {
         log_throttle = 0;
-        uint64_t vc = xshim_voice_count(inst->synth);
-        char msg[128];
+        uint64_t voices_after = xshim_voice_count(inst->synth);
+        uint32_t bd[4] = {0};
+        xshim_take_render_breakdown(inst->synth, bd);
+        char msg[224];
         snprintf(msg, sizeof(msg),
-                 "perf: render=%ld us  voices=%llu",
-                 render_us, (unsigned long long)vc);
+                 "perf: render=%ld us  vb=%llu va=%llu noteon=%u  par=%u sum=%u fx=%u tot=%u",
+                 render_us,
+                 (unsigned long long)voices_before,
+                 (unsigned long long)voices_after,
+                 (unsigned)noteons_this_block,
+                 bd[0], bd[1], bd[2], bd[3]);
         plugin_log(msg);
-        last_log_us = render_us;
     }
-    (void)last_log_us;
 
     /* Convert interleaved f32 → int16 with gain and tanh soft-clip. */
     float g = inst->gain;

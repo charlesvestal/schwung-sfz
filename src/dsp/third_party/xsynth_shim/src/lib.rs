@@ -90,6 +90,12 @@ pub struct XSynthHandle {
     group: ChannelGroup,
     worker: Option<LoadWorker>,
     drop_sink: SoundfontDropSink,
+    /// MOVE: NoteOns since the last `xshim_take_noteon_count` call. Used by
+    /// the plugin's render-perf log to separate spawn-heavy blocks (chord
+    /// burst from a sequence) from sustain-heavy blocks (lots of voices
+    /// already ringing). Incremented in xshim_note_on, snapshot+reset by
+    /// xshim_take_noteon_count just before each render block.
+    noteon_count: AtomicU32,
 }
 
 /* Install once: panic hook that writes the panic message + a short backtrace
@@ -141,6 +147,7 @@ pub unsafe extern "C" fn xshim_create(sample_rate: u32, channels: u32) -> *mut X
             group,
             worker: None,
             drop_sink,
+            noteon_count: AtomicU32::new(0),
         }))
     }))
     .unwrap_or(ptr::null_mut())
@@ -223,11 +230,40 @@ pub unsafe extern "C" fn xshim_note_on(handle: *mut XSynthHandle, ch: u8, key: u
     if handle.is_null() { return; }
     let _ = catch_unwind(AssertUnwindSafe(|| {
         let h = &mut *handle;
+        h.noteon_count.fetch_add(1, Ordering::Relaxed);
         h.group.send_event(SynthEvent::Channel(
             ch as u32,
             ChannelEvent::Audio(ChannelAudioEvent::NoteOn { key, vel }),
         ));
     }));
+}
+
+/// MOVE: snapshot+reset NoteOn count since the prior call. Plugin calls
+/// this right before xshim_render so the rendered block can be classified
+/// as spawn-heavy vs sustain-heavy in the perf log.
+#[no_mangle]
+pub unsafe extern "C" fn xshim_take_noteon_count(handle: *mut XSynthHandle) -> u32 {
+    if handle.is_null() { return 0; }
+    let h = &mut *handle;
+    h.noteon_count.swap(0, Ordering::Relaxed)
+}
+
+/// MOVE: read the most recent block's per-section render breakdown.
+/// `out` must point to 4 u32 slots: [parallel_us, sum_us, fx_us, total_us].
+/// `parallel_us` covers event drain + per-key render inside the rayon
+/// pool. `sum_us` is the serial mix of per-key audio_cache into out.
+/// `fx_us` is apply_channel_effects (volume/pan/cutoff sweep). `total_us`
+/// is wall time inside push_key_events_and_render. Globally-static —
+/// reflects the last channel-render that completed (one active SFZ
+/// channel per instance, so unambiguous in practice).
+#[no_mangle]
+pub unsafe extern "C" fn xshim_take_render_breakdown(_handle: *mut XSynthHandle, out: *mut u32) {
+    if out.is_null() { return; }
+    let slot = std::slice::from_raw_parts_mut(out, 4);
+    slot[0] = xsynth_core::channel::LAST_PARALLEL_US.load(Ordering::Relaxed);
+    slot[1] = xsynth_core::channel::LAST_SUM_US.load(Ordering::Relaxed);
+    slot[2] = xsynth_core::channel::LAST_FX_US.load(Ordering::Relaxed);
+    slot[3] = xsynth_core::channel::LAST_TOTAL_US.load(Ordering::Relaxed);
 }
 
 #[no_mangle]
@@ -483,6 +519,42 @@ pub unsafe extern "C" fn xshim_set_layer_count(handle: *mut XSynthHandle, layers
         let opt = if layers == 0 { None } else { Some(layers as usize) };
         h.group.send_event(SynthEvent::AllChannels(ChannelEvent::Config(
             ChannelConfigEvent::SetLayerCount(opt),
+        )));
+    }));
+}
+
+/// MOVE: polyphony cap. One unit = one note-on event, regardless of how
+/// many voices the preset spawns per note (WörliTzer = 5 voices/note;
+/// Bass = 1 voice/note). When the cap is exceeded, xsynth drops the
+/// oldest releasing note-group whole — release tails were fading anyway,
+/// so audible impact is "longer tails clip a beat early" rather than
+/// dropped audio frames. Pass 0 for "unlimited".
+#[no_mangle]
+pub unsafe extern "C" fn xshim_set_polyphony_cap(handle: *mut XSynthHandle, cap: u32) {
+    if handle.is_null() { return; }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        let opt = if cap == 0 { None } else { Some(cap as usize) };
+        h.group.send_event(SynthEvent::AllChannels(ChannelEvent::Config(
+            ChannelConfigEvent::SetPolyphonyCap(opt),
+        )));
+    }));
+}
+
+/// MOVE: spawn burst limit. Max NoteOn events drained per render block;
+/// surplus events defer to subsequent blocks. Quantized chord bursts
+/// (e.g. sequence step lands 10 notes at once) overwhelm a single
+/// render block with spawn cost. Spreading them across 2-3 blocks adds
+/// 3-9 ms of intra-chord latency, below human perception. Pass 0 for
+/// "unlimited" (legacy behavior).
+#[no_mangle]
+pub unsafe extern "C" fn xshim_set_spawn_burst_limit(handle: *mut XSynthHandle, limit: u32) {
+    if handle.is_null() { return; }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        let opt = if limit == 0 { None } else { Some(limit as usize) };
+        h.group.send_event(SynthEvent::AllChannels(ChannelEvent::Config(
+            ChannelConfigEvent::SetSpawnBurstLimit(opt),
         )));
     }));
 }

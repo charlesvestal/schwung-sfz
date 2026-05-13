@@ -369,8 +369,23 @@ static int load_sfz_file(xsynth_instance_t *inst, const char *path) {
     const char *load_path = path;
     char *converted = NULL;
     if (ext && strcasecmp(ext, ".dspreset") == 0) {
-        /* TEMPORARILY skip knob enumeration to isolate the freeze. */
-        converted = convert_dspreset_to_xsynth_sfz(path, NULL, NULL);
+        /* Enumerate DS knobs at convert time so the plugin can surface them
+         * as Move params. Defaults seed `knob_current[]` so the encoder row
+         * shows the dspreset's authored start position. */
+        converted = convert_dspreset_to_xsynth_sfz(path,
+                                                    inst->knobs,
+                                                    &inst->knob_count);
+        for (int i = 0; i < inst->knob_count; i++) {
+            inst->knob_current[i] = inst->knobs[i].default_value;
+        }
+        snprintf(msg, sizeof(msg), "Knobs enumerated: %d", inst->knob_count);
+        plugin_log(msg);
+        for (int i = 0; i < inst->knob_count && i < 4; i++) {
+            ds_knob_t *k = &inst->knobs[i];
+            snprintf(msg, sizeof(msg), "  knob[%d] key=%s label='%s' range=[%g,%g] cc=%d",
+                     i, k->key, k->label, k->min_value, k->max_value, k->cc_number);
+            plugin_log(msg);
+        }
         if (!converted) {
             plugin_log("DS converter returned NULL");
             snprintf(inst->load_error, sizeof(inst->load_error),
@@ -624,24 +639,22 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         inst->spawn_burst = v;
         if (inst->synth) xshim_set_spawn_burst_limit(inst->synth, (uint32_t)v);
     } else if (strncmp(key, "knob_", 5) == 0) {
-        /* knob_N — DS UI knob. Update current logical position + send
-         * the assigned CC to the synth. Live response is opcode-dependent
-         * (ampeg_* are responsive via the ARIA baker today; the rest just
-         * track state and take effect on next preset reload). */
+        /* knob_N — DS UI knob. Shell sends a normalized 0..1 fraction
+         * (chain_params declares min=0,max=1,step=0.02 for every slot,
+         * matching the OLD sfizz plugin's working pattern). Map back to
+         * the DS author's [min,max] range, store as the canonical value,
+         * forward to xsynth as a 0..127 CC. Live response is
+         * opcode-dependent (ampeg_* responsive; others take effect on
+         * next preset reload). */
         const char *tail = key + 5;
         if (tail[0] && (tail[0] >= '0' && tail[0] <= '9')) {
             int idx = atoi(tail);
             if (idx >= 0 && idx < inst->knob_count) {
-                double v = atof(val);
-                ds_knob_t *k = &inst->knobs[idx];
-                /* Clamp to declared range. */
-                if (v < k->min_value) v = k->min_value;
-                if (v > k->max_value) v = k->max_value;
-                inst->knob_current[idx] = v;
-                double t = 0.0;
-                if (k->max_value != k->min_value)
-                    t = (v - k->min_value) / (k->max_value - k->min_value);
+                double t = atof(val);
                 if (t < 0.0) t = 0.0; if (t > 1.0) t = 1.0;
+                ds_knob_t *k = &inst->knobs[idx];
+                inst->knob_current[idx] = k->min_value +
+                                          t * (k->max_value - k->min_value);
                 int cc_val = (int)(t * 127.0 + 0.5);
                 if (cc_val < 0) cc_val = 0; if (cc_val > 127) cc_val = 127;
                 if (inst->synth) xshim_cc(inst->synth, 0,
@@ -689,6 +702,24 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             if (v > 64) v = 64;
             inst->spawn_burst = v;
             if (inst->synth) xshim_set_spawn_burst_limit(inst->synth, (uint32_t)v);
+        }
+        /* Knob restore — happens after preset reload above so inst->knobs[]
+         * is populated for the new preset. Saved values are 0..1 fractions. */
+        for (int i = 0; i < inst->knob_count; i++) {
+            char k[16];
+            snprintf(k, sizeof(k), "knob_%d", i);
+            if (json_get_number(val, k, &f) == 0) {
+                double t = f;
+                if (t < 0.0) t = 0.0; if (t > 1.0) t = 1.0;
+                ds_knob_t *kn = &inst->knobs[i];
+                inst->knob_current[i] = kn->min_value +
+                                        t * (kn->max_value - kn->min_value);
+                int cc_val = (int)(t * 127.0 + 0.5);
+                if (cc_val < 0) cc_val = 0; if (cc_val > 127) cc_val = 127;
+                if (inst->synth) xshim_cc(inst->synth, 0,
+                                          (uint8_t)kn->cc_number,
+                                          (uint8_t)cc_val);
+            }
         }
     }
 }
@@ -742,19 +773,31 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
     else if (strcmp(key, "spawn_burst") == 0)
         return snprintf(buf, buf_len, "%d", inst->spawn_burst);
     else if (strncmp(key, "knob_", 5) == 0) {
+        /* Return current position as 0..1 fraction (matches set_param's
+         * input space). Unused slots and stale indices report 0. */
         int idx = atoi(key + 5);
-        if (idx >= 0 && idx < inst->knob_count)
-            return snprintf(buf, buf_len, "%g", inst->knob_current[idx]);
+        if (idx >= 0 && idx < inst->knob_count) {
+            ds_knob_t *k = &inst->knobs[idx];
+            double t = (k->max_value != k->min_value)
+                ? (inst->knob_current[idx] - k->min_value) /
+                  (k->max_value - k->min_value)
+                : 0.0;
+            if (t < 0.0) t = 0.0; if (t > 1.0) t = 1.0;
+            return snprintf(buf, buf_len, "%g", t);
+        }
         return snprintf(buf, buf_len, "0");
     }
     else if (strcmp(key, "chain_params") == 0) {
-        /* Knob entries kept OUT of chain_params — the dynamic JSON path
-         * reliably triggers a Move-side freeze even though our buffer
-         * arithmetic is safe. Something about declaring many params at
-         * runtime trips up the host. Knobs are still enumerated for
-         * state save/restore and could be surfaced via a different
-         * mechanism later. */
-        return snprintf(buf, buf_len,
+        /* FIXED SHAPE — always 4 built-ins + 8 knob slots, unused slots
+         * padded with `name:"—"` placeholders. The OLD sfizz plugin proved
+         * this is the only shape that doesn't freeze the Move shell: the
+         * JS knob-context cache (shadow_ui.js:7935) keys by slot index,
+         * so a shrinking array between preset switches leaves stale
+         * bindings that loop on render. Stable count, only labels and
+         * defaults vary per preset. Every knob uses normalized 0..1 with
+         * step=0.02; set_param maps back to the DS author's range. */
+        int written = 0;
+        written += snprintf(buf + written, buf_len - written,
             "[{\"key\":\"preset\",\"name\":\"Instrument\","
              "\"type\":\"int\",\"min\":0,\"max_param\":\"preset_count\","
              "\"default\":0},"
@@ -763,7 +806,30 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
              "{\"key\":\"gain\",\"name\":\"Gain\","
              "\"type\":\"float\",\"min\":0,\"max\":2,\"default\":1.0,\"step\":0.02},"
              "{\"key\":\"voices\",\"name\":\"Polyphony\","
-             "\"type\":\"int\",\"min\":4,\"max\":128,\"default\":14}]");
+             "\"type\":\"int\",\"min\":4,\"max\":128,\"default\":14}");
+        for (int i = 0; i < 8; i++) {
+            if (i < inst->knob_count) {
+                ds_knob_t *k = &inst->knobs[i];
+                double t = (k->max_value != k->min_value)
+                    ? (inst->knob_current[i] - k->min_value) /
+                      (k->max_value - k->min_value)
+                    : 0.0;
+                if (t < 0.0) t = 0.0; if (t > 1.0) t = 1.0;
+                written += snprintf(buf + written, buf_len - written,
+                    ",{\"key\":\"%s\",\"name\":\"%s\","
+                    "\"type\":\"float\",\"min\":0,\"max\":1,"
+                    "\"default\":%g,\"step\":0.02,\"unit\":\"%%\"}",
+                    k->key, k->label, t);
+            } else {
+                written += snprintf(buf + written, buf_len - written,
+                    ",{\"key\":\"knob_%d\",\"name\":\"—\","
+                    "\"type\":\"float\",\"min\":0,\"max\":1,"
+                    "\"default\":0,\"step\":0.02}",
+                    i);
+            }
+        }
+        written += snprintf(buf + written, buf_len - written, "]");
+        return written;
     }
     else if (strcmp(key, "preset_list") == 0) {
         int written = snprintf(buf, buf_len, "[");
@@ -800,27 +866,63 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
         return written;
     }
     else if (strcmp(key, "state") == 0) {
-        return snprintf(buf, buf_len,
+        /* Knob positions saved as normalized 0..1 fractions so they
+         * restore cleanly even if a future build changes a knob's
+         * underlying DS range. */
+        int written = snprintf(buf, buf_len,
             "{\"preset_name\":\"%s\",\"instrument_name\":\"%s\","
             "\"preset\":%d,\"octave_transpose\":%d,\"gain\":%.2f,"
-            "\"voices\":%d,\"spawn_burst\":%d}",
+            "\"voices\":%d,\"spawn_burst\":%d",
             inst->preset_name, inst->instrument_name,
             inst->current_preset, inst->octave_transpose, inst->gain,
             inst->voices, inst->spawn_burst);
+        for (int i = 0; i < inst->knob_count && written < buf_len - 32; i++) {
+            ds_knob_t *k = &inst->knobs[i];
+            double t = (k->max_value != k->min_value)
+                ? (inst->knob_current[i] - k->min_value) /
+                  (k->max_value - k->min_value)
+                : 0.0;
+            if (t < 0.0) t = 0.0; if (t > 1.0) t = 1.0;
+            written += snprintf(buf + written, buf_len - written,
+                                ",\"knob_%d\":%g", i, t);
+        }
+        written += snprintf(buf + written, buf_len - written, "}");
+        return written;
     }
     else if (strcmp(key, "ui_hierarchy") == 0) {
-        return snprintf(buf, buf_len,
+        /* Encoder row: 8 fixed knob slots (knob_0..knob_7) — matches the
+         * OLD sfizz plugin. Octave/gain/voices live in the params menu so
+         * they don't fight the DS knobs for encoder real estate. Per-knob
+         * entries with declared min/max are appended to params so the menu
+         * shows author-meaningful ranges (labels override the chain_params
+         * 0..1 normalized space at render time). */
+        int written = 0;
+        written += snprintf(buf + written, buf_len - written,
             "{\"modes\":null,\"levels\":{\"root\":{"
             "\"label\":\"SFZ\","
             "\"list_param\":\"preset\","
             "\"count_param\":\"preset_count\","
             "\"name_param\":\"preset_name\","
             "\"children\":null,"
-            "\"knobs\":[],\"params\":["
+            "\"knobs\":[");
+        for (int i = 0; i < 8; i++) {
+            written += snprintf(buf + written, buf_len - written,
+                                "%s\"knob_%d\"", (i ? "," : ""), i);
+        }
+        written += snprintf(buf + written, buf_len - written,
+            "],\"params\":["
                 "{\"key\":\"octave_transpose\",\"label\":\"Octave\"},"
                 "{\"key\":\"gain\",\"label\":\"Gain\"},"
-                "{\"key\":\"voices\",\"label\":\"Polyphony\"},"
-                "{\"level\":\"jump\",\"label\":\"Jump To Library\"}"
+                "{\"key\":\"voices\",\"label\":\"Polyphony\"}");
+        for (int i = 0; i < inst->knob_count; i++) {
+            ds_knob_t *k = &inst->knobs[i];
+            written += snprintf(buf + written, buf_len - written,
+                ",{\"key\":\"%s\",\"label\":\"%s\","
+                "\"min\":%g,\"max\":%g}",
+                k->key, k->label, k->min_value, k->max_value);
+        }
+        written += snprintf(buf + written, buf_len - written,
+            ",{\"level\":\"jump\",\"label\":\"Jump To Library\"}"
             "]},"
             "\"jump\":{"
                 "\"label\":\"Library\","
@@ -829,6 +931,7 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
                 "\"children\":null,"
                 "\"knobs\":[],\"params\":[]"
             "}}}");
+        return written;
     }
 
     return -1;

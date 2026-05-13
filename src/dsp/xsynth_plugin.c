@@ -66,6 +66,7 @@ extern void          xshim_pitch_bend(XSynthHandle*, uint8_t ch, float value);
 extern void          xshim_all_notes_off(XSynthHandle*);
 extern void          xshim_render(XSynthHandle*, float *out_interleaved, size_t num_samples);
 extern uint64_t      xshim_voice_count(const XSynthHandle*);
+extern void          xshim_set_layer_count(XSynthHandle*, uint32_t layers);
 extern size_t        xshim_last_error(char *out_buf, size_t out_len);
 extern int           xshim_load_sfz_async(XSynthHandle*, const char *path);
 extern int           xshim_load_status(const XSynthHandle*);
@@ -493,6 +494,11 @@ static void* v2_create_instance(const char *module_dir, const char *json_default
         }
     }
 
+    /* Push the initial per-key polyphony cap to xsynth. xsynth defaults to
+     * Some(4) per key on channel construction; if our nominal cap differs,
+     * sync it so set_param("voices") and reality agree from frame 1. */
+    if (inst->synth) xshim_set_layer_count(inst->synth, (uint32_t)inst->voices);
+
     plugin_log("Instance created");
     return inst;
 }
@@ -579,8 +585,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         if (v < 4)   v = 4;
         if (v > 128) v = 128;
         inst->voices = v;
-        /* TODO Phase 4: hot-reconfigure xsynth channel polyphony. For now
-         * the value is captured but takes effect on the next preset load. */
+        if (inst->synth) xshim_set_layer_count(inst->synth, (uint32_t)v);
     } else if (strcmp(key, "all_notes_off") == 0 || strcmp(key, "panic") == 0) {
         if (inst->synth) xshim_all_notes_off(inst->synth);
     } else if (strcmp(key, "state") == 0) {
@@ -614,6 +619,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             if (v < 4)   v = 4;
             if (v > 128) v = 128;
             inst->voices = v;
+            if (inst->synth) xshim_set_layer_count(inst->synth, (uint32_t)v);
         }
     }
 }

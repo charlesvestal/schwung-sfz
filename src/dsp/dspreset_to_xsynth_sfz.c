@@ -301,32 +301,45 @@ static void apply_ui_overrides(const char *src,
                             strcmp(param, "TAG_VOLUME") == 0) &&
                            strcmp(level, "group") == 0 &&
                            position >= 0 && position < DS_MAX_GROUPS) {
-                    /* Static bake (unchanged from before Phase 3): the
-                     * knob's CURRENT-position dB feeds group_amp_db so
-                     * the SFZ `volume=` opcode reflects what the user
-                     * sees. Step 6 will switch this to the silent
-                     * endpoint once the voice generator consumes the
-                     * volume_oncc delta. For now both lines are emitted
-                     * so the data flow exists end-to-end even though
-                     * the SIMD generator isn't reading it yet. */
-                    group_amp_db[position] = lin_to_db(atof(effective));
-
-                    /* Also record the knob → group volume_oncc binding
-                     * for emission later. Delta = dB at knob_max minus
-                     * dB at knob_min (full sweep range). */
                     if (knob_cc >= 0 &&
                         oncc_count_io && *oncc_count_io < DS_MAX_GROUP_ONCC) {
+                        /* Phase 3 step 6: silent-endpoint baseline for
+                         * live volume_oncc. The static `volume=` reflects
+                         * the voice amp at cc=0 (knob at min position);
+                         * the matching `volume_oncc<CC>=<delta>` brings
+                         * it up to db_max at cc=127. At load the plugin
+                         * sends CC = round(current_knob/range * 127) so
+                         * the voice's amp at load equals
+                         * `db_to_amp(db_min + delta * cc/127)`, which
+                         * with the SIMD generator's render-time sampling
+                         * makes knob movement audible without preset
+                         * reload.
+                         *
+                         * Curve trade-off: SFZ `volume_oncc` scales
+                         * linearly in dB; WörliTzer-style knobs use a
+                         * linear-amp translation. The dB-linear path
+                         * gives a steeper taper than authored (50% knob
+                         * sounds much quieter than expected). Accepted
+                         * trade-off until xsynth supports SFZ `_curvecc`
+                         * lookup tables. */
                         double v_at_min = apply_binding_xform(bind_tag, knob_min,
                                                               knob_max, knob_min);
                         double v_at_max = apply_binding_xform(bind_tag, knob_min,
                                                               knob_max, knob_max);
                         double db_min = lin_to_db(v_at_min);
                         double db_max = lin_to_db(v_at_max);
+                        group_amp_db[position] = db_min;
                         ds_group_oncc_t *e = &oncc_out[*oncc_count_io];
                         e->group_position = position;
                         e->cc_number      = knob_cc;
                         e->db_delta       = db_max - db_min;
                         (*oncc_count_io)++;
+                    } else {
+                        /* No live consumer (knob_idx misaligned or no
+                         * synthetic CC assigned) — fall back to the
+                         * static-at-current-knob baseline so the voice
+                         * isn't silenced. */
+                        group_amp_db[position] = lin_to_db(atof(effective));
                     }
                 } else if (position >= 0 && position < fx_count) {
                     ds_effect_t *f = &fx[position];

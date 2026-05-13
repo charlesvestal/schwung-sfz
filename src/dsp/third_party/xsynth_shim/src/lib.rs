@@ -470,3 +470,19 @@ pub unsafe extern "C" fn xshim_voice_count(handle: *const XSynthHandle) -> u64 {
     let h = &*handle;
     h.group.voice_count()
 }
+
+/// MOVE: per-key polyphony cap. xsynth doesn't have a global voice cap —
+/// `layers` is the per-key voice count limit. A DS preset with multiple
+/// velocity/mic/round-robin layers can spawn many voices per note-on; this
+/// caps how many stack on a single keypress. Pass 0 for "unlimited".
+#[no_mangle]
+pub unsafe extern "C" fn xshim_set_layer_count(handle: *mut XSynthHandle, layers: u32) {
+    if handle.is_null() { return; }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        let opt = if layers == 0 { None } else { Some(layers as usize) };
+        h.group.send_event(SynthEvent::AllChannels(ChannelEvent::Config(
+            ChannelConfigEvent::SetLayerCount(opt),
+        )));
+    }));
+}

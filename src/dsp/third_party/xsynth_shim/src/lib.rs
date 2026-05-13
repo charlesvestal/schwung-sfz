@@ -4,7 +4,6 @@
 // crate pulls cpal + alsa via xsynth-realtime, which we don't use, so we wrap
 // xsynth-core directly here and avoid the audio-backend dep chain.
 
-use std::cell::RefCell;
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -41,19 +40,28 @@ fn available_memory_mb() -> u64 {
     0
 }
 
-/// MOVE: refuse a load if free RAM is below this threshold. Picked so that
-/// a typical "heavy DS library" (Clean Fender ~600 MB decoded, WörliTzer
-/// ~950 MB) has a chance to allocate without tipping the whole device into
-/// OOM-abort. The plugin surfaces this as a load_error string and the user
-/// can choose a smaller patch.
-const MIN_FREE_MB_FOR_LOAD: u64 = 350;
+/// MOVE: refuse a load if free RAM is below this threshold. The earlier
+/// 350 MB threshold was too aggressive: once a single heavy patch is
+/// resident, MemAvailable drops below 350 MB and EVERY subsequent load
+/// (including switching from heavy to lighter) gets refused — even though
+/// the drop_sink + worker drain would free enough memory in practice.
+/// 80 MB is just enough margin for the alloc path itself to make progress
+/// past the worst-case fragmentation; below this we'd genuinely OOM-abort.
+const MIN_FREE_MB_FOR_LOAD: u64 = 80;
 
-thread_local! {
-    static LAST_ERROR: RefCell<String> = const { RefCell::new(String::new()) };
+/// MOVE: process-global last-error. Was thread_local — that prevented the
+/// audio thread (caller of xshim_last_error) from ever seeing errors that
+/// the load WORKER thread had set. Use a shared Mutex<String> instead so
+/// errors propagate across the worker→audio boundary.
+fn last_error_slot() -> &'static Mutex<String> {
+    static L: OnceLock<Mutex<String>> = OnceLock::new();
+    L.get_or_init(|| Mutex::new(String::new()))
 }
 
 fn set_last_error<S: Into<String>>(msg: S) {
-    LAST_ERROR.with(|cell| *cell.borrow_mut() = msg.into());
+    if let Ok(mut s) = last_error_slot().lock() {
+        *s = msg.into();
+    }
 }
 
 use xsynth_core::{
@@ -282,14 +290,15 @@ pub unsafe extern "C" fn xshim_render(handle: *mut XSynthHandle, out: *mut f32, 
 #[no_mangle]
 pub unsafe extern "C" fn xshim_last_error(out_buf: *mut c_char, out_len: usize) -> usize {
     if out_buf.is_null() || out_len == 0 { return 0; }
-    LAST_ERROR.with(|cell| {
-        let msg = cell.borrow();
-        let bytes = msg.as_bytes();
-        let n = bytes.len().min(out_len - 1);
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf as *mut u8, n);
-        *out_buf.add(n) = 0;
-        n
-    })
+    let msg = match last_error_slot().lock() {
+        Ok(s) => s.clone(),
+        Err(_) => String::new(),
+    };
+    let bytes = msg.as_bytes();
+    let n = bytes.len().min(out_len - 1);
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf as *mut u8, n);
+    *out_buf.add(n) = 0;
+    n
 }
 
 /// Send SetSoundfonts(empty) so the OLD soundfont gets pushed to drop_sink.

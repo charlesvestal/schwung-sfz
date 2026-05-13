@@ -126,6 +126,13 @@ typedef struct {
     int debounce_remaining;
     int pending_load;
     int suppress_next_preset_set;
+    /* Per-preset DS knobs (populated by the converter). Each knob is
+     * surfaced as a Move param (`knob_0`..`knob_15`); moving it sends
+     * the assigned CC via `xshim_cc`. Live response only when the knob's
+     * bindings hit xsynth-recognized targets (currently ampeg_*). */
+    ds_knob_t knobs[DS_MAX_KNOBS];
+    int knob_count;
+    double knob_current[DS_MAX_KNOBS]; /* current logical value in [min,max] */
     float *render_buf;             /* interleaved L/R/L/R..., 2 * frames */
 } xsynth_instance_t;
 
@@ -355,12 +362,15 @@ static int load_sfz_file(xsynth_instance_t *inst, const char *path) {
         return -1;
     }
 
+    inst->knob_count = 0;
+
     /* .dspreset → convert to .converted.sfz next to source, load that. */
     const char *ext = strrchr(path, '.');
     const char *load_path = path;
     char *converted = NULL;
     if (ext && strcasecmp(ext, ".dspreset") == 0) {
-        converted = convert_dspreset_to_xsynth_sfz(path);
+        /* TEMPORARILY skip knob enumeration to isolate the freeze. */
+        converted = convert_dspreset_to_xsynth_sfz(path, NULL, NULL);
         if (!converted) {
             plugin_log("DS converter returned NULL");
             snprintf(inst->load_error, sizeof(inst->load_error),
@@ -613,6 +623,31 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         if (v > 64) v = 64;
         inst->spawn_burst = v;
         if (inst->synth) xshim_set_spawn_burst_limit(inst->synth, (uint32_t)v);
+    } else if (strncmp(key, "knob_", 5) == 0) {
+        /* knob_N — DS UI knob. Update current logical position + send
+         * the assigned CC to the synth. Live response is opcode-dependent
+         * (ampeg_* are responsive via the ARIA baker today; the rest just
+         * track state and take effect on next preset reload). */
+        const char *tail = key + 5;
+        if (tail[0] && (tail[0] >= '0' && tail[0] <= '9')) {
+            int idx = atoi(tail);
+            if (idx >= 0 && idx < inst->knob_count) {
+                double v = atof(val);
+                ds_knob_t *k = &inst->knobs[idx];
+                /* Clamp to declared range. */
+                if (v < k->min_value) v = k->min_value;
+                if (v > k->max_value) v = k->max_value;
+                inst->knob_current[idx] = v;
+                double t = 0.0;
+                if (k->max_value != k->min_value)
+                    t = (v - k->min_value) / (k->max_value - k->min_value);
+                if (t < 0.0) t = 0.0; if (t > 1.0) t = 1.0;
+                int cc_val = (int)(t * 127.0 + 0.5);
+                if (cc_val < 0) cc_val = 0; if (cc_val > 127) cc_val = 127;
+                if (inst->synth) xshim_cc(inst->synth, 0,
+                                          (uint8_t)k->cc_number, (uint8_t)cc_val);
+            }
+        }
     } else if (strcmp(key, "all_notes_off") == 0 || strcmp(key, "panic") == 0) {
         if (inst->synth) xshim_all_notes_off(inst->synth);
     } else if (strcmp(key, "state") == 0) {
@@ -706,8 +741,19 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
         return snprintf(buf, buf_len, "%d", inst->voices);
     else if (strcmp(key, "spawn_burst") == 0)
         return snprintf(buf, buf_len, "%d", inst->spawn_burst);
+    else if (strncmp(key, "knob_", 5) == 0) {
+        int idx = atoi(key + 5);
+        if (idx >= 0 && idx < inst->knob_count)
+            return snprintf(buf, buf_len, "%g", inst->knob_current[idx]);
+        return snprintf(buf, buf_len, "0");
+    }
     else if (strcmp(key, "chain_params") == 0) {
-        /* Phase 1: no DS knobs. octave/gain/voices live in the params menu. */
+        /* Knob entries kept OUT of chain_params — the dynamic JSON path
+         * reliably triggers a Move-side freeze even though our buffer
+         * arithmetic is safe. Something about declaring many params at
+         * runtime trips up the host. Knobs are still enumerated for
+         * state save/restore and could be surfaced via a different
+         * mechanism later. */
         return snprintf(buf, buf_len,
             "[{\"key\":\"preset\",\"name\":\"Instrument\","
              "\"type\":\"int\",\"min\":0,\"max_param\":\"preset_count\","

@@ -1,17 +1,17 @@
 /*
  * DecentSampler `.dspreset` → xsynth-compatible SFZ converter.
  *
- * xsynth doesn't honor `_oncc` opcodes, mod LFOs, or routed effect buses, so
- * the converter resolves every UI-knob `value=` statically into the target
- * opcode at conversion time and skips effect block emission entirely.
+ * For knob handling: the converter both bakes each knob's default `value=`
+ * statically into the target opcode AND emits ARIA `_oncc<N>` opcodes for
+ * the subset xsynth honors (currently `ampeg_*`). Each knob is also
+ * exported as a `ds_knob_t` so the plugin can surface it as a Move param
+ * and send live CC changes via `xshim_cc` — knobs that only target
+ * ampeg-style opcodes respond live; other targets stay at their load-time
+ * defaults.
  *
- * Knobs that move filter cutoff, group amp, or ADSR all turn into fixed
- * opcodes baked into the SFZ. The user can still see and adjust them in the
- * params menu, but a change requires a preset reload to take effect.
- *
- * Returns a malloc'd path to a temp `.converted.sfz` file, or NULL on error.
- * Caller frees the path. The temp file is left on disk so xsynth can load it
- * normally; it's overwritten on the next preset switch.
+ * Returns a malloc'd path to a temp `.converted.sfz` file, or NULL on
+ * error. Caller frees the path. The temp file is left on disk so xsynth
+ * can load it normally; it's overwritten on the next preset switch.
  */
 #ifndef DSPRESET_TO_XSYNTH_SFZ_H
 #define DSPRESET_TO_XSYNTH_SFZ_H
@@ -20,7 +20,31 @@
 extern "C" {
 #endif
 
-char *convert_dspreset_to_xsynth_sfz(const char *path);
+#define DS_MAX_KNOBS 16
+
+/* One UI knob (`<labeled-knob>` or `<control>`) extracted from the
+ * dspreset and surfaced to the plugin. */
+typedef struct {
+    char  key[16];          /* "knob_0"..."knob_15" */
+    char  label[32];        /* DS `label=` (auto-derived if empty) */
+    double min_value;       /* DS `minValue=` (default 0) */
+    double max_value;       /* DS `maxValue=` (default 1) */
+    double default_value;   /* DS `value=` */
+    int   cc_number;        /* Synthetic MIDI CC (102..117) routed to xsynth */
+    int   live;             /* 1 if this knob's bindings can respond to live
+                             * CC (currently: ampeg_* targets only). 0 if it
+                             * only affects load-time defaults. */
+} ds_knob_t;
+
+/* Convert + populate knob metadata.
+ *
+ * On success, `out_knobs` is filled with `*out_knob_count` entries (at
+ * most DS_MAX_KNOBS). Pass NULL for `out_knobs` / `out_knob_count` to
+ * skip knob extraction.
+ */
+char *convert_dspreset_to_xsynth_sfz(const char *path,
+                                      ds_knob_t *out_knobs,
+                                      int *out_knob_count);
 
 #ifdef __cplusplus
 }

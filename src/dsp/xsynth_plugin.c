@@ -125,6 +125,12 @@ typedef struct {
     char load_error[256];
     int debounce_remaining;
     int pending_load;
+    int is_loading;                /* 1 from preset-switch request until the
+                                    * async load applies. Drives the
+                                    * "Loading... <name> <spinner>" prefix on
+                                    * preset_name so the browser shows
+                                    * activity during the 5-15s sample read
+                                    * window for heavy DS libraries. */
     int suppress_next_preset_set;
     /* Per-preset DS knobs (populated by the converter). Each knob is
      * surfaced as a Move param (`knob_0`..`knob_15`); moving it sends
@@ -430,6 +436,7 @@ static void set_preset_index(xsynth_instance_t *inst, int index) {
     xshim_all_notes_off(inst->synth);
     xshim_load_cancel(inst->synth);
     inst->pending_load = 1;
+    inst->is_loading = 1;
     inst->debounce_remaining = DEBOUNCE_BLOCKS;
 }
 
@@ -441,6 +448,7 @@ static void set_preset_index_immediate(xsynth_instance_t *inst, int index) {
     sync_preset_display(inst);
     xshim_all_notes_off(inst->synth);
     inst->pending_load = 0;
+    inst->is_loading = 1;
     inst->debounce_remaining = 0;
     do_load_preset(inst);
 }
@@ -737,6 +745,19 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
     else if (strcmp(key, "preset_count") == 0 || strcmp(key, "total_patches") == 0)
         return snprintf(buf, buf_len, "%d", inst->preset_count);
     else if (strcmp(key, "preset_name") == 0 || strcmp(key, "patch_name") == 0) {
+        /* During an async load (set_preset_index → apply), prepend a
+         * "Loading..." marker + a 4-frame spinner so the preset browser
+         * shows the device is still working through the 5-15s sample-read
+         * window heavy DS libraries need. ~10 Hz spinner driven off
+         * CLOCK_MONOTONIC — independent of UI poll rate. */
+        if (inst->is_loading) {
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            int frame = (int)(((ts.tv_sec * 10) + (ts.tv_nsec / 100000000L)) & 3);
+            static const char spin[4] = {'|', '/', '-', '\\'};
+            return snprintf(buf, buf_len, "Loading... %s %c",
+                            inst->preset_name, spin[frame]);
+        }
         strncpy(buf, inst->preset_name, buf_len - 1);
         buf[buf_len - 1] = '\0';
         return strlen(buf);
@@ -969,6 +990,7 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
         return;
     } else if (load_st == XSHIM_LOAD_READY) {
         xshim_load_apply(inst->synth);
+        inst->is_loading = 0;
         plugin_log("xsynth: async SFZ ready and applied");
     } else if (load_st == XSHIM_LOAD_ERROR) {
         char err[256] = {0};
@@ -976,8 +998,10 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
         snprintf(inst->load_error, sizeof(inst->load_error),
                  "xsynth load failed: %s", err[0] ? err : "unknown");
         xshim_load_clear_status(inst->synth);
+        inst->is_loading = 0;
     } else if (load_st == XSHIM_LOAD_CANCELLED) {
         xshim_load_clear_status(inst->synth);
+        inst->is_loading = 0;
     }
 
     /* MOVE FORK: SCHED_FIFO 50 disabled — when our render path spikes

@@ -433,7 +433,12 @@ char *convert_dspreset_to_xsynth_sfz(const char *path) {
     int lp_idx = -1, gain_idx = -1;
     for (int i = 0; i < fx_count; i++) {
         if (lp_idx < 0 && (strcmp(fx[i].type, "lowpass") == 0 ||
-                            strcmp(fx[i].type, "lowpass_4pl") == 0)) lp_idx = i;
+                            strcmp(fx[i].type, "lowpass_1pl") == 0 ||
+                            strcmp(fx[i].type, "lowpass_4pl") == 0 ||
+                            strcmp(fx[i].type, "highpass") == 0 ||
+                            strcmp(fx[i].type, "bandpass") == 0 ||
+                            strcmp(fx[i].type, "notch") == 0 ||
+                            strcmp(fx[i].type, "peak") == 0)) lp_idx = i;
         if (gain_idx < 0 && strcmp(fx[i].type, "gain") == 0) gain_idx = i;
     }
 
@@ -462,12 +467,18 @@ char *convert_dspreset_to_xsynth_sfz(const char *path) {
     pos += snprintf(sfz + pos, out_cap - pos, "<global>\n");
 
     /* Volume: wrapper attr + gain effect (both in dB). xsynth caps volume
-     * at +6 dB and clamps to -144 dB, so we add and pass through. */
+     * at +6 dB and clamps to -144 dB, so we add and pass through.
+     * xsynth's SFZ parser uses `parse_i16_in_range(-144..=6)` and rejects
+     * decimals — emit as integer. */
     double global_vol_db = 0.0;
     if (wrap_volume[0]) global_vol_db += atof(wrap_volume);
     if (gain_idx >= 0 && fx[gain_idx].level[0]) global_vol_db += atof(fx[gain_idx].level);
-    if (global_vol_db != 0.0)
-        pos += snprintf(sfz + pos, out_cap - pos, "volume=%.2f\n", global_vol_db);
+    if (global_vol_db != 0.0) {
+        if (global_vol_db < -144) global_vol_db = -144;
+        if (global_vol_db >  6.0) global_vol_db =  6.0;
+        int gvi = (int)(global_vol_db >= 0 ? global_vol_db + 0.5 : global_vol_db - 0.5);
+        pos += snprintf(sfz + pos, out_cap - pos, "volume=%d\n", gvi);
+    }
 
     /* ADSR: knob `value=` from apply_ui_overrides wins over wrapper attr —
      * the knob represents what the user "sees", and on xsynth there's no
@@ -496,12 +507,28 @@ char *convert_dspreset_to_xsynth_sfz(const char *path) {
         pos += snprintf(sfz + pos, out_cap - pos, "loop_mode=%s\n",
                         strcmp(wrap_loop, "true") == 0 ? "loop_continuous" : "no_loop");
 
-    /* Lowpass: bake the knob-resolved frequency + resonance. xsynth supports
-     * fil_type=lpf_1p/lpf_2p/lpf_4p/lpf_6p; we use lpf_2p as a generic
-     * (DS's `lowpass` is documented as a 2-pole) and lpf_4p for `lowpass_4pl`. */
+    /* Filter: map DS filter types to xsynth's SFZ parser variants.
+     * xsynth supports lpf_{1,2,4,6}p, hpf_{1,2,4,6}p, bpf_{1,2}p. DS
+     * has more types; we approximate where necessary:
+     *   lowpass        → lpf_2p   (DS docs: 2-pole)
+     *   lowpass_1pl    → lpf_1p
+     *   lowpass_4pl    → lpf_4p
+     *   highpass       → hpf_2p
+     *   bandpass       → bpf_2p
+     *   notch / peak   → bpf_2p   (closest xsynth has; not strictly
+     *                              correct but better than dropping
+     *                              the filter and letting the dry
+     *                              signal through unchanged) */
     if (lp_idx >= 0) {
-        const char *fil_type = strcmp(fx[lp_idx].type, "lowpass_4pl") == 0
-                                 ? "lpf_4p" : "lpf_2p";
+        const char *src_type = fx[lp_idx].type;
+        const char *fil_type = "lpf_2p";
+        if (strcmp(src_type, "lowpass_1pl") == 0) fil_type = "lpf_1p";
+        else if (strcmp(src_type, "lowpass_4pl") == 0) fil_type = "lpf_4p";
+        else if (strcmp(src_type, "highpass") == 0) fil_type = "hpf_2p";
+        else if (strcmp(src_type, "bandpass") == 0) fil_type = "bpf_2p";
+        else if (strcmp(src_type, "notch") == 0) fil_type = "bpf_2p";
+        else if (strcmp(src_type, "peak") == 0) fil_type = "bpf_2p";
+        /* default lpf_2p covers DS "lowpass" */
         const char *cutoff = fx[lp_idx].freq[0]      ? fx[lp_idx].freq      : "22000";
         const char *q      = fx[lp_idx].resonance[0] ? fx[lp_idx].resonance : "0.7";
         pos += snprintf(sfz + pos, out_cap - pos,

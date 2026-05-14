@@ -38,6 +38,10 @@ typedef struct {
                              * only affects load-time defaults. */
     int   tab_idx;          /* Phase 6.5: which <tab> the knob lives in
                              * (0 when the dspreset has no tabs). */
+    int   reverb_wet;       /* Phase 10: any binding targets
+                             * FX_REVERB_WET_LEVEL — the plugin routes
+                             * this knob's value to xshim_set_reverb_wet
+                             * instead of (or in addition to) the SFZ CC. */
 } ds_knob_t;
 
 /* Phase 6.5: tab metadata — one entry per `<tab>` element in the
@@ -45,6 +49,24 @@ typedef struct {
 typedef struct {
     char name[DS_MAX_TAB_NAME_LEN];  /* `<tab name="...">`; "main" if absent */
 } ds_tab_t;
+
+/* Phase 10: reverb config extracted from the dspreset's
+ * `<effect type="reverb">`. The plugin installs a fundsp reverb on
+ * load when `enabled` is set. */
+typedef struct {
+    int    enabled;
+    double wet_level;       /* 0..1 */
+    double room_size;       /* 0..1 → fundsp room_size in seconds (×30) */
+    double damping;         /* 0..1 → fundsp damp */
+} ds_reverb_cfg_t;
+
+/* Phase 9: delay config extracted from `<effect type="delay">`. */
+typedef struct {
+    int    enabled;
+    double delay_seconds;
+    double feedback;        /* 0..1 */
+    double mix;             /* 0..1 */
+} ds_delay_cfg_t;
 
 /* Convert + populate knob metadata.
  *
@@ -56,7 +78,9 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
                                       ds_knob_t *out_knobs,
                                       int *out_knob_count,
                                       ds_tab_t  *out_tabs,
-                                      int *out_tab_count);
+                                      int *out_tab_count,
+                                      ds_reverb_cfg_t *out_reverb,
+                                      ds_delay_cfg_t  *out_delay);
 
 #ifdef __cplusplus
 }

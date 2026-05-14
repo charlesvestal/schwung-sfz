@@ -225,6 +225,13 @@ typedef struct {
     char freq[32];
     char resonance[32];
     char level[32];
+    /* Phase 9/10: effect-specific attributes captured when present. */
+    char wet_level[32];
+    char room_size[32];
+    char damping[32];
+    char delay_time[32];
+    char feedback[32];
+    char mix[32];
 } ds_effect_t;
 
 static int parse_effects(const char *src, ds_effect_t fx[DS_MAX_FX]) {
@@ -250,6 +257,12 @@ static int parse_effects(const char *src, ds_effect_t fx[DS_MAX_FX]) {
         xml_get_attr(tag, "frequency", f->freq,      sizeof(f->freq));
         xml_get_attr(tag, "resonance", f->resonance, sizeof(f->resonance));
         xml_get_attr(tag, "level",     f->level,     sizeof(f->level));
+        xml_get_attr(tag, "wetLevel",  f->wet_level, sizeof(f->wet_level));
+        xml_get_attr(tag, "roomSize",  f->room_size, sizeof(f->room_size));
+        xml_get_attr(tag, "damping",   f->damping,   sizeof(f->damping));
+        xml_get_attr(tag, "delayTime", f->delay_time, sizeof(f->delay_time));
+        xml_get_attr(tag, "feedback",  f->feedback,   sizeof(f->feedback));
+        xml_get_attr(tag, "mix",       f->mix,        sizeof(f->mix));
 
         p = tag_end + 1;
         p = strstr(p, "<effect ");
@@ -810,7 +823,10 @@ static int binding_param_is_live(const char *parameter) {
            /* Phase 5: filter + pan live oncc. */
            strcmp(parameter, "FX_FILTER_FREQUENCY") == 0 ||
            strcmp(parameter, "FX_FILTER_RESONANCE") == 0 ||
-           strcmp(parameter, "PAN") == 0;
+           strcmp(parameter, "PAN") == 0 ||
+           /* Phase 10: reverb wet routes to the channel reverb via the
+            * plugin's set_param handler (not through xsynth). */
+           strcmp(parameter, "FX_REVERB_WET_LEVEL") == 0;
 }
 
 /* Walk every `<labeled-knob>` / `<control>` element in document order and
@@ -942,6 +958,7 @@ static int enumerate_ui_knobs(const char *src,
             else                bind_end = bind_start;
         }
         int any_live = 0;
+        int any_reverb_wet = 0;
         char first_param[64] = "";
         int first_position = -1;
         const char *bp = bind_start;
@@ -959,6 +976,7 @@ static int enumerate_ui_knobs(const char *src,
             xml_get_attr(btag, "parameter", param, sizeof(param));
             xml_get_attr(btag, "position",  pos_str, sizeof(pos_str));
             if (binding_param_is_live(param)) any_live = 1;
+            if (strcmp(param, "FX_REVERB_WET_LEVEL") == 0) any_reverb_wet = 1;
             if (first_param[0] == '\0' && param[0]) {
                 strncpy(first_param, param, sizeof(first_param) - 1);
                 first_param[sizeof(first_param) - 1] = '\0';
@@ -1000,7 +1018,10 @@ static int enumerate_ui_knobs(const char *src,
         k->max_value     = cmax[0] ? atof(cmax) : 1.0;
         k->default_value = cval[0] ? atof(cval) : k->min_value;
         k->cc_number     = next_cc++;
-        k->live          = any_live;
+        /* Knobs with any reverb-wet binding are surfaced as live —
+         * they route to the channel's reverb_wet at set_param time. */
+        k->live          = any_live || any_reverb_wet;
+        k->reverb_wet    = any_reverb_wet;
         k->tab_idx       = tab_index_at_position(src, p, tab_count);
         (void)tabs;
 
@@ -1016,9 +1037,13 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
                                       ds_knob_t *out_knobs,
                                       int *out_knob_count,
                                       ds_tab_t  *out_tabs,
-                                      int *out_tab_count) {
+                                      int *out_tab_count,
+                                      ds_reverb_cfg_t *out_reverb,
+                                      ds_delay_cfg_t  *out_delay) {
     if (out_knob_count) *out_knob_count = 0;
     if (out_tab_count)  *out_tab_count  = 0;
+    if (out_reverb)     { memset(out_reverb, 0, sizeof(*out_reverb)); }
+    if (out_delay)      { memset(out_delay,  0, sizeof(*out_delay));  }
     /* Base directory for sample-path resolution (the dspreset's parent). */
     char base_dir[1024];
     snprintf(base_dir, sizeof(base_dir), "%s", path);
@@ -1133,6 +1158,25 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
                        curves, &curves_count);
 
     int rr_total = count_rr_groups(src);
+
+    /* Phase 9/10: extract reverb + delay config from the dspreset's
+     * <effect> list so the plugin can install matching fundsp units. */
+    for (int i = 0; i < fx_count; i++) {
+        if (out_reverb && !out_reverb->enabled &&
+            strcmp(fx[i].type, "reverb") == 0) {
+            out_reverb->enabled = 1;
+            out_reverb->wet_level = fx[i].wet_level[0] ? atof(fx[i].wet_level) : 0.5;
+            out_reverb->room_size = fx[i].room_size[0] ? atof(fx[i].room_size) : 0.5;
+            out_reverb->damping   = fx[i].damping[0]   ? atof(fx[i].damping)   : 0.3;
+        }
+        if (out_delay && !out_delay->enabled &&
+            strcmp(fx[i].type, "delay") == 0) {
+            out_delay->enabled = 1;
+            out_delay->delay_seconds = fx[i].delay_time[0] ? atof(fx[i].delay_time) : 0.25;
+            out_delay->feedback      = fx[i].feedback[0]   ? atof(fx[i].feedback)   : 0.4;
+            out_delay->mix           = fx[i].mix[0]        ? atof(fx[i].mix)        : 0.5;
+        }
+    }
 
     int lp_idx = -1, gain_idx = -1;
     for (int i = 0; i < fx_count; i++) {

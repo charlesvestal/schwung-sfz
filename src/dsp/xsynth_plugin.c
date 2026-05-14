@@ -138,6 +138,11 @@ typedef struct {
      * bindings hit xsynth-recognized targets (currently ampeg_*). */
     ds_knob_t knobs[DS_MAX_KNOBS];
     int knob_count;
+    /* Phase 6.5: tab metadata + current tab index. The encoder row
+     * shows only knobs whose `tab_idx` matches `current_tab`. */
+    ds_tab_t tabs[DS_MAX_TABS];
+    int tab_count;
+    int current_tab;
     double knob_current[DS_MAX_KNOBS]; /* current logical value in [min,max] */
     float *render_buf;             /* interleaved L/R/L/R..., 2 * frames */
 } xsynth_instance_t;
@@ -378,9 +383,13 @@ static int load_sfz_file(xsynth_instance_t *inst, const char *path) {
         /* Enumerate DS knobs at convert time so the plugin can surface them
          * as Move params. Defaults seed `knob_current[]` so the encoder row
          * shows the dspreset's authored start position. */
+        inst->tab_count = 0;
+        inst->current_tab = 0;
         converted = convert_dspreset_to_xsynth_sfz(path,
                                                     inst->knobs,
-                                                    &inst->knob_count);
+                                                    &inst->knob_count,
+                                                    inst->tabs,
+                                                    &inst->tab_count);
         for (int i = 0; i < inst->knob_count; i++) {
             inst->knob_current[i] = inst->knobs[i].default_value;
         }
@@ -656,6 +665,15 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         if (v > 64) v = 64;
         inst->spawn_burst = v;
         if (inst->synth) xshim_set_spawn_burst_limit(inst->synth, (uint32_t)v);
+    } else if (strcmp(key, "knob_preset") == 0) {
+        /* Phase 6.5: select which DS <tab> the encoder row mirrors.
+         * Clamped to [0, tab_count - 1]. No xsynth interaction —
+         * change is purely a UI re-filter on the next chain_params
+         * read. */
+        int v = atoi(val);
+        if (v < 0) v = 0;
+        if (inst->tab_count > 0 && v >= inst->tab_count) v = inst->tab_count - 1;
+        inst->current_tab = v;
     } else if (strncmp(key, "knob_", 5) == 0) {
         /* knob_N — DS UI knob. Shell sends a normalized 0..1 fraction
          * (chain_params declares min=0,max=1,step=0.02 for every slot,
@@ -807,6 +825,8 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
         return snprintf(buf, buf_len, "%.2f", inst->gain);
     else if (strcmp(key, "voices") == 0)
         return snprintf(buf, buf_len, "%d", inst->voices);
+    else if (strcmp(key, "knob_preset") == 0)
+        return snprintf(buf, buf_len, "%d", inst->current_tab);
     else if (strcmp(key, "spawn_burst") == 0)
         return snprintf(buf, buf_len, "%d", inst->spawn_burst);
     else if (strncmp(key, "knob_", 5) == 0) {
@@ -834,6 +854,12 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
          * defaults vary per preset. Every knob uses normalized 0..1 with
          * step=0.02; set_param maps back to the DS author's range. */
         int written = 0;
+        /* Phase 6.5: knob_preset = tab dropdown. Always present so the
+         * encoder slot layout doesn't shrink between presets (which
+         * would break the host's per-slot JS knob-context cache).
+         * `max` clamps to tab_count - 1; presets with no tabs show a
+         * disabled-feeling [0..0] dropdown. */
+        int tab_max = (inst->tab_count > 1) ? (inst->tab_count - 1) : 0;
         written += snprintf(buf + written, buf_len - written,
             "[{\"key\":\"preset\",\"name\":\"Instrument\","
              "\"type\":\"int\",\"min\":0,\"max_param\":\"preset_count\","
@@ -843,27 +869,35 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
              "{\"key\":\"gain\",\"name\":\"Gain\","
              "\"type\":\"float\",\"min\":0,\"max\":2,\"default\":0.7,\"step\":0.02},"
              "{\"key\":\"voices\",\"name\":\"Polyphony\","
-             "\"type\":\"int\",\"min\":4,\"max\":128,\"default\":14}");
-        for (int i = 0; i < 8; i++) {
-            if (i < inst->knob_count) {
-                ds_knob_t *k = &inst->knobs[i];
-                double t = (k->max_value != k->min_value)
-                    ? (inst->knob_current[i] - k->min_value) /
-                      (k->max_value - k->min_value)
-                    : 0.0;
-                if (t < 0.0) t = 0.0; if (t > 1.0) t = 1.0;
-                written += snprintf(buf + written, buf_len - written,
-                    ",{\"key\":\"%s\",\"name\":\"%s\","
-                    "\"type\":\"float\",\"min\":0,\"max\":1,"
-                    "\"default\":%g,\"step\":0.02,\"unit\":\"%%\"}",
-                    k->key, k->label, t);
-            } else {
-                written += snprintf(buf + written, buf_len - written,
-                    ",{\"key\":\"knob_%d\",\"name\":\"—\","
-                    "\"type\":\"float\",\"min\":0,\"max\":1,"
-                    "\"default\":0,\"step\":0.02}",
-                    i);
-            }
+             "\"type\":\"int\",\"min\":4,\"max\":128,\"default\":14},"
+             "{\"key\":\"knob_preset\",\"name\":\"Knob Preset\","
+             "\"type\":\"int\",\"min\":0,\"max\":%d,\"default\":0}",
+             tab_max);
+        /* Walk all knobs in order, keeping only the ones whose tab_idx
+         * matches `current_tab`. Up to 8 fit in the encoder row; any
+         * remaining slots get the placeholder. */
+        int slot = 0;
+        for (int i = 0; i < inst->knob_count && slot < 8; i++) {
+            ds_knob_t *k = &inst->knobs[i];
+            if (inst->tab_count > 1 && k->tab_idx != inst->current_tab) continue;
+            double t = (k->max_value != k->min_value)
+                ? (inst->knob_current[i] - k->min_value) /
+                  (k->max_value - k->min_value)
+                : 0.0;
+            if (t < 0.0) t = 0.0; if (t > 1.0) t = 1.0;
+            written += snprintf(buf + written, buf_len - written,
+                ",{\"key\":\"%s\",\"name\":\"%s\","
+                "\"type\":\"float\",\"min\":0,\"max\":1,"
+                "\"default\":%g,\"step\":0.02,\"unit\":\"%%\"}",
+                k->key, k->label, t);
+            slot++;
+        }
+        for (; slot < 8; slot++) {
+            written += snprintf(buf + written, buf_len - written,
+                ",{\"key\":\"knob_%d_pad\",\"name\":\"—\","
+                "\"type\":\"float\",\"min\":0,\"max\":1,"
+                "\"default\":0,\"step\":0.02}",
+                slot);
         }
         written += snprintf(buf + written, buf_len - written, "]");
         return written;

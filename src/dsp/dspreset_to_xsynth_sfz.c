@@ -817,8 +817,74 @@ static int binding_param_is_live(const char *parameter) {
  * populate `knobs_out` with one entry per UI knob. Each knob is assigned
  * a synthetic CC number (102..117) so the plugin can route knob movement
  * to `xshim_cc`. Returns the populated knob count. */
+/* Phase 6.5: enumerate `<tab name="...">` elements in document order.
+ * Returns the count (0 when the dspreset has no <ui><tab>s). Tabs with
+ * no name attribute fall back to "Tab N". */
+static int enumerate_ui_tabs(const char *src, ds_tab_t tabs_out[DS_MAX_TABS]) {
+    int tc = 0;
+    const char *p = src;
+    while (tc < DS_MAX_TABS) {
+        const char *t = strstr(p, "<tab");
+        if (!t) break;
+        char nxt = t[4];
+        if (nxt != ' ' && nxt != '\t' && nxt != '\n' &&
+            nxt != '\r' && nxt != '>' && nxt != '/') {
+            p = t + 4; continue;
+        }
+        const char *te = strchr(t, '>');
+        if (!te) break;
+        char tag[512];
+        int tlen = (int)(te - t);
+        if (tlen > 511) tlen = 511;
+        memcpy(tag, t, tlen); tag[tlen] = '\0';
+        char name[DS_MAX_TAB_NAME_LEN];
+        xml_get_attr(tag, "name", name, sizeof(name));
+        if (!name[0]) snprintf(name, sizeof(name), "Tab %d", tc + 1);
+        snprintf(tabs_out[tc].name, sizeof(tabs_out[tc].name), "%s", name);
+        tc++;
+        p = te + 1;
+    }
+    return tc;
+}
+
+/* Phase 6.5: given a position in src and the tabs array, find which
+ * tab index encloses that position. Returns 0 when there are no tabs
+ * (or the position is outside any tab — also tab 0). */
+static int tab_index_at_position(const char *src, const char *pos,
+                                  int tab_count) {
+    if (tab_count <= 0) return 0;
+    int current = 0;
+    int seen = -1;
+    const char *p = src;
+    while (p < pos) {
+        const char *to = strstr(p, "<tab");
+        const char *tc = strstr(p, "</tab>");
+        const char *next = NULL;
+        if (to && tc) next = (to < tc) ? to : tc;
+        else if (to)  next = to;
+        else if (tc)  next = tc;
+        if (!next || next >= pos) break;
+        if (next == to) {
+            char nxt = to[4];
+            if (nxt == ' ' || nxt == '\t' || nxt == '\n' ||
+                nxt == '\r' || nxt == '>' || nxt == '/') {
+                seen++;
+                current = seen;
+            }
+            const char *e = strchr(to, '>');
+            p = e ? e + 1 : to + 4;
+        } else {
+            p = tc + 6;
+        }
+    }
+    if (current < 0) current = 0;
+    if (current >= tab_count) current = tab_count - 1;
+    return current;
+}
+
 static int enumerate_ui_knobs(const char *src,
-                              ds_knob_t knobs_out[DS_MAX_KNOBS]) {
+                              ds_knob_t knobs_out[DS_MAX_KNOBS],
+                              const ds_tab_t *tabs, int tab_count) {
     int kc = 0;
     int next_cc = 102;
     const char *p = src;
@@ -935,6 +1001,8 @@ static int enumerate_ui_knobs(const char *src,
         k->default_value = cval[0] ? atof(cval) : k->min_value;
         k->cc_number     = next_cc++;
         k->live          = any_live;
+        k->tab_idx       = tab_index_at_position(src, p, tab_count);
+        (void)tabs;
 
         kc++;
         p = self_closed ? tag_end + 1 : bind_end + 15; /* skip past closer */
@@ -946,8 +1014,11 @@ static int enumerate_ui_knobs(const char *src,
 
 char *convert_dspreset_to_xsynth_sfz(const char *path,
                                       ds_knob_t *out_knobs,
-                                      int *out_knob_count) {
+                                      int *out_knob_count,
+                                      ds_tab_t  *out_tabs,
+                                      int *out_tab_count) {
     if (out_knob_count) *out_knob_count = 0;
+    if (out_tab_count)  *out_tab_count  = 0;
     /* Base directory for sample-path resolution (the dspreset's parent). */
     char base_dir[1024];
     snprintf(base_dir, sizeof(base_dir), "%s", path);
@@ -1017,7 +1088,13 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
      * enumerate into a local buffer for use within this call. */
     ds_knob_t local_knobs[DS_MAX_KNOBS];
     ds_knob_t *use_knobs = out_knobs ? out_knobs : local_knobs;
-    int knob_count_local = enumerate_ui_knobs(src, use_knobs);
+    /* Phase 6.5: enumerate tabs first so each knob can record its tab_idx. */
+    ds_tab_t local_tabs[DS_MAX_TABS];
+    ds_tab_t *use_tabs = out_tabs ? out_tabs : local_tabs;
+    int tab_count_local = enumerate_ui_tabs(src, use_tabs);
+    if (out_tabs && out_tab_count) *out_tab_count = tab_count_local;
+    int knob_count_local = enumerate_ui_knobs(src, use_knobs,
+                                              use_tabs, tab_count_local);
     if (out_knobs && out_knob_count) {
         *out_knob_count = knob_count_local;
     }
@@ -1494,6 +1571,22 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
             if (val[0]) pos += snprintf(sfz + pos, out_cap - pos, "loop_start=%s\n", val);
             xml_get_attr(stag, "loopEnd", val, sizeof(val));
             if (val[0]) pos += snprintf(sfz + pos, out_cap - pos, "loop_end=%s\n", val);
+            /* Phase 8: loopCrossfade=<frames> in DS → loop_crossfade=
+             * <seconds> in SFZ. Assume 44.1 kHz source rate when
+             * converting frames to seconds — most DS sample libraries
+             * ship at 44.1k. The xsynth side multiplies seconds by the
+             * output rate to get the actual frame count, so any drift
+             * from a non-44.1k source is bounded to a few frames of
+             * crossfade. */
+            xml_get_attr(stag, "loopCrossfade", val, sizeof(val));
+            if (val[0]) {
+                double frames = atof(val);
+                if (frames > 0.0) {
+                    pos += snprintf(sfz + pos, out_cap - pos,
+                                    "loop_crossfade=%.4f\n",
+                                    frames / 44100.0);
+                }
+            }
 
             sample_scan = stag_end + 1;
         }

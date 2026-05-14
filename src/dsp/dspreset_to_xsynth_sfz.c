@@ -37,12 +37,45 @@
 /* One live `volume_oncc<N>=<dB>` binding the converter discovered.
  * Emitted by the main loop as an SFZ opcode inside the matching
  * group. The voice spawner reads it from RegionParams.volume_oncc;
- * a future SIMD generator will sample CC<N> at render time. */
+ * the SIMDVoiceOnccAmp generator samples CC<N> at render time.
+ *
+ * db_min and db_delta together define the binding: at cc=0 the voice
+ * amp contribution is db_min (silent endpoint), at cc=127 it's
+ * db_min + db_delta (full volume from this knob). The static SFZ
+ * `volume=` baseline gets db_min added; the emitted `volume_oncc=` is
+ * db_delta. When multiple bindings stack on one group and the sum of
+ * db_min would clamp below xsynth's SFZ `volume` floor (-144) or its
+ * spawner clamp (-96), all bindings on that group are scaled
+ * proportionally so the static lands exactly at the floor and the
+ * knob-at-max sum still reproduces the authored amp. */
 typedef struct {
     int    group_position;  /* DS group index (0-based, matches `position=`) */
     int    cc_number;       /* Knob's synthetic MIDI CC (102..117) */
     double db_delta;        /* dB at knob_max minus dB at knob_min */
+    double db_min;          /* dB at knob_min (silent endpoint, ≤ 0) */
 } ds_group_oncc_t;
+
+/* MOVE FORK / Phase 4: instrument-level AMP_VOLUME binding. Knob acts
+ * as master volume across the whole instrument. Emitted on the SFZ
+ * `<global>` block so every region picks it up. */
+typedef struct {
+    int    cc_number;
+    double db_delta;
+    double db_min;          /* silent-endpoint baseline (dB at knob_min) */
+} ds_global_oncc_t;
+
+/* MOVE FORK / Phase 4: tag-level AMP_VOLUME binding. Knob drives the
+ * volume of every group whose `tags="X"` attribute matches `tag`. The
+ * main emit loop resolves these to per-group volume_oncc opcodes by
+ * comparing the group's tags= against this list. */
+#define DS_MAX_TAG_NAME 32
+#define DS_MAX_TAG_ONCC (DS_MAX_KNOBS * 4)
+typedef struct {
+    char   tag[DS_MAX_TAG_NAME];
+    int    cc_number;
+    double db_delta;
+    double db_min;          /* silent-endpoint baseline */
+} ds_tag_oncc_t;
 
 /* --- helpers -------------------------------------------------------------- */
 
@@ -209,7 +242,10 @@ static void apply_ui_overrides(const char *src,
                                double group_amp_db[DS_MAX_GROUPS],
                                const ds_knob_t *knobs, int knob_count,
                                ds_group_oncc_t oncc_out[DS_MAX_GROUP_ONCC],
-                               int *oncc_count_io) {
+                               int *oncc_count_io,
+                               ds_global_oncc_t *global_oncc_out, int *global_oncc_count_io,
+                               double *global_amp_db_out,
+                               ds_tag_oncc_t *tag_oncc_out, int *tag_oncc_count_io) {
     int knob_idx = 0;
     const char *p = src;
     while (1) {
@@ -299,6 +335,57 @@ static void apply_ui_overrides(const char *src,
                     strncpy(env_release, effective, 31); env_release[31] = '\0';
                 } else if ((strcmp(param, "AMP_VOLUME") == 0 ||
                             strcmp(param, "TAG_VOLUME") == 0) &&
+                           strcmp(level, "instrument") == 0 &&
+                           knob_cc >= 0 &&
+                           global_oncc_out && global_oncc_count_io &&
+                           *global_oncc_count_io < DS_MAX_KNOBS) {
+                    /* Phase 4: instrument-level AMP_VOLUME knob = master
+                     * volume across all groups. Recorded for emission on
+                     * the SFZ `<global>` block. Silent-endpoint baseline
+                     * combines with whatever <groups volume="..."> the
+                     * dspreset has, then volume_oncc adds the sweep. */
+                    double v_at_min = apply_binding_xform(bind_tag, knob_min,
+                                                          knob_max, knob_min);
+                    double v_at_max = apply_binding_xform(bind_tag, knob_min,
+                                                          knob_max, knob_max);
+                    double db_min = lin_to_db(v_at_min);
+                    double db_max = lin_to_db(v_at_max);
+                    ds_global_oncc_t *e = &global_oncc_out[*global_oncc_count_io];
+                    e->cc_number = knob_cc;
+                    e->db_delta  = db_max - db_min;
+                    e->db_min    = db_min;
+                    (*global_oncc_count_io)++;
+                    if (global_amp_db_out) *global_amp_db_out += db_min;
+                } else if ((strcmp(param, "AMP_VOLUME") == 0 ||
+                            strcmp(param, "TAG_VOLUME") == 0) &&
+                           strcmp(level, "tag") == 0 &&
+                           knob_cc >= 0 &&
+                           tag_oncc_out && tag_oncc_count_io &&
+                           *tag_oncc_count_io < DS_MAX_TAG_ONCC) {
+                    /* Phase 4: tag-level AMP_VOLUME knob = volume bus for
+                     * every group with matching `tags=`. Stored with the
+                     * binding's `identifier` attribute; the main emit
+                     * loop resolves to per-group volume_oncc when it
+                     * walks groups and reads each group's tags=. */
+                    char tag_id[DS_MAX_TAG_NAME] = "";
+                    xml_get_attr(bind_tag, "identifier", tag_id, sizeof(tag_id));
+                    if (tag_id[0]) {
+                        double v_at_min = apply_binding_xform(bind_tag, knob_min,
+                                                              knob_max, knob_min);
+                        double v_at_max = apply_binding_xform(bind_tag, knob_min,
+                                                              knob_max, knob_max);
+                        double db_min = lin_to_db(v_at_min);
+                        double db_max = lin_to_db(v_at_max);
+                        ds_tag_oncc_t *e = &tag_oncc_out[*tag_oncc_count_io];
+                        strncpy(e->tag, tag_id, DS_MAX_TAG_NAME - 1);
+                        e->tag[DS_MAX_TAG_NAME - 1] = '\0';
+                        e->cc_number = knob_cc;
+                        e->db_delta  = db_max - db_min;
+                        e->db_min    = db_min;
+                        (*tag_oncc_count_io)++;
+                    }
+                } else if ((strcmp(param, "AMP_VOLUME") == 0 ||
+                            strcmp(param, "TAG_VOLUME") == 0) &&
                            strcmp(level, "group") == 0 &&
                            position >= 0 && position < DS_MAX_GROUPS) {
                     if (knob_cc >= 0 &&
@@ -328,11 +415,15 @@ static void apply_ui_overrides(const char *src,
                                                               knob_max, knob_max);
                         double db_min = lin_to_db(v_at_min);
                         double db_max = lin_to_db(v_at_max);
-                        group_amp_db[position] = db_min;
+                        /* group_amp_db left at NaN — the emit loop
+                         * collects oncc db_min from oncc_out, scales
+                         * if multiple bindings would underflow, and
+                         * emits the final static volume there. */
                         ds_group_oncc_t *e = &oncc_out[*oncc_count_io];
                         e->group_position = position;
                         e->cc_number      = knob_cc;
                         e->db_delta       = db_max - db_min;
+                        e->db_min         = db_min;
                         (*oncc_count_io)++;
                     } else {
                         /* No live consumer (knob_idx misaligned or no
@@ -730,10 +821,18 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
     for (int i = 0; i < DS_MAX_GROUPS; i++) group_amp_db[i] = NAN;
     ds_group_oncc_t group_oncc[DS_MAX_GROUP_ONCC];
     int group_oncc_count = 0;
+    /* Phase 4: instrument-level + tag-level AMP_VOLUME buckets. */
+    ds_global_oncc_t global_oncc[DS_MAX_KNOBS];
+    int global_oncc_count = 0;
+    double global_amp_db_extra = 0.0;     /* silent-baseline contributions */
+    ds_tag_oncc_t tag_oncc[DS_MAX_TAG_ONCC];
+    int tag_oncc_count = 0;
     apply_ui_overrides(src, fx, fx_count, env_attack, env_decay,
                        env_sustain, env_release, group_amp_db,
                        use_knobs, knob_count_local,
-                       group_oncc, &group_oncc_count);
+                       group_oncc, &group_oncc_count,
+                       global_oncc, &global_oncc_count, &global_amp_db_extra,
+                       tag_oncc, &tag_oncc_count);
 
     int rr_total = count_rr_groups(src);
 
@@ -780,12 +879,24 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
     double global_vol_db = 0.0;
     if (wrap_volume[0]) global_vol_db += atof(wrap_volume);
     if (gain_idx >= 0 && fx[gain_idx].level[0]) global_vol_db += atof(fx[gain_idx].level);
+    /* `<global> volume=` carries only the static-only pieces
+     * (`<groups volume=>` wrapper + gain effect). Phase 4 oncc shifts
+     * (instrument / tag / group level) are emitted per-group below
+     * so they can be scaled to fit xsynth's -96 dB voice-amp floor
+     * when multiple silent-endpoint shifts stack. */
     if (global_vol_db != 0.0) {
-        if (global_vol_db < -144) global_vol_db = -144;
-        if (global_vol_db >  6.0) global_vol_db =  6.0;
-        int gvi = (int)(global_vol_db >= 0 ? global_vol_db + 0.5 : global_vol_db - 0.5);
+        double v = global_vol_db;
+        if (v < -144) v = -144;
+        if (v >  6.0) v =  6.0;
+        int gvi = (int)(v >= 0 ? v + 0.5 : v - 0.5);
         pos += snprintf(sfz + pos, out_cap - pos, "volume=%d\n", gvi);
     }
+    /* Phase 4: do NOT emit instrument-level volume_oncc on <global>.
+     * Multiple stacked silent-endpoint shifts (instrument + tag +
+     * group) can exceed xsynth's -96 dB spawner clamp; we need to
+     * scale proportionally per-group. Emission of instrument-level
+     * deltas is done per-group below, alongside tag-level and
+     * group-level, so all three can be scaled together. */
 
     /* ADSR: knob `value=` from apply_ui_overrides wins over wrapper attr —
      * the knob represents what the user "sees", and on xsynth there's no
@@ -869,52 +980,114 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
             pos += snprintf(sfz + pos, out_cap - pos, "trigger=release\n");
         }
 
-        /* Group volume: <group volume="dB"> + knob-AMP_VOLUME dB + modVolume
-         * (linear → dB). Without honoring these, multi-group patches like
-         * WörliTzer play ~6× too loud. */
+        /* Phase 4: collect this group's tag (if any) for tag-level
+         * volume_oncc matching below. Single-tag form only (DS allows
+         * multi via comma but no installed preset uses it). */
+        char group_tag[DS_MAX_TAG_NAME] = "";
+        xml_get_attr(tag_buf, "tags", group_tag, sizeof(group_tag));
+
+        /* Group base static volume (NO oncc-related shifts yet). */
         double base_db = 0.0; int has_base = 0;
         xml_get_attr(tag_buf, "volume", val, sizeof(val));
         if (val[0]) { base_db = atof(val); has_base = 1; }
 
-        double extra_db = 0.0; int has_extra = 0;
-        if (group_idx < DS_MAX_GROUPS && !isnan(group_amp_db[group_idx])) {
-            extra_db = group_amp_db[group_idx]; has_extra = 1;
-        } else {
-            xml_get_attr(tag_buf, "modVolume", val, sizeof(val));
-            if (val[0]) { extra_db = lin_to_db(atof(val)); has_extra = 1; }
+        /* modVolume contributes only when no group-level oncc binding
+         * exists for this group (oncc bindings supersede the static
+         * modVolume baseline). */
+        double mod_extra_db = 0.0; int has_mod_extra = 0;
+        {
+            char tmp[64];
+            xml_get_attr(tag_buf, "modVolume", tmp, sizeof(tmp));
+            if (tmp[0]) { mod_extra_db = lin_to_db(atof(tmp)); has_mod_extra = 1; }
         }
+
+        /* Collect every oncc binding that applies to this group:
+         * group-level (matching position), tag-level (matching tags=),
+         * instrument-level (always applies). */
+        struct { int cc; double dmin; double delta; } group_bindings[DS_MAX_KNOBS * 3];
+        int gb_count = 0;
+        for (int oi = 0; oi < group_oncc_count && gb_count < (int)(sizeof(group_bindings)/sizeof(group_bindings[0])); oi++) {
+            if (group_oncc[oi].group_position != group_idx) continue;
+            group_bindings[gb_count].cc    = group_oncc[oi].cc_number;
+            group_bindings[gb_count].dmin  = group_oncc[oi].db_min;
+            group_bindings[gb_count].delta = group_oncc[oi].db_delta;
+            gb_count++;
+        }
+        for (int ti = 0; ti < tag_oncc_count && gb_count < (int)(sizeof(group_bindings)/sizeof(group_bindings[0])); ti++) {
+            if (!group_tag[0] || strcmp(group_tag, tag_oncc[ti].tag) != 0) continue;
+            group_bindings[gb_count].cc    = tag_oncc[ti].cc_number;
+            group_bindings[gb_count].dmin  = tag_oncc[ti].db_min;
+            group_bindings[gb_count].delta = tag_oncc[ti].db_delta;
+            gb_count++;
+        }
+        for (int gi = 0; gi < global_oncc_count && gb_count < (int)(sizeof(group_bindings)/sizeof(group_bindings[0])); gi++) {
+            group_bindings[gb_count].cc    = global_oncc[gi].cc_number;
+            group_bindings[gb_count].dmin  = global_oncc[gi].db_min;
+            group_bindings[gb_count].delta = global_oncc[gi].db_delta;
+            gb_count++;
+        }
+
+        /* Compute the un-clamped static volume = base + Σ db_min. If
+         * it would underflow xsynth's -96 dB spawner clamp (and SFZ's
+         * -144 dB parse clamp), scale all bindings' db_min AND db_delta
+         * proportionally so:
+         *   - clamped static = -96 (the spawner floor)
+         *   - knob-at-max sum (Σ scaled_delta) still reproduces base_db
+         *
+         * Without scaling, the un-clamped negative would get truncated
+         * but the matching positive volume_oncc deltas wouldn't —
+         * resulting in the voice playing tens of dB louder than
+         * authored at preset load. Affects only multi-stack groups
+         * (e.g. Legacy Knight: instrument + tag bindings on one group).
+         * Single-binding groups (WörliTzer, DS Synths) need no scaling. */
+        double sum_db_min = 0.0;
+        for (int i = 0; i < gb_count; i++) sum_db_min += group_bindings[i].dmin;
+        double scale = 1.0;
+        const double SPAWNER_FLOOR_DB = -96.0;
+        if (sum_db_min < 0.0 && base_db + sum_db_min < SPAWNER_FLOOR_DB) {
+            double available = SPAWNER_FLOOR_DB - base_db;  /* negative */
+            if (available < 0.0) scale = available / sum_db_min;
+            if (scale < 0.0) scale = 0.0;
+            if (scale > 1.0) scale = 1.0;
+        }
+
+        /* Emit static volume = base + scaled Σ db_min + modVolume
+         * (when no oncc bindings absorb the per-group baseline). */
+        int has_oncc_static = (gb_count > 0);
+        double extra_db = has_oncc_static ? (sum_db_min * scale) : mod_extra_db;
+        int has_extra = has_oncc_static || has_mod_extra;
         if (has_base || has_extra) {
             double v = base_db + extra_db;
             if (v < -144) v = -144;
             if (v >  6.0) v =  6.0;
             /* xsynth's SFZ parser uses `parse_i16_in_range(val, -144..=6)`
-             * for `volume` — it REJECTS decimals (e.g. "-16.48") and
-             * silently drops the opcode on parse failure, leaving the
-             * group at the 0 dB default. We round to integer dB so all
-             * the layer volumes (and the -80 dB "silent" buckets for
-             * knobs at 0) actually take effect. */
+             * for `volume` — it REJECTS decimals and silently drops the
+             * opcode on parse failure. Round to integer dB. */
             int vi = (int)(v >= 0 ? v + 0.5 : v - 0.5);
             pos += snprintf(sfz + pos, out_cap - pos, "volume=%d\n", vi);
         }
 
-        /* Phase 3 step 3: emit live `volume_oncc<CC>=<dB>` opcodes for
-         * every AMP_VOLUME / TAG_VOLUME knob bound to this group. The
-         * static `volume=` above STILL reflects the knob's current
-         * position (unchanged from prior behavior) — these opcodes
-         * add a parsed-but-unused field on RegionParams.volume_oncc.
-         * Step 5 will wire a SIMD generator that multiplies the voice
-         * amp by `db_to_amp(Σ delta·cc/127)`. Step 6 will switch the
-         * static baseline to the knob's silent endpoint so the delta
-         * brings audio UP from silence as the user turns the knob. */
-        for (int oi = 0; oi < group_oncc_count; oi++) {
-            const ds_group_oncc_t *e = &group_oncc[oi];
-            if (e->group_position != group_idx) continue;
-            double d = e->db_delta;
+        /* Emit volume_oncc<CC>= for each applicable binding, scaled to
+         * match the static. At cc=knob_current, voice amp =
+         * `db_to_amp(base + Σ scaled_dmin + Σ scaled_delta · cc/127)`,
+         * which equals the authored amp at knob's load position when
+         * scale=1, and the floor-clamped equivalent when scale<1. */
+        for (int i = 0; i < gb_count; i++) {
+            double d = group_bindings[i].delta * scale;
             if (d < -144.0) d = -144.0;
             if (d >  144.0) d =  144.0;
             pos += snprintf(sfz + pos, out_cap - pos,
-                            "volume_oncc%d=%.2f\n", e->cc_number, d);
+                            "volume_oncc%d=%.2f\n",
+                            group_bindings[i].cc, d);
         }
+
+        /* Phase 4: groupTuning attribute. DS semitones → xsynth tune=
+         * (i16 cents, clamped to -2400..2400). Applied at the group
+         * level via inheritance — every region inside picks it up
+         * unless it sets its own tune=. */
+        char group_tuning[32] = "";
+        xml_get_attr(tag_buf, "groupTuning", group_tuning, sizeof(group_tuning));
+        double group_tune_cents = group_tuning[0] ? atof(group_tuning) * 100.0 : 0.0;
 
         xml_get_attr(tag_buf, "ampVelTrack", val, sizeof(val));
         if (val[0]) {
@@ -1007,12 +1180,16 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
             if (val[0]) pos += snprintf(sfz + pos, out_cap - pos, "hivel=%s\n", val);
             xml_get_attr(stag, "start", val, sizeof(val));
             if (val[0]) pos += snprintf(sfz + pos, out_cap - pos, "offset=%s\n", val);
-            /* `end` and `transpose` are not in xsynth's opcode list; skip. */
+            /* `end` and `transpose` are not in xsynth's opcode list; skip.
+             * Phase 4: combine <sample tuning> (semitones) with the
+             * containing group's <group groupTuning> (semitones,
+             * pre-converted to cents above) for the final `tune=`. */
             xml_get_attr(stag, "tuning", val, sizeof(val));
-            if (val[0]) {
-                /* DS tuning is in semitones (typically -12..+12). xsynth's
-                 * `tune` is i16 cents, range -2400..2400. Convert. */
-                int cents = (int)(atof(val) * 100.0);
+            double total_cents = group_tune_cents;
+            if (val[0]) total_cents += atof(val) * 100.0;
+            if (total_cents != 0.0) {
+                int cents = (int)(total_cents >= 0 ? total_cents + 0.5
+                                                   : total_cents - 0.5);
                 if (cents < -2400) cents = -2400;
                 if (cents >  2400) cents =  2400;
                 if (cents != 0)

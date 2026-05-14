@@ -471,7 +471,7 @@ static void* v2_create_instance(const char *module_dir, const char *json_default
     if (!inst) return NULL;
     strncpy(inst->module_dir, module_dir, sizeof(inst->module_dir) - 1);
     strcpy(inst->preset_name, "No preset");
-    inst->gain = 1.0f;
+    inst->gain = 0.7f;
     inst->voices = 14;     /* polyphony cap (note-groups). 14 polyphony
                             * × WörliTzer's 5 voices/note ≈ 70 voices,
                             * which is the safe ceiling at current
@@ -841,7 +841,7 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
              "{\"key\":\"octave_transpose\",\"name\":\"Octave\","
              "\"type\":\"int\",\"min\":-4,\"max\":4,\"default\":0},"
              "{\"key\":\"gain\",\"name\":\"Gain\","
-             "\"type\":\"float\",\"min\":0,\"max\":2,\"default\":1.0,\"step\":0.02},"
+             "\"type\":\"float\",\"min\":0,\"max\":2,\"default\":0.7,\"step\":0.02},"
              "{\"key\":\"voices\",\"name\":\"Polyphony\","
              "\"type\":\"int\",\"min\":4,\"max\":128,\"default\":14}");
         for (int i = 0; i < 8; i++) {

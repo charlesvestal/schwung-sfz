@@ -826,7 +826,11 @@ static int binding_param_is_live(const char *parameter) {
            strcmp(parameter, "PAN") == 0 ||
            /* Phase 10: reverb wet routes to the channel reverb via the
             * plugin's set_param handler (not through xsynth). */
-           strcmp(parameter, "FX_REVERB_WET_LEVEL") == 0;
+           strcmp(parameter, "FX_REVERB_WET_LEVEL") == 0 ||
+           /* Phase 9: delay parameters routed via plugin set_param. */
+           strcmp(parameter, "FX_DELAY_TIME") == 0 ||
+           strcmp(parameter, "FX_FEEDBACK") == 0 ||
+           strcmp(parameter, "FX_MIX") == 0;
 }
 
 /* Walk every `<labeled-knob>` / `<control>` element in document order and
@@ -959,6 +963,7 @@ static int enumerate_ui_knobs(const char *src,
         }
         int any_live = 0;
         int any_reverb_wet = 0;
+        int any_delay_time = 0, any_delay_fb = 0, any_delay_mix = 0;
         char first_param[64] = "";
         int first_position = -1;
         const char *bp = bind_start;
@@ -977,6 +982,9 @@ static int enumerate_ui_knobs(const char *src,
             xml_get_attr(btag, "position",  pos_str, sizeof(pos_str));
             if (binding_param_is_live(param)) any_live = 1;
             if (strcmp(param, "FX_REVERB_WET_LEVEL") == 0) any_reverb_wet = 1;
+            if (strcmp(param, "FX_DELAY_TIME")       == 0) any_delay_time = 1;
+            if (strcmp(param, "FX_FEEDBACK")         == 0) any_delay_fb   = 1;
+            if (strcmp(param, "FX_MIX")              == 0) any_delay_mix  = 1;
             if (first_param[0] == '\0' && param[0]) {
                 strncpy(first_param, param, sizeof(first_param) - 1);
                 first_param[sizeof(first_param) - 1] = '\0';
@@ -1018,10 +1026,15 @@ static int enumerate_ui_knobs(const char *src,
         k->max_value     = cmax[0] ? atof(cmax) : 1.0;
         k->default_value = cval[0] ? atof(cval) : k->min_value;
         k->cc_number     = next_cc++;
-        /* Knobs with any reverb-wet binding are surfaced as live —
-         * they route to the channel's reverb_wet at set_param time. */
-        k->live          = any_live || any_reverb_wet;
+        /* Phase 9/10: knobs targeting fundsp post-mix effects are
+         * surfaced as live — the plugin routes their values at
+         * set_param time. */
+        k->live          = any_live || any_reverb_wet ||
+                           any_delay_time || any_delay_fb || any_delay_mix;
         k->reverb_wet    = any_reverb_wet;
+        k->delay_time    = any_delay_time;
+        k->delay_feedback= any_delay_fb;
+        k->delay_mix     = any_delay_mix;
         k->tab_idx       = tab_index_at_position(src, p, tab_count);
         (void)tabs;
 

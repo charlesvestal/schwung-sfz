@@ -609,6 +609,64 @@ pub unsafe extern "C" fn xshim_set_reverb_wet(handle: *mut XSynthHandle, wet: f3
     }));
 }
 
+/// MOVE / Phase 9: install / remove the channel stereo feedback delay.
+/// `enable=0` removes (frees the ring buffer). `enable=1` allocates
+/// a fresh delay sized for up to 2 s of buffer and initializes
+/// time/feedback to the given values.
+#[no_mangle]
+pub unsafe extern "C" fn xshim_set_delay(
+    handle: *mut XSynthHandle,
+    enable: u32,
+    time: f32,
+    feedback: f32,
+) {
+    if handle.is_null() { return; }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        let params = if enable != 0 { Some((time, feedback)) } else { None };
+        h.group.send_event(SynthEvent::AllChannels(ChannelEvent::Config(
+            ChannelConfigEvent::SetDelay(params),
+        )));
+    }));
+}
+
+/// MOVE / Phase 9: live delay-time update (seconds).
+#[no_mangle]
+pub unsafe extern "C" fn xshim_set_delay_time(handle: *mut XSynthHandle, time: f32) {
+    if handle.is_null() { return; }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        h.group.send_event(SynthEvent::AllChannels(ChannelEvent::Config(
+            ChannelConfigEvent::SetDelayTime(time),
+        )));
+    }));
+}
+
+/// MOVE / Phase 9: live feedback update (0..0.95).
+#[no_mangle]
+pub unsafe extern "C" fn xshim_set_delay_feedback(handle: *mut XSynthHandle, fb: f32) {
+    if handle.is_null() { return; }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        h.group.send_event(SynthEvent::AllChannels(ChannelEvent::Config(
+            ChannelConfigEvent::SetDelayFeedback(fb),
+        )));
+    }));
+}
+
+/// MOVE / Phase 9: dry/wet mix for the channel delay. Zero disables
+/// processing entirely (no CPU cost).
+#[no_mangle]
+pub unsafe extern "C" fn xshim_set_delay_mix(handle: *mut XSynthHandle, mix: f32) {
+    if handle.is_null() { return; }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        h.group.send_event(SynthEvent::AllChannels(ChannelEvent::Config(
+            ChannelConfigEvent::SetDelayMix(mix),
+        )));
+    }));
+}
+
 /// MOVE: spawn burst limit. Max NoteOn events drained per render block;
 /// surplus events defer to subsequent blocks. Quantized chord bursts
 /// (e.g. sequence step lands 10 notes at once) overwhelm a single

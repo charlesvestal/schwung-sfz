@@ -72,6 +72,11 @@ extern void          xshim_set_spawn_burst_limit(XSynthHandle*, uint32_t limit);
 extern void          xshim_set_reverb(XSynthHandle*, uint32_t enable,
                                         float room, float time, float damp);
 extern void          xshim_set_reverb_wet(XSynthHandle*, float wet);
+extern void          xshim_set_delay(XSynthHandle*, uint32_t enable,
+                                       float time, float feedback);
+extern void          xshim_set_delay_time(XSynthHandle*, float time);
+extern void          xshim_set_delay_feedback(XSynthHandle*, float fb);
+extern void          xshim_set_delay_mix(XSynthHandle*, float mix);
 extern uint32_t      xshim_take_noteon_count(XSynthHandle*);
 extern void          xshim_take_render_breakdown(XSynthHandle*, uint32_t *out4);
 extern size_t        xshim_last_error(char *out_buf, size_t out_len);
@@ -428,6 +433,22 @@ static int load_sfz_file(xsynth_instance_t *inst, const char *path) {
                 inst->reverb_wet = 0.0f;
                 xshim_set_reverb_wet(inst->synth, 0.0f);
             }
+            /* Phase 9: install/remove delay per dspreset. mix becomes
+             * the channel's delay_mix; time/feedback live-tweakable
+             * via knob bindings. */
+            if (delay_cfg.enabled) {
+                float t  = (float)delay_cfg.delay_seconds;
+                if (t < 0.001f) t = 0.001f; if (t > 2.0f) t = 2.0f;
+                float fb = (float)delay_cfg.feedback;
+                if (fb < 0.0f) fb = 0.0f; if (fb > 0.95f) fb = 0.95f;
+                float mx = (float)delay_cfg.mix;
+                if (mx < 0.0f) mx = 0.0f; if (mx > 1.0f) mx = 1.0f;
+                xshim_set_delay(inst->synth, 1, t, fb);
+                xshim_set_delay_mix(inst->synth, mx);
+            } else {
+                xshim_set_delay(inst->synth, 0, 0.0f, 0.0f);
+                xshim_set_delay_mix(inst->synth, 0.0f);
+            }
         }
         for (int i = 0; i < inst->knob_count; i++) {
             inst->knob_current[i] = inst->knobs[i].default_value;
@@ -758,6 +779,15 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
                     if (wet < 0.0f) wet = 0.0f; if (wet > 1.0f) wet = 1.0f;
                     inst->reverb_wet = wet;
                     xshim_set_reverb_wet(inst->synth, wet);
+                }
+                /* Phase 9: route delay knob bindings. Absolute knob
+                 * value (not the normalized fraction) is what the
+                 * delay expects — seconds for time, 0..1 for fb/mix. */
+                if (inst->synth && (k->delay_time || k->delay_feedback || k->delay_mix)) {
+                    double abs_v = inst->knob_current[idx];
+                    if (k->delay_time)     xshim_set_delay_time(inst->synth, (float)abs_v);
+                    if (k->delay_feedback) xshim_set_delay_feedback(inst->synth, (float)abs_v);
+                    if (k->delay_mix)      xshim_set_delay_mix(inst->synth, (float)abs_v);
                 }
             }
         }

@@ -42,6 +42,9 @@ typedef struct {
                              * FX_REVERB_WET_LEVEL — the plugin routes
                              * this knob's value to xshim_set_reverb_wet
                              * instead of (or in addition to) the SFZ CC. */
+    int   delay_time;       /* Phase 9: FX_DELAY_TIME binding */
+    int   delay_feedback;   /* Phase 9: FX_FEEDBACK binding */
+    int   delay_mix;        /* Phase 9: FX_MIX binding */
 } ds_knob_t;
 
 /* Phase 6.5: tab metadata — one entry per `<tab>` element in the

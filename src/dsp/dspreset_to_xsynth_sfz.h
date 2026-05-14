@@ -21,6 +21,8 @@ extern "C" {
 #endif
 
 #define DS_MAX_KNOBS 16
+#define DS_MAX_TABS 8
+#define DS_MAX_TAB_NAME_LEN 24
 
 /* One UI knob (`<labeled-knob>` or `<control>`) extracted from the
  * dspreset and surfaced to the plugin. */
@@ -34,7 +36,15 @@ typedef struct {
     int   live;             /* 1 if this knob's bindings can respond to live
                              * CC (currently: ampeg_* targets only). 0 if it
                              * only affects load-time defaults. */
+    int   tab_idx;          /* Phase 6.5: which <tab> the knob lives in
+                             * (0 when the dspreset has no tabs). */
 } ds_knob_t;
+
+/* Phase 6.5: tab metadata — one entry per `<tab>` element in the
+ * dspreset's `<ui>` block. */
+typedef struct {
+    char name[DS_MAX_TAB_NAME_LEN];  /* `<tab name="...">`; "main" if absent */
+} ds_tab_t;
 
 /* Convert + populate knob metadata.
  *
@@ -44,7 +54,9 @@ typedef struct {
  */
 char *convert_dspreset_to_xsynth_sfz(const char *path,
                                       ds_knob_t *out_knobs,
-                                      int *out_knob_count);
+                                      int *out_knob_count,
+                                      ds_tab_t  *out_tabs,
+                                      int *out_tab_count);
 
 #ifdef __cplusplus
 }

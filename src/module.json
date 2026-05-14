@@ -44,7 +44,15 @@
               "type": "float",
               "min": 0,
               "max": 2,
-              "default": 1.0
+              "default": 0.7
+            },
+            {
+              "key": "funverb",
+              "label": "FUNVERB",
+              "type": "float",
+              "min": 0,
+              "max": 1,
+              "default": 0.0
             },
             {
               "key": "voices",
@@ -52,7 +60,15 @@
               "type": "int",
               "min": 4,
               "max": 128,
-              "default": 24
+              "default": 14
+            },
+            {
+              "key": "knob_preset",
+              "label": "Knob Preset",
+              "type": "int",
+              "min": 0,
+              "max": 7,
+              "default": 0
             }
           ],
           "knobs": [

@@ -69,6 +69,9 @@ extern uint64_t      xshim_voice_count(const XSynthHandle*);
 extern void          xshim_set_layer_count(XSynthHandle*, uint32_t layers);
 extern void          xshim_set_polyphony_cap(XSynthHandle*, uint32_t cap);
 extern void          xshim_set_spawn_burst_limit(XSynthHandle*, uint32_t limit);
+extern void          xshim_set_reverb(XSynthHandle*, uint32_t enable,
+                                        float room, float time, float damp);
+extern void          xshim_set_reverb_wet(XSynthHandle*, float wet);
 extern uint32_t      xshim_take_noteon_count(XSynthHandle*);
 extern void          xshim_take_render_breakdown(XSynthHandle*, uint32_t *out4);
 extern size_t        xshim_last_error(char *out_buf, size_t out_len);
@@ -143,6 +146,8 @@ typedef struct {
     ds_tab_t tabs[DS_MAX_TABS];
     int tab_count;
     int current_tab;
+    /* Phase 9 prototype: fundsp reverb wet level (0..1). */
+    float reverb_wet;
     double knob_current[DS_MAX_KNOBS]; /* current logical value in [min,max] */
     float *render_buf;             /* interleaved L/R/L/R..., 2 * frames */
 } xsynth_instance_t;
@@ -481,6 +486,7 @@ static void* v2_create_instance(const char *module_dir, const char *json_default
     strncpy(inst->module_dir, module_dir, sizeof(inst->module_dir) - 1);
     strcpy(inst->preset_name, "No preset");
     inst->gain = 0.7f;
+    inst->reverb_wet = 0.0f;
     inst->voices = 14;     /* polyphony cap (note-groups). 14 polyphony
                             * × WörliTzer's 5 voices/note ≈ 70 voices,
                             * which is the safe ceiling at current
@@ -566,6 +572,11 @@ static void* v2_create_instance(const char *module_dir, const char *json_default
     if (inst->synth) {
         xshim_set_polyphony_cap(inst->synth, (uint32_t)inst->voices);
         xshim_set_spawn_burst_limit(inst->synth, (uint32_t)inst->spawn_burst);
+        /* Phase 9 prototype: install a fundsp reverb with sensible
+         * defaults. Wet level defaults to 0 so existing presets are
+         * unchanged until users opt in via the chain param. */
+        xshim_set_reverb(inst->synth, 1, 20.0f, 3.0f, 0.5f);
+        xshim_set_reverb_wet(inst->synth, 0.0f);
     }
 
     plugin_log("Instance created");
@@ -665,6 +676,13 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         if (v > 64) v = 64;
         inst->spawn_burst = v;
         if (inst->synth) xshim_set_spawn_burst_limit(inst->synth, (uint32_t)v);
+    } else if (strcmp(key, "funverb") == 0 || strcmp(key, "reverb") == 0) {
+        /* Phase 9 prototype: fundsp reverb wet level (0..1). */
+        float w = (float)atof(val);
+        if (w < 0.0f) w = 0.0f;
+        if (w > 1.0f) w = 1.0f;
+        inst->reverb_wet = w;
+        if (inst->synth) xshim_set_reverb_wet(inst->synth, w);
     } else if (strcmp(key, "knob_preset") == 0) {
         /* Phase 6.5: select which DS <tab> the encoder row mirrors.
          * Clamped to [0, tab_count - 1]. No xsynth interaction —
@@ -827,6 +845,8 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
         return snprintf(buf, buf_len, "%d", inst->voices);
     else if (strcmp(key, "knob_preset") == 0)
         return snprintf(buf, buf_len, "%d", inst->current_tab);
+    else if (strcmp(key, "funverb") == 0 || strcmp(key, "reverb") == 0)
+        return snprintf(buf, buf_len, "%.2f", inst->reverb_wet);
     else if (strcmp(key, "spawn_burst") == 0)
         return snprintf(buf, buf_len, "%d", inst->spawn_burst);
     else if (strncmp(key, "knob_", 5) == 0) {
@@ -860,6 +880,9 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
          * `max` clamps to tab_count - 1; presets with no tabs show a
          * disabled-feeling [0..0] dropdown. */
         int tab_max = (inst->tab_count > 1) ? (inst->tab_count - 1) : 0;
+        /* chain_params is metadata sidecar — types/min/max for every
+         * key the ui_hierarchy references. The hierarchy (defined in
+         * get_param("ui_hierarchy") above) is what builds the menu. */
         written += snprintf(buf + written, buf_len - written,
             "[{\"key\":\"preset\",\"name\":\"Instrument\","
              "\"type\":\"int\",\"min\":0,\"max_param\":\"preset_count\","
@@ -868,6 +891,8 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
              "\"type\":\"int\",\"min\":-4,\"max\":4,\"default\":0},"
              "{\"key\":\"gain\",\"name\":\"Gain\","
              "\"type\":\"float\",\"min\":0,\"max\":2,\"default\":0.7,\"step\":0.02},"
+             "{\"key\":\"funverb\",\"name\":\"FUNVERB\","
+             "\"type\":\"float\",\"min\":0,\"max\":1,\"default\":0.0,\"step\":0.02},"
              "{\"key\":\"voices\",\"name\":\"Polyphony\","
              "\"type\":\"int\",\"min\":4,\"max\":128,\"default\":14},"
              "{\"key\":\"knob_preset\",\"name\":\"Knob Preset\","
@@ -984,7 +1009,9 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
             "],\"params\":["
                 "{\"key\":\"octave_transpose\",\"label\":\"Octave\"},"
                 "{\"key\":\"gain\",\"label\":\"Gain\"},"
-                "{\"key\":\"voices\",\"label\":\"Polyphony\"}");
+                "{\"key\":\"funverb\",\"label\":\"FUNVERB\"},"
+                "{\"key\":\"voices\",\"label\":\"Polyphony\"},"
+                "{\"key\":\"knob_preset\",\"label\":\"Knob Preset\"}");
         for (int i = 0; i < inst->knob_count; i++) {
             ds_knob_t *k = &inst->knobs[i];
             written += snprintf(buf + written, buf_len - written,

@@ -390,11 +390,45 @@ static int load_sfz_file(xsynth_instance_t *inst, const char *path) {
          * shows the dspreset's authored start position. */
         inst->tab_count = 0;
         inst->current_tab = 0;
+        ds_reverb_cfg_t reverb_cfg = {0};
+        ds_delay_cfg_t  delay_cfg  = {0};
         converted = convert_dspreset_to_xsynth_sfz(path,
                                                     inst->knobs,
                                                     &inst->knob_count,
                                                     inst->tabs,
-                                                    &inst->tab_count);
+                                                    &inst->tab_count,
+                                                    &reverb_cfg,
+                                                    &delay_cfg);
+        /* Phase 10: install reverb from dspreset config (or remove
+         * when not present). roomSize 0..1 maps to fundsp room param
+         * (×30 to expand to seconds-of-prop-time). damping 0..1 →
+         * fundsp damp. Wet level becomes the channel's reverb_wet. */
+        if (inst->synth) {
+            if (reverb_cfg.enabled) {
+                /* DS spec only gives roomSize/damping/wetLevel — no
+                 * explicit decay-time attribute. Derive both fundsp
+                 * room (in seconds of prop time) and time (decay) from
+                 * roomSize so larger rooms → longer tails. Defaults
+                 * tuned for a tighter "plate"-ish character at
+                 * roomSize=0.5. Track tighter behavior parity with
+                 * sfizz/fverb in a follow-up. */
+                float rs = (float)reverb_cfg.room_size;
+                if (rs < 0.0f) rs = 0.0f; if (rs > 1.0f) rs = 1.0f;
+                float room = rs * 15.0f + 3.0f;   /* 3..18 */
+                float time = rs * 1.8f + 0.4f;    /* 0.4..2.2 sec */
+                float damp = (float)reverb_cfg.damping;
+                if (damp < 0.0f) damp = 0.0f; if (damp > 1.0f) damp = 1.0f;
+                xshim_set_reverb(inst->synth, 1, room, time, damp);
+                float wet = (float)reverb_cfg.wet_level;
+                if (wet < 0.0f) wet = 0.0f; if (wet > 1.0f) wet = 1.0f;
+                inst->reverb_wet = wet;
+                xshim_set_reverb_wet(inst->synth, wet);
+            } else {
+                xshim_set_reverb(inst->synth, 0, 0.0f, 0.0f, 0.0f);
+                inst->reverb_wet = 0.0f;
+                xshim_set_reverb_wet(inst->synth, 0.0f);
+            }
+        }
         for (int i = 0; i < inst->knob_count; i++) {
             inst->knob_current[i] = inst->knobs[i].default_value;
         }
@@ -713,6 +747,18 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
                 if (cc_val < 0) cc_val = 0; if (cc_val > 127) cc_val = 127;
                 if (inst->synth) xshim_cc(inst->synth, 0,
                                           (uint8_t)k->cc_number, (uint8_t)cc_val);
+                /* Phase 10: route knobs whose DS binding is
+                 * FX_REVERB_WET_LEVEL straight to the channel reverb. */
+                if (k->reverb_wet && inst->synth) {
+                    /* DS knob value is k->min_value..k->max_value; we
+                     * already stored the absolute value above. Reverb
+                     * expects 0..1 — use the same fraction t (knob is
+                     * always normalized at the chain-param surface). */
+                    float wet = (float)t;
+                    if (wet < 0.0f) wet = 0.0f; if (wet > 1.0f) wet = 1.0f;
+                    inst->reverb_wet = wet;
+                    xshim_set_reverb_wet(inst->synth, wet);
+                }
             }
         }
     } else if (strcmp(key, "all_notes_off") == 0 || strcmp(key, "panic") == 0) {
@@ -891,8 +937,6 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
              "\"type\":\"int\",\"min\":-4,\"max\":4,\"default\":0},"
              "{\"key\":\"gain\",\"name\":\"Gain\","
              "\"type\":\"float\",\"min\":0,\"max\":2,\"default\":0.7,\"step\":0.02},"
-             "{\"key\":\"funverb\",\"name\":\"FUNVERB\","
-             "\"type\":\"float\",\"min\":0,\"max\":1,\"default\":0.0,\"step\":0.02},"
              "{\"key\":\"voices\",\"name\":\"Polyphony\","
              "\"type\":\"int\",\"min\":4,\"max\":128,\"default\":14},"
              "{\"key\":\"knob_preset\",\"name\":\"Knob Preset\","
@@ -1009,7 +1053,6 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
             "],\"params\":["
                 "{\"key\":\"octave_transpose\",\"label\":\"Octave\"},"
                 "{\"key\":\"gain\",\"label\":\"Gain\"},"
-                "{\"key\":\"funverb\",\"label\":\"FUNVERB\"},"
                 "{\"key\":\"voices\",\"label\":\"Polyphony\"},"
                 "{\"key\":\"knob_preset\",\"label\":\"Knob Preset\"}");
         for (int i = 0; i < inst->knob_count; i++) {

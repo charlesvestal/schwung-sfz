@@ -140,11 +140,6 @@ typedef struct {
     int knob_count;
     double knob_current[DS_MAX_KNOBS]; /* current logical value in [min,max] */
     float *render_buf;             /* interleaved L/R/L/R..., 2 * frames */
-    /* MOVE FORK: countdown — force-log render_before/render_after for the
-     * N blocks following a soundfont apply, so we can see exactly when
-     * the post-apply audio thread freezes. Decremented each block, 0 =
-     * normal throttled logging. */
-    int just_applied_post_log;
 } xsynth_instance_t;
 
 static void plugin_log(const char *msg) {
@@ -1012,14 +1007,13 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
     } else if (load_st == XSHIM_LOAD_READY) {
         xshim_load_apply(inst->synth);
         inst->is_loading = 0;
-        /* Phase 3 step 1: push each knob's current CC value so the
-         * NEW soundfont's voices see the authored start position from
+        /* MOVE FORK: push each knob's current CC value so the NEW
+         * soundfont's voices observe the authored start position from
          * the first block. State-restore has its own resend path; this
          * covers fresh loads (e.g. switching to a different preset).
-         * No effect today because no `_oncc<N>` opcode targets these
-         * synthetic CCs yet — events route to xsynth's `_ => {}`
-         * default arm. Lands the resend now so subsequent Phase 3 steps
-         * can wire up bindings against it. */
+         * The voice-side SIMDVoiceOnccAmp generator samples the same
+         * channel cc_state per render block, so once these CCs land
+         * any volume_oncc<CC> bindings spawn at the correct amp. */
         for (int i = 0; i < inst->knob_count; i++) {
             ds_knob_t *k = &inst->knobs[i];
             double t = (k->max_value != k->min_value)
@@ -1031,12 +1025,6 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
             if (cc_val < 0) cc_val = 0; if (cc_val > 127) cc_val = 127;
             xshim_cc(inst->synth, 0, (uint8_t)k->cc_number, (uint8_t)cc_val);
         }
-        /* MOVE FORK: mark the next 16 blocks for unconditional render
-         * logging (bypasses 256-block heartbeat throttle). The freeze
-         * happens AFTER apply on a non-heartbeat block, so we'd
-         * otherwise miss it. 16 blocks ≈ 46 ms — covers event drain +
-         * first voice spawns. */
-        inst->just_applied_post_log = 16;
         plugin_log("xsynth: async SFZ ready and applied");
     } else if (load_st == XSHIM_LOAD_ERROR) {
         char err[256] = {0};
@@ -1064,42 +1052,6 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
     uint32_t noteons_this_block = xshim_take_noteon_count(inst->synth);
     uint64_t voices_before = xshim_voice_count(inst->synth);
 
-    /* MOVE FORK: render heartbeat — diagnostic for the audio-thread freeze
-     * that's seen on rapid preset switching. Logs a fixed-cadence marker
-     * (every 256 blocks ≈ 750 ms @ 44.1 kHz / 128 frames) BEFORE the
-     * xshim_render call. If the freeze is inside xshim_render, the
-     * subsequent `render_after` line in xsynth_debug.log will be missing.
-     * Also captures MemAvailable so we can correlate freeze with memory
-     * pressure. */
-    static uint64_t s_block_counter = 0;
-    s_block_counter++;
-    long mem_avail_kb = -1;
-    int should_log_this_block =
-        (s_block_counter % 256 == 0) || (inst->just_applied_post_log > 0);
-    if (should_log_this_block) {
-        FILE *mf = fopen("/proc/meminfo", "r");
-        if (mf) {
-            char line[256];
-            while (fgets(line, sizeof(line), mf)) {
-                if (strncmp(line, "MemAvailable:", 13) == 0) {
-                    mem_avail_kb = atol(line + 13);
-                    break;
-                }
-            }
-            fclose(mf);
-        }
-        FILE *f = fopen("/data/UserData/schwung/tmp/xsynth_debug.log", "a");
-        if (f) {
-            fprintf(f, "[plugin] render_before blk=%llu voices=%llu mem_avail=%ldKB is_loading=%d noteons=%u post_apply=%d\n",
-                    (unsigned long long)s_block_counter,
-                    (unsigned long long)voices_before,
-                    mem_avail_kb, inst->is_loading,
-                    (unsigned)noteons_this_block,
-                    inst->just_applied_post_log);
-            fclose(f);
-        }
-    }
-
     /* xsynth renders interleaved f32 stereo directly into render_buf. */
     struct timespec _t0, _t1;
     clock_gettime(CLOCK_MONOTONIC, &_t0);
@@ -1107,23 +1059,6 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
     clock_gettime(CLOCK_MONOTONIC, &_t1);
     long render_us = (_t1.tv_sec - _t0.tv_sec) * 1000000L +
                      (_t1.tv_nsec - _t0.tv_nsec) / 1000L;
-
-    /* MOVE FORK: pair with render_before above. If freeze is in render
-     * loop, we'll see render_before with no matching render_after. */
-    if (should_log_this_block) {
-        FILE *f = fopen("/data/UserData/schwung/tmp/xsynth_debug.log", "a");
-        if (f) {
-            fprintf(f, "[plugin] render_after  blk=%llu render_us=%ld voices_after=%llu\n",
-                    (unsigned long long)s_block_counter, render_us,
-                    (unsigned long long)xshim_voice_count(inst->synth));
-            fclose(f);
-        }
-    }
-    /* Decrement the post-apply countdown after both before/after logs
-     * fired so the current block is fully captured. */
-    if (inst->just_applied_post_log > 0) {
-        inst->just_applied_post_log--;
-    }
 
     /* Log perf when there was a spawn burst, render was heavy, or every
      * 256 blocks for baseline. Breakdown: par = event drain + per-key

@@ -77,6 +77,29 @@ typedef struct {
     double db_min;          /* silent-endpoint baseline */
 } ds_tag_oncc_t;
 
+/* MOVE FORK / Phase 5: filter live bindings (FX_FILTER_FREQUENCY,
+ * FX_FILTER_RESONANCE). Emitted on `<global>` so every region's
+ * cutoff/resonance is driven by the knob CC via xsynth-core's
+ * SIMD*VoiceCutoffLive. Baseline = knob-min endpoint; the *_oncc<CC>
+ * sweep covers knob_min → knob_max. */
+typedef struct {
+    int    cc_number;
+    double base_hz;         /* freq at knob_min (silent endpoint, low cutoff) */
+    double cents_delta;     /* 1200 * log2(max_hz / base_hz) */
+} ds_filter_freq_oncc_t;
+typedef struct {
+    int    cc_number;
+    double base_db;         /* resonance dB at knob_min */
+    double db_delta;        /* dB at knob_max minus dB at knob_min */
+} ds_filter_res_oncc_t;
+/* MOVE FORK / Phase 5: PAN live binding (instrument-level — applied to
+ * every region's pan via pan_oncc on <global>). */
+typedef struct {
+    int    cc_number;
+    double base_pct;        /* pan (-100..100) at knob_min */
+    double pct_delta;
+} ds_pan_oncc_t;
+
 /* --- helpers -------------------------------------------------------------- */
 
 static double lin_to_db(double x) {
@@ -245,7 +268,10 @@ static void apply_ui_overrides(const char *src,
                                int *oncc_count_io,
                                ds_global_oncc_t *global_oncc_out, int *global_oncc_count_io,
                                double *global_amp_db_out,
-                               ds_tag_oncc_t *tag_oncc_out, int *tag_oncc_count_io) {
+                               ds_tag_oncc_t *tag_oncc_out, int *tag_oncc_count_io,
+                               ds_filter_freq_oncc_t *filter_freq_out, int *filter_freq_count_io,
+                               ds_filter_res_oncc_t  *filter_res_out,  int *filter_res_count_io,
+                               ds_pan_oncc_t         *pan_oncc_out,    int *pan_oncc_count_io) {
     int knob_idx = 0;
     const char *p = src;
     while (1) {
@@ -435,9 +461,70 @@ static void apply_ui_overrides(const char *src,
                 } else if (position >= 0 && position < fx_count) {
                     ds_effect_t *f = &fx[position];
                     if (strcmp(param, "FX_FILTER_FREQUENCY") == 0) {
-                        strncpy(f->freq, effective, 31); f->freq[31] = '\0';
+                        /* Phase 5: emit cutoff_oncc<CC>=<cents> when the
+                         * knob has a synthetic CC. base_hz comes from the
+                         * knob-min endpoint (silent-endpoint baseline);
+                         * cents_delta covers knob_min → knob_max. The
+                         * static `cutoff=` written elsewhere is overwritten
+                         * by base_hz so they agree. */
+                        if (knob_cc >= 0 &&
+                            filter_freq_out && filter_freq_count_io &&
+                            *filter_freq_count_io < DS_MAX_KNOBS) {
+                            double v_at_min = apply_binding_xform(bind_tag, knob_min,
+                                                                  knob_max, knob_min);
+                            double v_at_max = apply_binding_xform(bind_tag, knob_min,
+                                                                  knob_max, knob_max);
+                            /* Guard against zero / negative freq values. */
+                            if (v_at_min < 1.0)  v_at_min = 1.0;
+                            if (v_at_max <= v_at_min) v_at_max = v_at_min + 1.0;
+                            ds_filter_freq_oncc_t *e =
+                                &filter_freq_out[*filter_freq_count_io];
+                            e->cc_number = knob_cc;
+                            e->base_hz   = v_at_min;
+                            e->cents_delta = 1200.0 * log2(v_at_max / v_at_min);
+                            (*filter_freq_count_io)++;
+                            /* Overwrite static `freq` so the global emit
+                             * uses the silent-endpoint baseline. */
+                            snprintf(f->freq, sizeof(f->freq), "%.2f", v_at_min);
+                        } else {
+                            strncpy(f->freq, effective, 31); f->freq[31] = '\0';
+                        }
                     } else if (strcmp(param, "FX_FILTER_RESONANCE") == 0) {
-                        strncpy(f->resonance, effective, 31); f->resonance[31] = '\0';
+                        if (knob_cc >= 0 &&
+                            filter_res_out && filter_res_count_io &&
+                            *filter_res_count_io < DS_MAX_KNOBS) {
+                            double v_at_min = apply_binding_xform(bind_tag, knob_min,
+                                                                  knob_max, knob_min);
+                            double v_at_max = apply_binding_xform(bind_tag, knob_min,
+                                                                  knob_max, knob_max);
+                            /* DS resonance ranges 0..1 (Q-like). xsynth's
+                             * SFZ `resonance` is dB. Pass through directly
+                             * (matches existing static behavior, ~0.7 ≈ 0
+                             * dB). Future: scale to a fuller dB range. */
+                            ds_filter_res_oncc_t *e =
+                                &filter_res_out[*filter_res_count_io];
+                            e->cc_number = knob_cc;
+                            e->base_db   = v_at_min;
+                            e->db_delta  = v_at_max - v_at_min;
+                            (*filter_res_count_io)++;
+                            snprintf(f->resonance, sizeof(f->resonance), "%.4f", v_at_min);
+                        } else {
+                            strncpy(f->resonance, effective, 31); f->resonance[31] = '\0';
+                        }
+                    } else if (strcmp(param, "PAN") == 0) {
+                        if (knob_cc >= 0 &&
+                            pan_oncc_out && pan_oncc_count_io &&
+                            *pan_oncc_count_io < DS_MAX_KNOBS) {
+                            double v_at_min = apply_binding_xform(bind_tag, knob_min,
+                                                                  knob_max, knob_min);
+                            double v_at_max = apply_binding_xform(bind_tag, knob_min,
+                                                                  knob_max, knob_max);
+                            ds_pan_oncc_t *e = &pan_oncc_out[*pan_oncc_count_io];
+                            e->cc_number = knob_cc;
+                            e->base_pct  = v_at_min;
+                            e->pct_delta = v_at_max - v_at_min;
+                            (*pan_oncc_count_io)++;
+                        }
                     }
                     /* Reverb knobs: skip — xsynth has no reverb anyway. */
                 }
@@ -603,7 +690,11 @@ static int binding_param_is_live(const char *parameter) {
            strcmp(parameter, "ENV_RELEASE") == 0 ||
            strcmp(parameter, "ENV_HOLD") == 0 ||
            strcmp(parameter, "AMP_VOLUME") == 0 ||
-           strcmp(parameter, "TAG_VOLUME") == 0;
+           strcmp(parameter, "TAG_VOLUME") == 0 ||
+           /* Phase 5: filter + pan live oncc. */
+           strcmp(parameter, "FX_FILTER_FREQUENCY") == 0 ||
+           strcmp(parameter, "FX_FILTER_RESONANCE") == 0 ||
+           strcmp(parameter, "PAN") == 0;
 }
 
 /* Walk every `<labeled-knob>` / `<control>` element in document order and
@@ -827,12 +918,22 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
     double global_amp_db_extra = 0.0;     /* silent-baseline contributions */
     ds_tag_oncc_t tag_oncc[DS_MAX_TAG_ONCC];
     int tag_oncc_count = 0;
+    /* Phase 5: filter freq/resonance + pan live bindings. */
+    ds_filter_freq_oncc_t filter_freq_oncc[DS_MAX_KNOBS];
+    int filter_freq_oncc_count = 0;
+    ds_filter_res_oncc_t  filter_res_oncc[DS_MAX_KNOBS];
+    int filter_res_oncc_count = 0;
+    ds_pan_oncc_t         pan_oncc[DS_MAX_KNOBS];
+    int pan_oncc_count = 0;
     apply_ui_overrides(src, fx, fx_count, env_attack, env_decay,
                        env_sustain, env_release, group_amp_db,
                        use_knobs, knob_count_local,
                        group_oncc, &group_oncc_count,
                        global_oncc, &global_oncc_count, &global_amp_db_extra,
-                       tag_oncc, &tag_oncc_count);
+                       tag_oncc, &tag_oncc_count,
+                       filter_freq_oncc, &filter_freq_oncc_count,
+                       filter_res_oncc, &filter_res_oncc_count,
+                       pan_oncc, &pan_oncc_count);
 
     int rr_total = count_rr_groups(src);
 
@@ -952,6 +1053,30 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
         pos += snprintf(sfz + pos, out_cap - pos,
                         "fil_type=%s\ncutoff=%s\nresonance=%s\n",
                         fil_type, cutoff, q);
+        /* Phase 5: live filter sweep from FX_FILTER_FREQUENCY /
+         * FX_FILTER_RESONANCE knob bindings. xsynth-core picks up these
+         * opcodes via SIMD*VoiceCutoffLive and recomputes biquad
+         * coefficients per render block. */
+        for (int i = 0; i < filter_freq_oncc_count; i++) {
+            pos += snprintf(sfz + pos, out_cap - pos,
+                            "cutoff_oncc%d=%.2f\n",
+                            filter_freq_oncc[i].cc_number,
+                            filter_freq_oncc[i].cents_delta);
+        }
+        for (int i = 0; i < filter_res_oncc_count; i++) {
+            pos += snprintf(sfz + pos, out_cap - pos,
+                            "resonance_oncc%d=%.4f\n",
+                            filter_res_oncc[i].cc_number,
+                            filter_res_oncc[i].db_delta);
+        }
+    }
+    /* Phase 5: live pan_oncc from PAN knob bindings. Emitted on
+     * <global> so every region's pan is driven by the knob CC. */
+    for (int i = 0; i < pan_oncc_count; i++) {
+        pos += snprintf(sfz + pos, out_cap - pos,
+                        "pan_oncc%d=%.2f\n",
+                        pan_oncc[i].cc_number,
+                        pan_oncc[i].pct_delta);
     }
 
     /* === walk <group>s === */

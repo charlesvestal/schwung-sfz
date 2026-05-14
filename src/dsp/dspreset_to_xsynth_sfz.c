@@ -53,6 +53,7 @@ typedef struct {
     int    cc_number;       /* Knob's synthetic MIDI CC (102..117) */
     double db_delta;        /* dB at knob_max minus dB at knob_min */
     double db_min;          /* dB at knob_min (silent endpoint, ≤ 0) */
+    int    curve_id;        /* Phase 6: SFZ curve index; -1 = no curve */
 } ds_group_oncc_t;
 
 /* MOVE FORK / Phase 4: instrument-level AMP_VOLUME binding. Knob acts
@@ -62,6 +63,7 @@ typedef struct {
     int    cc_number;
     double db_delta;
     double db_min;          /* silent-endpoint baseline (dB at knob_min) */
+    int    curve_id;        /* Phase 6 */
 } ds_global_oncc_t;
 
 /* MOVE FORK / Phase 4: tag-level AMP_VOLUME binding. Knob drives the
@@ -75,6 +77,7 @@ typedef struct {
     int    cc_number;
     double db_delta;
     double db_min;          /* silent-endpoint baseline */
+    int    curve_id;        /* Phase 6 */
 } ds_tag_oncc_t;
 
 /* MOVE FORK / Phase 5: filter live bindings (FX_FILTER_FREQUENCY,
@@ -86,11 +89,13 @@ typedef struct {
     int    cc_number;
     double base_hz;         /* freq at knob_min (silent endpoint, low cutoff) */
     double cents_delta;     /* 1200 * log2(max_hz / base_hz) */
+    int    curve_id;        /* Phase 6 */
 } ds_filter_freq_oncc_t;
 typedef struct {
     int    cc_number;
     double base_db;         /* resonance dB at knob_min */
     double db_delta;        /* dB at knob_max minus dB at knob_min */
+    int    curve_id;        /* Phase 6 */
 } ds_filter_res_oncc_t;
 /* MOVE FORK / Phase 5: PAN live binding (instrument-level — applied to
  * every region's pan via pan_oncc on <global>). */
@@ -98,13 +103,92 @@ typedef struct {
     int    cc_number;
     double base_pct;        /* pan (-100..100) at knob_min */
     double pct_delta;
+    int    curve_id;        /* Phase 6 */
 } ds_pan_oncc_t;
+
+/* MOVE FORK / Phase 6: SFZv2 curve table. The converter generates one
+ * curve per live `_oncc` binding, pre-baking the DS knob's translation
+ * (apply_binding_xform) into 128 sample points. xsynth-core's SIMD
+ * generators consult curve[cc] instead of cc/127 when a `_curvecc<N>`
+ * opcode references this curve. */
+#define DS_MAX_CURVES 64
+typedef struct {
+    int    id;
+    double v[128];          /* normalized in [0, 1] */
+} ds_curve_t;
 
 /* --- helpers -------------------------------------------------------------- */
 
 static double lin_to_db(double x) {
     if (x <= 1e-5) return -80.0;
     return 20.0 * log10(x);
+}
+
+static double apply_binding_xform(const char *bind_tag, double in_min,
+                                  double in_max, double v);
+
+/* MOVE FORK / Phase 6: build a 128-point curve table that maps SFZ
+ * `cc/127` to the *fraction* of (target_max - target_min) we want
+ * applied at that CC. Used by xsynth-core's SIMD generators when
+ * `_curvecc<N>` references this table.
+ *
+ * Strategy: at each CC step, the user's knob is at position
+ *   knob_pos = knob_min + (knob_max - knob_min) * cc/127
+ * (i.e. linear in DS knob space — the on-device encoder is linear).
+ * `apply_binding_xform` gives the parameter value at that position;
+ * `target_at` then converts to the parameter's SFZ-native unit (dB for
+ * volume, cents for cutoff, etc.). The curve point is normalized
+ * relative to the endpoints so the SFZ side just multiplies by
+ * full_swing.
+ *
+ * `kind` selects the target conversion:
+ *   0 = volume (DS amp-linear → SFZ dB-linear)
+ *   1 = cutoff (DS Hz-linear → SFZ cents-linear)
+ *   2 = pass-through (caller already in target unit)
+ */
+static void build_curve(ds_curve_t *c, int id,
+                        const char *bind_tag,
+                        double knob_min, double knob_max,
+                        double v_at_min, double v_at_max,
+                        int kind) {
+    c->id = id;
+    /* Convert endpoints to the SFZ target unit so we can normalize. */
+    double t_min, t_max;
+    if (kind == 0) {
+        t_min = lin_to_db(v_at_min);
+        t_max = lin_to_db(v_at_max);
+    } else if (kind == 1) {
+        if (v_at_min < 1.0) v_at_min = 1.0;
+        if (v_at_max <= v_at_min) v_at_max = v_at_min + 1.0;
+        t_min = 0.0;  /* base */
+        t_max = 1200.0 * log2(v_at_max / v_at_min);
+    } else {
+        t_min = v_at_min;
+        t_max = v_at_max;
+    }
+    double range = t_max - t_min;
+    if (range == 0.0) {
+        for (int i = 0; i < 128; i++) c->v[i] = (double)i / 127.0;
+        return;
+    }
+    for (int i = 0; i < 128; i++) {
+        double frac = (double)i / 127.0;
+        double knob_pos = knob_min + (knob_max - knob_min) * frac;
+        double v = apply_binding_xform(bind_tag, knob_min, knob_max, knob_pos);
+        double t;
+        if (kind == 0) {
+            t = lin_to_db(v);
+        } else if (kind == 1) {
+            if (v < 1.0) v = 1.0;
+            t = 1200.0 * log2(v / v_at_min);
+        } else {
+            t = v;
+        }
+        double f = (t - t_min) / range;
+        if (f < 0.0) f = 0.0;
+        if (f > 1.0) f = 1.0;
+        c->v[i] = f;
+    }
 }
 
 static void xml_get_attr(const char *tag, const char *attr_name,
@@ -258,6 +342,23 @@ static int compute_binding_value(const char *ctrl_tag, const char *bind_tag,
  * its synthetic CC number. AMP_VOLUME / TAG_VOLUME group-level bindings
  * additionally record a `volume_oncc` entry the main emit loop writes
  * as `volume_oncc<CC>=<dB-delta>` opcodes per group. */
+/* MOVE FORK / Phase 6: allocate a fresh curve_id, build the table,
+ * push into curves_out. Returns the assigned id, or -1 if the bucket
+ * is full / disabled. IDs start at 100 to avoid SFZv2's predefined
+ * 0..7 curve slots. */
+static int alloc_curve(ds_curve_t *curves_out, int *count_io,
+                       const char *bind_tag,
+                       double knob_min, double knob_max,
+                       double v_at_min, double v_at_max,
+                       int kind) {
+    if (!curves_out || !count_io || *count_io >= DS_MAX_CURVES) return -1;
+    int id = 100 + *count_io;
+    build_curve(&curves_out[*count_io], id, bind_tag,
+                knob_min, knob_max, v_at_min, v_at_max, kind);
+    (*count_io)++;
+    return id;
+}
+
 static void apply_ui_overrides(const char *src,
                                ds_effect_t fx[DS_MAX_FX], int fx_count,
                                char env_attack[32], char env_decay[32],
@@ -271,7 +372,8 @@ static void apply_ui_overrides(const char *src,
                                ds_tag_oncc_t *tag_oncc_out, int *tag_oncc_count_io,
                                ds_filter_freq_oncc_t *filter_freq_out, int *filter_freq_count_io,
                                ds_filter_res_oncc_t  *filter_res_out,  int *filter_res_count_io,
-                               ds_pan_oncc_t         *pan_oncc_out,    int *pan_oncc_count_io) {
+                               ds_pan_oncc_t         *pan_oncc_out,    int *pan_oncc_count_io,
+                               ds_curve_t *curves_out, int *curves_count_io) {
     int knob_idx = 0;
     const char *p = src;
     while (1) {
@@ -380,6 +482,9 @@ static void apply_ui_overrides(const char *src,
                     e->cc_number = knob_cc;
                     e->db_delta  = db_max - db_min;
                     e->db_min    = db_min;
+                    e->curve_id  = alloc_curve(curves_out, curves_count_io,
+                                                bind_tag, knob_min, knob_max,
+                                                v_at_min, v_at_max, 0);
                     (*global_oncc_count_io)++;
                     if (global_amp_db_out) *global_amp_db_out += db_min;
                 } else if ((strcmp(param, "AMP_VOLUME") == 0 ||
@@ -408,6 +513,9 @@ static void apply_ui_overrides(const char *src,
                         e->cc_number = knob_cc;
                         e->db_delta  = db_max - db_min;
                         e->db_min    = db_min;
+                        e->curve_id  = alloc_curve(curves_out, curves_count_io,
+                                                    bind_tag, knob_min, knob_max,
+                                                    v_at_min, v_at_max, 0);
                         (*tag_oncc_count_io)++;
                     }
                 } else if ((strcmp(param, "AMP_VOLUME") == 0 ||
@@ -450,6 +558,9 @@ static void apply_ui_overrides(const char *src,
                         e->cc_number      = knob_cc;
                         e->db_delta       = db_max - db_min;
                         e->db_min         = db_min;
+                        e->curve_id       = alloc_curve(curves_out, curves_count_io,
+                                                         bind_tag, knob_min, knob_max,
+                                                         v_at_min, v_at_max, 0);
                         (*oncc_count_io)++;
                     } else {
                         /* No live consumer (knob_idx misaligned or no
@@ -482,6 +593,9 @@ static void apply_ui_overrides(const char *src,
                             e->cc_number = knob_cc;
                             e->base_hz   = v_at_min;
                             e->cents_delta = 1200.0 * log2(v_at_max / v_at_min);
+                            e->curve_id = alloc_curve(curves_out, curves_count_io,
+                                                       bind_tag, knob_min, knob_max,
+                                                       v_at_min, v_at_max, 1);
                             (*filter_freq_count_io)++;
                             /* Overwrite static `freq` so the global emit
                              * uses the silent-endpoint baseline. */
@@ -506,6 +620,7 @@ static void apply_ui_overrides(const char *src,
                             e->cc_number = knob_cc;
                             e->base_db   = v_at_min;
                             e->db_delta  = v_at_max - v_at_min;
+                            e->curve_id  = -1; /* linear ok for resonance */
                             (*filter_res_count_io)++;
                             snprintf(f->resonance, sizeof(f->resonance), "%.4f", v_at_min);
                         } else {
@@ -523,6 +638,7 @@ static void apply_ui_overrides(const char *src,
                             e->cc_number = knob_cc;
                             e->base_pct  = v_at_min;
                             e->pct_delta = v_at_max - v_at_min;
+                            e->curve_id  = -1; /* linear ok for pan */
                             (*pan_oncc_count_io)++;
                         }
                     }
@@ -925,6 +1041,9 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
     int filter_res_oncc_count = 0;
     ds_pan_oncc_t         pan_oncc[DS_MAX_KNOBS];
     int pan_oncc_count = 0;
+    /* Phase 6: curve tables pre-baked from DS knob translations. */
+    ds_curve_t curves[DS_MAX_CURVES];
+    int curves_count = 0;
     apply_ui_overrides(src, fx, fx_count, env_attack, env_decay,
                        env_sustain, env_release, group_amp_db,
                        use_knobs, knob_count_local,
@@ -933,7 +1052,8 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
                        tag_oncc, &tag_oncc_count,
                        filter_freq_oncc, &filter_freq_oncc_count,
                        filter_res_oncc, &filter_res_oncc_count,
-                       pan_oncc, &pan_oncc_count);
+                       pan_oncc, &pan_oncc_count,
+                       curves, &curves_count);
 
     int rr_total = count_rr_groups(src);
 
@@ -968,6 +1088,19 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
             xml_get_attr(tag_buf, "sustain",     wrap_sustain, sizeof(wrap_sustain));
             xml_get_attr(tag_buf, "release",     wrap_release, sizeof(wrap_release));
             xml_get_attr(tag_buf, "loopEnabled", wrap_loop,    sizeof(wrap_loop));
+        }
+    }
+
+    /* Phase 6: emit `<curve>` blocks before any `<global>`. Each curve
+     * pre-bakes the DS knob's translation into 128 sample points; xsynth
+     * SIMD generators look up curve[cc] in place of cc/127 when a
+     * matching `_curvecc<N>=<id>` opcode references it. */
+    for (int ci = 0; ci < curves_count; ci++) {
+        pos += snprintf(sfz + pos, out_cap - pos,
+                        "<curve>\nindex=%d\n", curves[ci].id);
+        for (int pi = 0; pi < 128; pi++) {
+            pos += snprintf(sfz + pos, out_cap - pos,
+                            "v%03d=%.6f\n", pi, curves[ci].v[pi]);
         }
     }
 
@@ -1062,12 +1195,24 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
                             "cutoff_oncc%d=%.2f\n",
                             filter_freq_oncc[i].cc_number,
                             filter_freq_oncc[i].cents_delta);
+            if (filter_freq_oncc[i].curve_id >= 0) {
+                pos += snprintf(sfz + pos, out_cap - pos,
+                                "cutoff_curvecc%d=%d\n",
+                                filter_freq_oncc[i].cc_number,
+                                filter_freq_oncc[i].curve_id);
+            }
         }
         for (int i = 0; i < filter_res_oncc_count; i++) {
             pos += snprintf(sfz + pos, out_cap - pos,
                             "resonance_oncc%d=%.4f\n",
                             filter_res_oncc[i].cc_number,
                             filter_res_oncc[i].db_delta);
+            if (filter_res_oncc[i].curve_id >= 0) {
+                pos += snprintf(sfz + pos, out_cap - pos,
+                                "resonance_curvecc%d=%d\n",
+                                filter_res_oncc[i].cc_number,
+                                filter_res_oncc[i].curve_id);
+            }
         }
     }
     /* Phase 5: live pan_oncc from PAN knob bindings. Emitted on
@@ -1077,6 +1222,12 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
                         "pan_oncc%d=%.2f\n",
                         pan_oncc[i].cc_number,
                         pan_oncc[i].pct_delta);
+        if (pan_oncc[i].curve_id >= 0) {
+            pos += snprintf(sfz + pos, out_cap - pos,
+                            "pan_curvecc%d=%d\n",
+                            pan_oncc[i].cc_number,
+                            pan_oncc[i].curve_id);
+        }
     }
 
     /* === walk <group>s === */
@@ -1129,13 +1280,14 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
         /* Collect every oncc binding that applies to this group:
          * group-level (matching position), tag-level (matching tags=),
          * instrument-level (always applies). */
-        struct { int cc; double dmin; double delta; } group_bindings[DS_MAX_KNOBS * 3];
+        struct { int cc; double dmin; double delta; int curve_id; } group_bindings[DS_MAX_KNOBS * 3];
         int gb_count = 0;
         for (int oi = 0; oi < group_oncc_count && gb_count < (int)(sizeof(group_bindings)/sizeof(group_bindings[0])); oi++) {
             if (group_oncc[oi].group_position != group_idx) continue;
             group_bindings[gb_count].cc    = group_oncc[oi].cc_number;
             group_bindings[gb_count].dmin  = group_oncc[oi].db_min;
             group_bindings[gb_count].delta = group_oncc[oi].db_delta;
+            group_bindings[gb_count].curve_id = group_oncc[oi].curve_id;
             gb_count++;
         }
         for (int ti = 0; ti < tag_oncc_count && gb_count < (int)(sizeof(group_bindings)/sizeof(group_bindings[0])); ti++) {
@@ -1143,12 +1295,14 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
             group_bindings[gb_count].cc    = tag_oncc[ti].cc_number;
             group_bindings[gb_count].dmin  = tag_oncc[ti].db_min;
             group_bindings[gb_count].delta = tag_oncc[ti].db_delta;
+            group_bindings[gb_count].curve_id = tag_oncc[ti].curve_id;
             gb_count++;
         }
         for (int gi = 0; gi < global_oncc_count && gb_count < (int)(sizeof(group_bindings)/sizeof(group_bindings[0])); gi++) {
             group_bindings[gb_count].cc    = global_oncc[gi].cc_number;
             group_bindings[gb_count].dmin  = global_oncc[gi].db_min;
             group_bindings[gb_count].delta = global_oncc[gi].db_delta;
+            group_bindings[gb_count].curve_id = global_oncc[gi].curve_id;
             gb_count++;
         }
 
@@ -1204,6 +1358,12 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
             pos += snprintf(sfz + pos, out_cap - pos,
                             "volume_oncc%d=%.2f\n",
                             group_bindings[i].cc, d);
+            if (group_bindings[i].curve_id >= 0) {
+                pos += snprintf(sfz + pos, out_cap - pos,
+                                "volume_curvecc%d=%d\n",
+                                group_bindings[i].cc,
+                                group_bindings[i].curve_id);
+            }
         }
 
         /* Phase 4: groupTuning attribute. DS semitones → xsynth tune=

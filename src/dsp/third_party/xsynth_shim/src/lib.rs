@@ -574,6 +574,41 @@ pub unsafe extern "C" fn xshim_set_polyphony_cap(handle: *mut XSynthHandle, cap:
     }));
 }
 
+/// MOVE / Phase 9 prototype: install / remove the channel reverb.
+/// Pass enable=0 to remove. enable=1 installs a fundsp `reverb_stereo`
+/// with the given (room, time, damp) — typical room = 10..20,
+/// time = 1..5, damp = 0..1.
+#[no_mangle]
+pub unsafe extern "C" fn xshim_set_reverb(
+    handle: *mut XSynthHandle,
+    enable: u32,
+    room: f32,
+    time: f32,
+    damp: f32,
+) {
+    if handle.is_null() { return; }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        let params = if enable != 0 { Some((room, time, damp)) } else { None };
+        h.group.send_event(SynthEvent::AllChannels(ChannelEvent::Config(
+            ChannelConfigEvent::SetReverb(params),
+        )));
+    }));
+}
+
+/// MOVE / Phase 9 prototype: dry/wet mix for the channel reverb. 0
+/// disables processing entirely (no CPU cost); 1 is fully wet.
+#[no_mangle]
+pub unsafe extern "C" fn xshim_set_reverb_wet(handle: *mut XSynthHandle, wet: f32) {
+    if handle.is_null() { return; }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        h.group.send_event(SynthEvent::AllChannels(ChannelEvent::Config(
+            ChannelConfigEvent::SetReverbWet(wet),
+        )));
+    }));
+}
+
 /// MOVE: spawn burst limit. Max NoteOn events drained per render block;
 /// surplus events defer to subsequent blocks. Quantized chord bursts
 /// (e.g. sequence step lands 10 notes at once) overwhelm a single

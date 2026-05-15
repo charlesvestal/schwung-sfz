@@ -1239,68 +1239,187 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
     }
 
     /* === Phase 11: parse <modulators><lfo> blocks ===
-     * MVP: amp LFO (tremolo) only. Look for any <lfo> whose first
-     * <binding> targets LEVEL or AMP_VOLUME and emit `amplfo_freq` /
-     * `amplfo_depth` on <global> so every region picks them up.
-     * Pitch LFO (GROUP_TUNING) and filter LFO (FX_FILTER_FREQUENCY)
-     * targets are recognized but defer SFZ-side until a later phase
-     * (xsynth needs pitchlfo / fillfo support added). */
+     * MVP: amp LFO (tremolo). Look for any <lfo> whose first <binding>
+     * targets LEVEL or AMP_VOLUME and emit `amplfo_freq` /
+     * `amplfo_depth` on <global>.
+     *
+     * Also detect knob bindings to type="modulator" position="i" with
+     * parameter="MOD_AMOUNT" or "FREQUENCY" — these are the dspreset's
+     * LFO speed / depth controls. When found, route them through
+     * amplfo_freq_oncc / amplfo_depth_oncc so the knob drives the
+     * LFO live. */
     double amp_lfo_freq = 0.0;
     double amp_lfo_depth_db = 0.0;
+    int    amp_lfo_freq_cc = -1, amp_lfo_depth_cc = -1;
+    double amp_lfo_freq_delta = 0.0, amp_lfo_depth_delta = 0.0;
     {
         const char *mp = strstr(src, "<modulators");
         const char *me = mp ? strstr(mp, "</modulators>") : NULL;
-        const char *lfop = mp ? strstr(mp, "<lfo") : NULL;
-        while (lfop && (!me || lfop < me)) {
-            const char *lfo_tag_end = strchr(lfop, '>');
-            if (!lfo_tag_end) break;
-            char lfo_tag[512];
-            int ll = (int)(lfo_tag_end - lfop);
-            if (ll > 511) ll = 511;
-            memcpy(lfo_tag, lfop, ll);
-            lfo_tag[ll] = '\0';
-            char freq_str[32], mod_amount_str[32];
-            xml_get_attr(lfo_tag, "frequency", freq_str, sizeof(freq_str));
-            xml_get_attr(lfo_tag, "modAmount", mod_amount_str, sizeof(mod_amount_str));
-            double freq = freq_str[0] ? atof(freq_str) : 1.0;
-            double mod_amount = mod_amount_str[0] ? atof(mod_amount_str) : 1.0;
-            /* Find matching </lfo> closer. */
-            const char *lfo_close = strstr(lfo_tag_end, "</lfo>");
-            if (!lfo_close) break;
-            /* Walk this LFO's bindings. */
-            const char *bp = lfo_tag_end + 1;
-            while (bp && bp < lfo_close) {
-                const char *bt = strstr(bp, "<binding");
-                if (!bt || bt >= lfo_close) break;
-                const char *bte = strchr(bt, '>');
-                if (!bte) break;
-                char btag[512];
-                int btl = (int)(bte - bt);
-                if (btl > 511) btl = 511;
-                memcpy(btag, bt, btl);
-                btag[btl] = '\0';
-                char param[64], omin[32], omax[32];
-                xml_get_attr(btag, "parameter", param, sizeof(param));
-                xml_get_attr(btag, "translationOutputMin", omin, sizeof(omin));
-                xml_get_attr(btag, "translationOutputMax", omax, sizeof(omax));
-                if ((strcmp(param, "LEVEL") == 0 || strcmp(param, "AMP_VOLUME") == 0)
-                        && amp_lfo_freq == 0.0) {
-                    double output_min = omin[0] ? atof(omin) : 0.0;
-                    double output_max = omax[0] ? atof(omax) : 1.0;
-                    double half_range = (output_max - output_min) * 0.5 * mod_amount;
-                    if (half_range < 0) half_range = -half_range;
-                    /* Linear amp swing → dB depth. half_range = ±swing
-                     * around 1.0; ±0.5 ≈ ±6 dB. Cap at 24 dB so an
-                     * outputMax=1 outputMin=0 tremolo doesn't sound
-                     * cartoonish (would be 40 dB literally). */
-                    double depth_db = 20.0 * log10(1.0 + half_range);
-                    if (depth_db > 24.0) depth_db = 24.0;
-                    amp_lfo_freq = freq;
-                    amp_lfo_depth_db = depth_db;
+        /* Walk modulators in document order so position indexes match
+         * the dspreset's `<binding position="i">` references. */
+        const char *cur = mp ? mp + 12 : NULL;
+        int mod_idx = 0;
+        while (cur && (!me || cur < me)) {
+            const char *lfo_open = strstr(cur, "<lfo");
+            const char *env_open = strstr(cur, "<envelope");
+            const char *next = NULL;
+            int is_lfo = 0;
+            if (lfo_open && env_open) {
+                if (lfo_open < env_open) { next = lfo_open; is_lfo = 1; }
+                else                       next = env_open;
+            } else if (lfo_open) { next = lfo_open; is_lfo = 1; }
+            else if (env_open)   next = env_open;
+            if (!next || (me && next >= me)) break;
+            const char *tag_end = strchr(next, '>');
+            if (!tag_end) break;
+            const char *close = is_lfo ? strstr(tag_end, "</lfo>")
+                                       : strstr(tag_end, "</envelope>");
+            if (!close) break;
+
+            if (is_lfo) {
+                char lfo_tag[512];
+                int ll = (int)(tag_end - next);
+                if (ll > 511) ll = 511;
+                memcpy(lfo_tag, next, ll);
+                lfo_tag[ll] = '\0';
+                char freq_str[32], mod_amount_str[32];
+                xml_get_attr(lfo_tag, "frequency", freq_str, sizeof(freq_str));
+                xml_get_attr(lfo_tag, "modAmount", mod_amount_str, sizeof(mod_amount_str));
+                double freq = freq_str[0] ? atof(freq_str) : 1.0;
+                double mod_amount = mod_amount_str[0] ? atof(mod_amount_str) : 1.0;
+
+                /* Scan inner bindings for amp-targeting (LEVEL / AMP_VOLUME). */
+                const char *bp = tag_end + 1;
+                while (bp && bp < close) {
+                    const char *bt = strstr(bp, "<binding");
+                    if (!bt || bt >= close) break;
+                    const char *bte = strchr(bt, '>');
+                    if (!bte) break;
+                    char btag[512];
+                    int btl = (int)(bte - bt);
+                    if (btl > 511) btl = 511;
+                    memcpy(btag, bt, btl);
+                    btag[btl] = '\0';
+                    char param[64], omin[32], omax[32];
+                    xml_get_attr(btag, "parameter", param, sizeof(param));
+                    xml_get_attr(btag, "translationOutputMin", omin, sizeof(omin));
+                    xml_get_attr(btag, "translationOutputMax", omax, sizeof(omax));
+                    if ((strcmp(param, "LEVEL") == 0 || strcmp(param, "AMP_VOLUME") == 0)
+                            && amp_lfo_freq == 0.0 && amp_lfo_freq_cc < 0) {
+                        double output_min = omin[0] ? atof(omin) : 0.0;
+                        double output_max = omax[0] ? atof(omax) : 1.0;
+                        double full_swing = (output_max - output_min) * 0.5;
+                        if (full_swing < 0) full_swing = -full_swing;
+                        double max_depth = 20.0 * log10(1.0 + full_swing);
+                        if (max_depth > 24.0) max_depth = 24.0;
+                        /* Default static: scale by XML modAmount. */
+                        amp_lfo_freq = freq;
+                        amp_lfo_depth_db = max_depth * mod_amount;
+
+                        /* Search for knob bindings to this modulator (mod_idx). */
+                        char needle[96];
+                        snprintf(needle, sizeof(needle),
+                                 "type=\"modulator\" position=\"%d\"", mod_idx);
+                        for (int ki = 0; ki < knob_count_local; ki++) {
+                            const ds_knob_t *k = &use_knobs[ki];
+                            if (k->cc_number < 0) continue;
+                            /* Look up this knob's tag in src to inspect bindings. */
+                            char target_key[32];
+                            snprintf(target_key, sizeof(target_key), "knob_%d", ki);
+                            /* We have the knob's cc + min/max already. Just
+                             * check if it has a modulator binding to mod_idx
+                             * by re-scanning src for the matching binding
+                             * substring near this knob. */
+                            /* Simpler: scan all bindings in src for
+                             *   type="modulator" position="mod_idx"
+                             *   parameter="MOD_AMOUNT" or "FREQUENCY"
+                             * tied to ANY knob — assume knob index in
+                             * document order matches ki. Then test if the
+                             * surrounding control has this knob's cc. */
+                            (void)target_key;
+                        }
+
+                        /* Find first knob whose binding targets this LFO. */
+                        const char *kp = src;
+                        int knob_walk_idx = 0;
+                        while (kp) {
+                            const char *c1 = strstr(kp, "<control");
+                            const char *c2 = strstr(kp, "<labeled-knob");
+                            const char *ctrl_start = NULL;
+                            size_t pat_len = 0;
+                            if (c1 && c2) {
+                                if (c1 < c2) { ctrl_start = c1; pat_len = 8; }
+                                else         { ctrl_start = c2; pat_len = 13; }
+                            } else if (c1) { ctrl_start = c1; pat_len = 8; }
+                            else if (c2)   { ctrl_start = c2; pat_len = 13; }
+                            else break;
+                            char nxt = ctrl_start[pat_len];
+                            if (nxt != ' ' && nxt != '\t' && nxt != '\n' &&
+                                nxt != '\r' && nxt != '>' && nxt != '/') {
+                                kp = ctrl_start + pat_len; continue;
+                            }
+                            const char *ctrl_tag_end = strchr(ctrl_start, '>');
+                            if (!ctrl_tag_end) break;
+                            int self_closed = (*(ctrl_tag_end - 1) == '/');
+                            const char *ctrl_close = NULL;
+                            if (!self_closed) {
+                                const char *e1 = strstr(ctrl_tag_end, "</control>");
+                                const char *e2 = strstr(ctrl_tag_end, "</labeled-knob>");
+                                if (e1 && e2)       ctrl_close = (e1 < e2) ? e1 : e2;
+                                else if (e1)        ctrl_close = e1;
+                                else if (e2)        ctrl_close = e2;
+                            }
+                            /* Search bindings inside this control for the
+                             * modulator targeting our mod_idx. */
+                            const char *bend_search = self_closed ? ctrl_tag_end : ctrl_close;
+                            if (bend_search && strstr(ctrl_tag_end + 1, needle) &&
+                                strstr(ctrl_tag_end + 1, needle) < bend_search) {
+                                const char *bind_scan = ctrl_tag_end + 1;
+                                while (bind_scan < bend_search) {
+                                    const char *bb = strstr(bind_scan, "<binding");
+                                    if (!bb || bb >= bend_search) break;
+                                    const char *bbe = strchr(bb, '>');
+                                    if (!bbe) break;
+                                    char bbtag[512];
+                                    int bbl = (int)(bbe - bb);
+                                    if (bbl > 511) bbl = 511;
+                                    memcpy(bbtag, bb, bbl);
+                                    bbtag[bbl] = '\0';
+                                    if (strstr(bbtag, needle)) {
+                                        char bparam[64];
+                                        xml_get_attr(bbtag, "parameter", bparam, sizeof(bparam));
+                                        if (knob_walk_idx < knob_count_local) {
+                                            const ds_knob_t *kn = &use_knobs[knob_walk_idx];
+                                            if (kn->cc_number >= 0) {
+                                                if (strcmp(bparam, "FREQUENCY") == 0
+                                                        && amp_lfo_freq_cc < 0) {
+                                                    amp_lfo_freq_cc = kn->cc_number;
+                                                    amp_lfo_freq = kn->min_value;
+                                                    amp_lfo_freq_delta = kn->max_value - kn->min_value;
+                                                }
+                                                if (strcmp(bparam, "MOD_AMOUNT") == 0
+                                                        && amp_lfo_depth_cc < 0) {
+                                                    amp_lfo_depth_cc = kn->cc_number;
+                                                    /* Base depth = 0 (knob at min); delta = max depth. */
+                                                    amp_lfo_depth_db = 0.0;
+                                                    amp_lfo_depth_delta = max_depth;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    bind_scan = bbe + 1;
+                                }
+                            }
+                            knob_walk_idx++;
+                            kp = self_closed ? ctrl_tag_end + 1
+                                              : (ctrl_close ? ctrl_close + 1 : ctrl_tag_end + 1);
+                        }
+                    }
+                    bp = bte + 1;
                 }
-                bp = bte + 1;
             }
-            lfop = strstr(lfo_close + 6, "<lfo");
+            cur = close + (is_lfo ? 6 : 11);
+            mod_idx++;
         }
     }
 
@@ -1390,11 +1509,27 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
          * but xsynth's default is too short; 0.5 s keeps piano tails alive. */
         pos += snprintf(sfz + pos, out_cap - pos, "ampeg_release=0.5\n");
     }
-    /* Phase 11: amp LFO from <modulators><lfo binding=LEVEL/AMP_VOLUME>. */
-    if (amp_lfo_freq > 0.0 && amp_lfo_depth_db > 0.0) {
+    /* Phase 11: amp LFO from <modulators><lfo binding=LEVEL/AMP_VOLUME>.
+     * `amp_lfo_freq_cc` set when a knob binds to type="modulator"
+     * parameter="FREQUENCY"; same for depth via MOD_AMOUNT. The base
+     * + delta lets the host drive the LFO live from those knobs. */
+    if (amp_lfo_freq > 0.0 || amp_lfo_freq_cc >= 0) {
         pos += snprintf(sfz + pos, out_cap - pos,
-                        "amplfo_freq=%.4f\namplfo_depth=%.2f\n",
-                        amp_lfo_freq, amp_lfo_depth_db);
+                        "amplfo_freq=%.4f\n", amp_lfo_freq);
+        if (amp_lfo_freq_cc >= 0) {
+            pos += snprintf(sfz + pos, out_cap - pos,
+                            "amplfo_freq_oncc%d=%.4f\n",
+                            amp_lfo_freq_cc, amp_lfo_freq_delta);
+        }
+    }
+    if (amp_lfo_depth_db > 0.0 || amp_lfo_depth_cc >= 0) {
+        pos += snprintf(sfz + pos, out_cap - pos,
+                        "amplfo_depth=%.2f\n", amp_lfo_depth_db);
+        if (amp_lfo_depth_cc >= 0) {
+            pos += snprintf(sfz + pos, out_cap - pos,
+                            "amplfo_depth_oncc%d=%.2f\n",
+                            amp_lfo_depth_cc, amp_lfo_depth_delta);
+        }
     }
     if (wrap_loop[0])
         pos += snprintf(sfz + pos, out_cap - pos, "loop_mode=%s\n",

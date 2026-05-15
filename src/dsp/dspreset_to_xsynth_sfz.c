@@ -236,12 +236,14 @@ typedef struct {
 
 static int parse_effects(const char *src, ds_effect_t fx[DS_MAX_FX]) {
     int count = 0;
-    const char *p = strstr(src, "<effects");
-    if (!p) return 0;
-    const char *end = strstr(p, "</effects>");
-    if (!end) end = src + strlen(src);
-
-    p = strstr(p, "<effect ");
+    /* Walk every `<effect ` tag in the document (note the trailing
+     * space — distinguishes from `<effects`). dspresets commonly
+     * have multiple `<effects/>` blocks (per-group, often self-closed
+     * + empty) plus a global `<effects>...</effects>` block. We need
+     * effects from all of them; just iterate every individual
+     * `<effect ` tag everywhere. */
+    const char *end = src + strlen(src);
+    const char *p = strstr(src, "<effect ");
     while (p && p < end && count < DS_MAX_FX) {
         const char *tag_end = strchr(p, '>');
         if (!tag_end || tag_end > end) break;

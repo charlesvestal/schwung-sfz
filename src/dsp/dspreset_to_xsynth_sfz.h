@@ -20,7 +20,7 @@
 extern "C" {
 #endif
 
-#define DS_MAX_KNOBS 16
+#define DS_MAX_KNOBS 32
 #define DS_MAX_TABS 8
 #define DS_MAX_TAB_NAME_LEN 24
 
@@ -44,7 +44,7 @@ typedef struct {
                              * instead of (or in addition to) the SFZ CC. */
     int   delay_time;       /* Phase 9: FX_DELAY_TIME binding */
     int   delay_feedback;   /* Phase 9: FX_FEEDBACK binding */
-    int   delay_mix;        /* Phase 9: FX_MIX binding */
+    int   delay_mix;        /* Phase 9: FX_WET_LEVEL on delay effect */
 } ds_knob_t;
 
 /* Phase 6.5: tab metadata — one entry per `<tab>` element in the

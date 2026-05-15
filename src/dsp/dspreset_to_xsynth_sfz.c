@@ -756,18 +756,29 @@ static const char *target_alias(const char *ds_param) {
     if (!ds_param || !ds_param[0]) return NULL;
     if (strcmp(ds_param, "FX_FILTER_FREQUENCY") == 0) return "Filter";
     if (strcmp(ds_param, "FX_FILTER_RESONANCE") == 0) return "Reso";
+    if (strcmp(ds_param, "FX_CENTER_FREQUENCY") == 0) return "Center";
     if (strcmp(ds_param, "FX_REVERB_WET_LEVEL")  == 0) return "Reverb";
     if (strcmp(ds_param, "FX_REVERB_ROOM_SIZE")  == 0) return "Room";
     if (strcmp(ds_param, "FX_REVERB_DAMPING")    == 0) return "Damp";
     if (strcmp(ds_param, "FX_DELAY_TIME")        == 0) return "DlyTime";
     if (strcmp(ds_param, "FX_DELAY_FEEDBACK")    == 0) return "DlyFb";
+    if (strcmp(ds_param, "FX_FEEDBACK")          == 0) return "Feedback";
     if (strcmp(ds_param, "FX_WET_LEVEL")         == 0) return "Wet";
+    if (strcmp(ds_param, "FX_MIX")               == 0) return "Mix";
+    if (strcmp(ds_param, "FX_MOD_RATE")          == 0) return "Rate";
+    if (strcmp(ds_param, "FX_MOD_DEPTH")         == 0) return "Depth";
+    if (strcmp(ds_param, "FX_STEREO_OFFSET")     == 0) return "Width";
     if (strcmp(ds_param, "FX_CHORUS_DEPTH")      == 0) return "ChrDepth";
     if (strcmp(ds_param, "FX_CHORUS_RATE")       == 0) return "ChrRate";
     if (strcmp(ds_param, "ENV_ATTACK")  == 0) return "Attack";
     if (strcmp(ds_param, "ENV_DECAY")   == 0) return "Decay";
     if (strcmp(ds_param, "ENV_SUSTAIN") == 0) return "Sustain";
     if (strcmp(ds_param, "ENV_RELEASE") == 0) return "Release";
+    if (strcmp(ds_param, "AMP_VOLUME")  == 0) return "Volume";
+    if (strcmp(ds_param, "TAG_VOLUME")  == 0) return "Volume";
+    if (strcmp(ds_param, "PAN")         == 0) return "Pan";
+    if (strcmp(ds_param, "ENABLED")     == 0) return "Enable";
+    if (strcmp(ds_param, "GROUP_TUNING") == 0) return "Tune";
     if (strcmp(ds_param, "LEVEL")       == 0) return "Level";
     if (strcmp(ds_param, "MOD_AMOUNT")  == 0) return "Mod";
     if (strcmp(ds_param, "FREQUENCY")   == 0) return "Freq";
@@ -827,10 +838,12 @@ static int binding_param_is_live(const char *parameter) {
            /* Phase 10: reverb wet routes to the channel reverb via the
             * plugin's set_param handler (not through xsynth). */
            strcmp(parameter, "FX_REVERB_WET_LEVEL") == 0 ||
-           /* Phase 9: delay parameters routed via plugin set_param. */
+           /* Phase 9: delay parameters routed via plugin set_param.
+            * FX_WET_LEVEL is the delay's wet control per DS
+            * convention (reverb has its own FX_REVERB_WET_LEVEL). */
            strcmp(parameter, "FX_DELAY_TIME") == 0 ||
            strcmp(parameter, "FX_FEEDBACK") == 0 ||
-           strcmp(parameter, "FX_MIX") == 0;
+           strcmp(parameter, "FX_WET_LEVEL") == 0;
 }
 
 /* Walk every `<labeled-knob>` / `<control>` element in document order and
@@ -984,7 +997,9 @@ static int enumerate_ui_knobs(const char *src,
             if (strcmp(param, "FX_REVERB_WET_LEVEL") == 0) any_reverb_wet = 1;
             if (strcmp(param, "FX_DELAY_TIME")       == 0) any_delay_time = 1;
             if (strcmp(param, "FX_FEEDBACK")         == 0) any_delay_fb   = 1;
-            if (strcmp(param, "FX_MIX")              == 0) any_delay_mix  = 1;
+            /* DS convention: delay wet uses FX_WET_LEVEL; FX_MIX is
+             * the chorus/phaser convention (not handled yet). */
+            if (strcmp(param, "FX_WET_LEVEL")        == 0) any_delay_mix  = 1;
             if (first_param[0] == '\0' && param[0]) {
                 strncpy(first_param, param, sizeof(first_param) - 1);
                 first_param[sizeof(first_param) - 1] = '\0';
@@ -1025,7 +1040,11 @@ static int enumerate_ui_knobs(const char *src,
         k->min_value     = cmin[0] ? atof(cmin) : 0.0;
         k->max_value     = cmax[0] ? atof(cmax) : 1.0;
         k->default_value = cval[0] ? atof(cval) : k->min_value;
-        k->cc_number     = next_cc++;
+        /* CC range 102..119 is "undefined controllers" — safe to
+         * commandeer for synthetic routing. Knobs past CC 119 get
+         * cc_number=-1 (no live CC, but still listed in the menu
+         * so they're discoverable). */
+        k->cc_number     = (next_cc <= 119) ? next_cc++ : -1;
         /* Phase 9/10: knobs targeting fundsp post-mix effects are
          * surfaced as live — the plugin routes their values at
          * set_param time. */
@@ -1039,7 +1058,19 @@ static int enumerate_ui_knobs(const char *src,
         (void)tabs;
 
         kc++;
-        p = self_closed ? tag_end + 1 : bind_end + 15; /* skip past closer */
+        /* Advance past the closing tag. bind_end points to the start
+         * of `</control>` (10 chars) or `</labeled-knob>` (15 chars).
+         * Previous code used a hardcoded +15 for both, which over-
+         * shot for `</control>` and made strstr skip the NEXT
+         * element on tightly-packed dspresets (K4-AirVoice et al.
+         * lost 7 of 18 knobs to this). Scan to `>` instead. */
+        if (self_closed) {
+            p = tag_end + 1;
+        } else {
+            p = bind_end;
+            while (*p && *p != '>') p++;
+            if (*p == '>') p++;
+        }
     }
     return kc;
 }
@@ -1187,7 +1218,11 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
             out_delay->enabled = 1;
             out_delay->delay_seconds = fx[i].delay_time[0] ? atof(fx[i].delay_time) : 0.25;
             out_delay->feedback      = fx[i].feedback[0]   ? atof(fx[i].feedback)   : 0.4;
-            out_delay->mix           = fx[i].mix[0]        ? atof(fx[i].mix)        : 0.5;
+            /* Default mix 0 (dry). Authors who want delay audible
+             * either set wetLevel/mix on the <effect> tag or bind a
+             * UI knob to FX_WET_LEVEL; either way overrides this. */
+            out_delay->mix           = fx[i].wet_level[0] ? atof(fx[i].wet_level)
+                                       : (fx[i].mix[0]    ? atof(fx[i].mix) : 0.0);
         }
     }
 

@@ -77,6 +77,11 @@ extern void          xshim_set_delay(XSynthHandle*, uint32_t enable,
 extern void          xshim_set_delay_time(XSynthHandle*, float time);
 extern void          xshim_set_delay_feedback(XSynthHandle*, float fb);
 extern void          xshim_set_delay_mix(XSynthHandle*, float mix);
+extern void          xshim_set_chorus(XSynthHandle*, uint32_t enable,
+                                        float rate, float depth);
+extern void          xshim_set_chorus_rate(XSynthHandle*, float rate);
+extern void          xshim_set_chorus_depth(XSynthHandle*, float depth);
+extern void          xshim_set_chorus_mix(XSynthHandle*, float mix);
 extern uint32_t      xshim_take_noteon_count(XSynthHandle*);
 extern void          xshim_take_render_breakdown(XSynthHandle*, uint32_t *out4);
 extern size_t        xshim_last_error(char *out_buf, size_t out_len);
@@ -385,15 +390,17 @@ static int load_sfz_file(xsynth_instance_t *inst, const char *path) {
 
     inst->knob_count = 0;
 
-    /* Phase 9/10: reset post-mix effects on every preset load so state
-     * from the previous preset doesn't leak. .dspreset path below
-     * re-installs as authored; .sfz path leaves both effects off. */
+    /* Phase 9/10/12: reset post-mix effects on every preset load so
+     * state from the previous preset doesn't leak. .dspreset path
+     * below re-installs as authored; .sfz path leaves all off. */
     if (inst->synth) {
         xshim_set_reverb(inst->synth, 0, 0.0f, 0.0f, 0.0f);
         xshim_set_reverb_wet(inst->synth, 0.0f);
         inst->reverb_wet = 0.0f;
         xshim_set_delay(inst->synth, 0, 0.0f, 0.0f);
         xshim_set_delay_mix(inst->synth, 0.0f);
+        xshim_set_chorus(inst->synth, 0, 0.0f, 0.0f);
+        xshim_set_chorus_mix(inst->synth, 0.0f);
     }
 
     /* .dspreset → convert to .converted.sfz next to source, load that. */
@@ -408,13 +415,15 @@ static int load_sfz_file(xsynth_instance_t *inst, const char *path) {
         inst->current_tab = 0;
         ds_reverb_cfg_t reverb_cfg = {0};
         ds_delay_cfg_t  delay_cfg  = {0};
+        ds_chorus_cfg_t chorus_cfg = {0};
         converted = convert_dspreset_to_xsynth_sfz(path,
                                                     inst->knobs,
                                                     &inst->knob_count,
                                                     inst->tabs,
                                                     &inst->tab_count,
                                                     &reverb_cfg,
-                                                    &delay_cfg);
+                                                    &delay_cfg,
+                                                    &chorus_cfg);
         /* Phase 10: install reverb from dspreset config (or remove
          * when not present). roomSize 0..1 maps to fundsp room param
          * (×30 to expand to seconds-of-prop-time). damping 0..1 →
@@ -443,6 +452,19 @@ static int load_sfz_file(xsynth_instance_t *inst, const char *path) {
                 xshim_set_reverb(inst->synth, 0, 0.0f, 0.0f, 0.0f);
                 inst->reverb_wet = 0.0f;
                 xshim_set_reverb_wet(inst->synth, 0.0f);
+            }
+            /* Phase 12: install/remove chorus per dspreset.
+             * SAFETY: force mix=0 at install — chorus auto-engagement
+             * caused distortion artifacts on some presets; user opts
+             * in via the dspreset's FX_MIX knob movement. */
+            if (chorus_cfg.enabled) {
+                xshim_set_chorus(inst->synth, 1,
+                                 (float)chorus_cfg.rate,
+                                 (float)chorus_cfg.depth);
+                xshim_set_chorus_mix(inst->synth, 0.0f);
+            } else {
+                xshim_set_chorus(inst->synth, 0, 0.0f, 0.0f);
+                xshim_set_chorus_mix(inst->synth, 0.0f);
             }
             /* Phase 9: install/remove delay per dspreset. mix becomes
              * the channel's delay_mix; time/feedback live-tweakable
@@ -799,6 +821,13 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
                     if (k->delay_time)     xshim_set_delay_time(inst->synth, (float)abs_v);
                     if (k->delay_feedback) xshim_set_delay_feedback(inst->synth, (float)abs_v);
                     if (k->delay_mix)      xshim_set_delay_mix(inst->synth, (float)abs_v);
+                }
+                /* Phase 12: route chorus knob bindings. */
+                if (inst->synth && (k->chorus_rate || k->chorus_depth || k->chorus_mix)) {
+                    double abs_v = inst->knob_current[idx];
+                    if (k->chorus_rate)  xshim_set_chorus_rate(inst->synth, (float)abs_v);
+                    if (k->chorus_depth) xshim_set_chorus_depth(inst->synth, (float)abs_v);
+                    if (k->chorus_mix)   xshim_set_chorus_mix(inst->synth, (float)abs_v);
                 }
             }
         }
@@ -1184,6 +1213,9 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
             if (k->delay_time)     xshim_set_delay_time(inst->synth, (float)abs_v);
             if (k->delay_feedback) xshim_set_delay_feedback(inst->synth, (float)abs_v);
             if (k->delay_mix)      xshim_set_delay_mix(inst->synth, (float)abs_v);
+            if (k->chorus_rate)    xshim_set_chorus_rate(inst->synth, (float)abs_v);
+            if (k->chorus_depth)   xshim_set_chorus_depth(inst->synth, (float)abs_v);
+            if (k->chorus_mix)     xshim_set_chorus_mix(inst->synth, (float)abs_v);
         }
         plugin_log("xsynth: async SFZ ready and applied");
     } else if (load_st == XSHIM_LOAD_ERROR) {

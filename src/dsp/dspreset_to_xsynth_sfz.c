@@ -1238,6 +1238,72 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
         if (gain_idx < 0 && strcmp(fx[i].type, "gain") == 0) gain_idx = i;
     }
 
+    /* === Phase 11: parse <modulators><lfo> blocks ===
+     * MVP: amp LFO (tremolo) only. Look for any <lfo> whose first
+     * <binding> targets LEVEL or AMP_VOLUME and emit `amplfo_freq` /
+     * `amplfo_depth` on <global> so every region picks them up.
+     * Pitch LFO (GROUP_TUNING) and filter LFO (FX_FILTER_FREQUENCY)
+     * targets are recognized but defer SFZ-side until a later phase
+     * (xsynth needs pitchlfo / fillfo support added). */
+    double amp_lfo_freq = 0.0;
+    double amp_lfo_depth_db = 0.0;
+    {
+        const char *mp = strstr(src, "<modulators");
+        const char *me = mp ? strstr(mp, "</modulators>") : NULL;
+        const char *lfop = mp ? strstr(mp, "<lfo") : NULL;
+        while (lfop && (!me || lfop < me)) {
+            const char *lfo_tag_end = strchr(lfop, '>');
+            if (!lfo_tag_end) break;
+            char lfo_tag[512];
+            int ll = (int)(lfo_tag_end - lfop);
+            if (ll > 511) ll = 511;
+            memcpy(lfo_tag, lfop, ll);
+            lfo_tag[ll] = '\0';
+            char freq_str[32], mod_amount_str[32];
+            xml_get_attr(lfo_tag, "frequency", freq_str, sizeof(freq_str));
+            xml_get_attr(lfo_tag, "modAmount", mod_amount_str, sizeof(mod_amount_str));
+            double freq = freq_str[0] ? atof(freq_str) : 1.0;
+            double mod_amount = mod_amount_str[0] ? atof(mod_amount_str) : 1.0;
+            /* Find matching </lfo> closer. */
+            const char *lfo_close = strstr(lfo_tag_end, "</lfo>");
+            if (!lfo_close) break;
+            /* Walk this LFO's bindings. */
+            const char *bp = lfo_tag_end + 1;
+            while (bp && bp < lfo_close) {
+                const char *bt = strstr(bp, "<binding");
+                if (!bt || bt >= lfo_close) break;
+                const char *bte = strchr(bt, '>');
+                if (!bte) break;
+                char btag[512];
+                int btl = (int)(bte - bt);
+                if (btl > 511) btl = 511;
+                memcpy(btag, bt, btl);
+                btag[btl] = '\0';
+                char param[64], omin[32], omax[32];
+                xml_get_attr(btag, "parameter", param, sizeof(param));
+                xml_get_attr(btag, "translationOutputMin", omin, sizeof(omin));
+                xml_get_attr(btag, "translationOutputMax", omax, sizeof(omax));
+                if ((strcmp(param, "LEVEL") == 0 || strcmp(param, "AMP_VOLUME") == 0)
+                        && amp_lfo_freq == 0.0) {
+                    double output_min = omin[0] ? atof(omin) : 0.0;
+                    double output_max = omax[0] ? atof(omax) : 1.0;
+                    double half_range = (output_max - output_min) * 0.5 * mod_amount;
+                    if (half_range < 0) half_range = -half_range;
+                    /* Linear amp swing → dB depth. half_range = ±swing
+                     * around 1.0; ±0.5 ≈ ±6 dB. Cap at 24 dB so an
+                     * outputMax=1 outputMin=0 tremolo doesn't sound
+                     * cartoonish (would be 40 dB literally). */
+                    double depth_db = 20.0 * log10(1.0 + half_range);
+                    if (depth_db > 24.0) depth_db = 24.0;
+                    amp_lfo_freq = freq;
+                    amp_lfo_depth_db = depth_db;
+                }
+                bp = bte + 1;
+            }
+            lfop = strstr(lfo_close + 6, "<lfo");
+        }
+    }
+
     /* === <global>: combined static defaults === */
     char *groups_tag = strstr(src, "<groups");
     char wrap_attack[64] = "", wrap_decay[64] = "";
@@ -1323,6 +1389,12 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
         /* Same fallback as the sfizz converter — many DS presets omit release
          * but xsynth's default is too short; 0.5 s keeps piano tails alive. */
         pos += snprintf(sfz + pos, out_cap - pos, "ampeg_release=0.5\n");
+    }
+    /* Phase 11: amp LFO from <modulators><lfo binding=LEVEL/AMP_VOLUME>. */
+    if (amp_lfo_freq > 0.0 && amp_lfo_depth_db > 0.0) {
+        pos += snprintf(sfz + pos, out_cap - pos,
+                        "amplfo_freq=%.4f\namplfo_depth=%.2f\n",
+                        amp_lfo_freq, amp_lfo_depth_db);
     }
     if (wrap_loop[0])
         pos += snprintf(sfz + pos, out_cap - pos, "loop_mode=%s\n",

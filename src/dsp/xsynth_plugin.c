@@ -385,6 +385,17 @@ static int load_sfz_file(xsynth_instance_t *inst, const char *path) {
 
     inst->knob_count = 0;
 
+    /* Phase 9/10: reset post-mix effects on every preset load so state
+     * from the previous preset doesn't leak. .dspreset path below
+     * re-installs as authored; .sfz path leaves both effects off. */
+    if (inst->synth) {
+        xshim_set_reverb(inst->synth, 0, 0.0f, 0.0f, 0.0f);
+        xshim_set_reverb_wet(inst->synth, 0.0f);
+        inst->reverb_wet = 0.0f;
+        xshim_set_delay(inst->synth, 0, 0.0f, 0.0f);
+        xshim_set_delay_mix(inst->synth, 0.0f);
+    }
+
     /* .dspreset → convert to .converted.sfz next to source, load that. */
     const char *ext = strrchr(path, '.');
     const char *load_path = path;
@@ -972,11 +983,14 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
              "{\"key\":\"knob_preset\",\"name\":\"Knob Preset\","
              "\"type\":\"int\",\"min\":0,\"max\":%d,\"default\":0}",
              tab_max);
-        /* Walk all knobs in order, keeping only the ones whose tab_idx
-         * matches `current_tab`. Up to 8 fit in the encoder row; any
-         * remaining slots get the placeholder. */
-        int slot = 0;
-        for (int i = 0; i < inst->knob_count && slot < 8; i++) {
+        /* Emit one chain_params entry per knob — the host needs both
+         * ui_hierarchy AND chain_params metadata to render a knob with
+         * a real label. Without a matching chain_params entry the
+         * host falls back to a generic "Knob N" placeholder (same
+         * symptom as the FUNVERB miss earlier in this branch). The
+         * encoder row hardware limit only shows the first ~8 at once,
+         * but the params menu walks the full list. */
+        for (int i = 0; i < inst->knob_count; i++) {
             ds_knob_t *k = &inst->knobs[i];
             if (inst->tab_count > 1 && k->tab_idx != inst->current_tab) continue;
             double t = (k->max_value != k->min_value)
@@ -989,14 +1003,6 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
                 "\"type\":\"float\",\"min\":0,\"max\":1,"
                 "\"default\":%g,\"step\":0.02,\"unit\":\"%%\"}",
                 k->key, k->label, t);
-            slot++;
-        }
-        for (; slot < 8; slot++) {
-            written += snprintf(buf + written, buf_len - written,
-                ",{\"key\":\"knob_%d_pad\",\"name\":\"—\","
-                "\"type\":\"float\",\"min\":0,\"max\":1,"
-                "\"default\":0,\"step\":0.02}",
-                slot);
         }
         written += snprintf(buf + written, buf_len - written, "]");
         return written;
@@ -1085,12 +1091,19 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
                 "{\"key\":\"gain\",\"label\":\"Gain\"},"
                 "{\"key\":\"voices\",\"label\":\"Polyphony\"},"
                 "{\"key\":\"knob_preset\",\"label\":\"Knob Preset\"}");
-        for (int i = 0; i < inst->knob_count; i++) {
-            ds_knob_t *k = &inst->knobs[i];
+        /* The host caches ui_hierarchy at module-load and never
+         * re-queries it across preset switches, while chain_params
+         * IS re-queried per preset. Emit ALL possible knob slots
+         * (knob_0..knob_DS_MAX_KNOBS-1) here as placeholders; the
+         * host drops any hierarchy entry whose key is missing from
+         * the live chain_params metadata, so non-existent knobs for
+         * the current preset disappear automatically. Result:
+         * preset switches show the right knob set without
+         * re-querying the hierarchy. */
+        for (int i = 0; i < DS_MAX_KNOBS; i++) {
             written += snprintf(buf + written, buf_len - written,
-                ",{\"key\":\"%s\",\"label\":\"%s\","
-                "\"min\":%g,\"max\":%g}",
-                k->key, k->label, k->min_value, k->max_value);
+                ",{\"key\":\"knob_%d\",\"label\":\"Knob %d\"}",
+                i, i + 1);
         }
         written += snprintf(buf + written, buf_len - written,
             ",{\"level\":\"jump\",\"label\":\"Jump To Library\"}"
@@ -1158,6 +1171,19 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
             int cc_val = (int)(t * 127.0 + 0.5);
             if (cc_val < 0) cc_val = 0; if (cc_val > 127) cc_val = 127;
             xshim_cc(inst->synth, 0, (uint8_t)k->cc_number, (uint8_t)cc_val);
+            /* Phase 9/10: knobs routed to channel effects need their
+             * default value pushed at load, otherwise the effect
+             * stays at the baked-in install defaults (which sounded
+             * "wildly loud and cartoonish" on K4-Acoustic — DS
+             * preset had no <effect> attrs, only knob value=). */
+            double abs_v = inst->knob_current[i];
+            if (k->reverb_wet) {
+                inst->reverb_wet = (float)t;  /* fraction is the wet level */
+                xshim_set_reverb_wet(inst->synth, (float)t);
+            }
+            if (k->delay_time)     xshim_set_delay_time(inst->synth, (float)abs_v);
+            if (k->delay_feedback) xshim_set_delay_feedback(inst->synth, (float)abs_v);
+            if (k->delay_mix)      xshim_set_delay_mix(inst->synth, (float)abs_v);
         }
         plugin_log("xsynth: async SFZ ready and applied");
     } else if (load_st == XSHIM_LOAD_ERROR) {

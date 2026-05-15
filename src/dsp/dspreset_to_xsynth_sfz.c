@@ -1254,6 +1254,11 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
     double amp_lfo_depth_db = 0.0;
     int    amp_lfo_freq_cc = -1, amp_lfo_depth_cc = -1;
     double amp_lfo_freq_delta = 0.0, amp_lfo_depth_delta = 0.0;
+    /* Phase 11: filter LFO (curly's wobble). Depth in cents. */
+    double fil_lfo_freq = 0.0;
+    double fil_lfo_depth_cents = 0.0;
+    int    fil_lfo_freq_cc = -1, fil_lfo_depth_cc = -1;
+    double fil_lfo_freq_delta = 0.0, fil_lfo_depth_delta = 0.0;
     {
         const char *mp = strstr(src, "<modulators");
         const char *me = mp ? strstr(mp, "</modulators>") : NULL;
@@ -1306,6 +1311,101 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
                     xml_get_attr(btag, "parameter", param, sizeof(param));
                     xml_get_attr(btag, "translationOutputMin", omin, sizeof(omin));
                     xml_get_attr(btag, "translationOutputMax", omax, sizeof(omax));
+                    if (strcmp(param, "FX_FILTER_FREQUENCY") == 0
+                            && fil_lfo_freq == 0.0 && fil_lfo_freq_cc < 0) {
+                        double output_min = omin[0] ? atof(omin) : 0.0;
+                        double output_max = omax[0] ? atof(omax) : 1.0;
+                        double full_swing_hz = (output_max - output_min) * 0.5;
+                        if (full_swing_hz < 0) full_swing_hz = -full_swing_hz;
+                        /* Rough Hz→cents mapping: 1200 cents = one octave.
+                         * We treat outputMax/2 as the Hz swing around a
+                         * nominal 1 kHz center; depth_cents=log2(1+swing/1k).
+                         * Works well at typical cutoff values (300-3kHz).
+                         * Cap at 2400 cents (±2 octaves). */
+                        double swing_ratio = full_swing_hz / 1000.0;
+                        double max_depth_cents = 1200.0 * log2(1.0 + swing_ratio);
+                        if (max_depth_cents > 2400.0) max_depth_cents = 2400.0;
+                        fil_lfo_freq = freq;
+                        fil_lfo_depth_cents = max_depth_cents * mod_amount;
+
+                        /* Knob routing for filter LFO (same pattern as
+                         * amp LFO below). Find knobs whose binding is
+                         * type="modulator" position="mod_idx"
+                         * parameter="FREQUENCY"/"MOD_AMOUNT" and route
+                         * via fillfo_freq_oncc / fillfo_depth_oncc. */
+                        char fneedle[96];
+                        snprintf(fneedle, sizeof(fneedle),
+                                 "type=\"modulator\" position=\"%d\"", mod_idx);
+                        const char *kp2 = src;
+                        int kwi = 0;
+                        while (kp2) {
+                            const char *c1 = strstr(kp2, "<control");
+                            const char *c2 = strstr(kp2, "<labeled-knob");
+                            const char *ctrl_start = NULL;
+                            size_t pat_len = 0;
+                            if (c1 && c2) {
+                                if (c1 < c2) { ctrl_start = c1; pat_len = 8; }
+                                else         { ctrl_start = c2; pat_len = 13; }
+                            } else if (c1) { ctrl_start = c1; pat_len = 8; }
+                            else if (c2)   { ctrl_start = c2; pat_len = 13; }
+                            else break;
+                            char nxt = ctrl_start[pat_len];
+                            if (nxt != ' ' && nxt != '\t' && nxt != '\n' &&
+                                nxt != '\r' && nxt != '>' && nxt != '/') {
+                                kp2 = ctrl_start + pat_len; continue;
+                            }
+                            const char *cte = strchr(ctrl_start, '>');
+                            if (!cte) break;
+                            int self_closed = (*(cte - 1) == '/');
+                            const char *ctrl_close = NULL;
+                            if (!self_closed) {
+                                const char *e1 = strstr(cte, "</control>");
+                                const char *e2 = strstr(cte, "</labeled-knob>");
+                                if (e1 && e2)       ctrl_close = (e1 < e2) ? e1 : e2;
+                                else if (e1)        ctrl_close = e1;
+                                else if (e2)        ctrl_close = e2;
+                            }
+                            const char *bes = self_closed ? cte : ctrl_close;
+                            if (bes) {
+                                const char *bsc = cte + 1;
+                                while (bsc < bes) {
+                                    const char *bb = strstr(bsc, "<binding");
+                                    if (!bb || bb >= bes) break;
+                                    const char *bbe = strchr(bb, '>');
+                                    if (!bbe) break;
+                                    char bbtag[512];
+                                    int bbl = (int)(bbe - bb);
+                                    if (bbl > 511) bbl = 511;
+                                    memcpy(bbtag, bb, bbl);
+                                    bbtag[bbl] = '\0';
+                                    if (strstr(bbtag, fneedle)) {
+                                        char bparam[64];
+                                        xml_get_attr(bbtag, "parameter", bparam, sizeof(bparam));
+                                        if (kwi < knob_count_local) {
+                                            const ds_knob_t *kn = &use_knobs[kwi];
+                                            if (kn->cc_number >= 0) {
+                                                if (strcmp(bparam, "FREQUENCY") == 0
+                                                        && fil_lfo_freq_cc < 0) {
+                                                    fil_lfo_freq_cc = kn->cc_number;
+                                                    fil_lfo_freq = kn->min_value;
+                                                    fil_lfo_freq_delta = kn->max_value - kn->min_value;
+                                                }
+                                                if (strcmp(bparam, "MOD_AMOUNT") == 0
+                                                        && fil_lfo_depth_cc < 0) {
+                                                    fil_lfo_depth_cc = kn->cc_number;
+                                                    fil_lfo_depth_cents = 0.0;
+                                                    fil_lfo_depth_delta = max_depth_cents;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    bsc = bbe + 1;
+                                }
+                            }
+                            kwi++;
+                            kp2 = self_closed ? cte + 1 : (ctrl_close ? ctrl_close + 1 : cte + 1);
+                        }
+                    }
                     if ((strcmp(param, "LEVEL") == 0 || strcmp(param, "AMP_VOLUME") == 0)
                             && amp_lfo_freq == 0.0 && amp_lfo_freq_cc < 0) {
                         double output_min = omin[0] ? atof(omin) : 0.0;
@@ -1531,6 +1631,25 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
             pos += snprintf(sfz + pos, out_cap - pos,
                             "amplfo_depth_oncc%d=%.2f\n",
                             amp_lfo_depth_cc, amp_lfo_depth_delta);
+        }
+    }
+    /* Phase 11: filter LFO. */
+    if (fil_lfo_freq > 0.0 || fil_lfo_freq_cc >= 0) {
+        pos += snprintf(sfz + pos, out_cap - pos,
+                        "fillfo_freq=%.4f\n", fil_lfo_freq);
+        if (fil_lfo_freq_cc >= 0) {
+            pos += snprintf(sfz + pos, out_cap - pos,
+                            "fillfo_freq_oncc%d=%.4f\n",
+                            fil_lfo_freq_cc, fil_lfo_freq_delta);
+        }
+    }
+    if (fil_lfo_depth_cents > 0.0 || fil_lfo_depth_cc >= 0) {
+        pos += snprintf(sfz + pos, out_cap - pos,
+                        "fillfo_depth=%.2f\n", fil_lfo_depth_cents);
+        if (fil_lfo_depth_cc >= 0) {
+            pos += snprintf(sfz + pos, out_cap - pos,
+                            "fillfo_depth_oncc%d=%.2f\n",
+                            fil_lfo_depth_cc, fil_lfo_depth_delta);
         }
     }
     if (wrap_loop[0])

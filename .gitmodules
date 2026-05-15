@@ -3,4 +3,5 @@
 	url = https://github.com/sfztools/sfizz.git
 [submodule "src/dsp/third_party/xsynth"]
 	path = src/dsp/third_party/xsynth
-	url = https://github.com/BlackMIDIDevs/xsynth.git
+	url = https://github.com/charlesvestal/xsynth.git
+	branch = schwung-fork

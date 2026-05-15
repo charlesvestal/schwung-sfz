@@ -586,7 +586,30 @@ static void apply_ui_overrides(const char *src,
                     }
                 } else if (position >= 0 && position < fx_count) {
                     ds_effect_t *f = &fx[position];
-                    if (strcmp(param, "FX_FILTER_FREQUENCY") == 0) {
+                    /* Only effects that we convert into the global biquad
+                     * (lowpass/highpass/bandpass/notch/peak) can host
+                     * cutoff/resonance live bindings. K4-Acoustic's Phaser
+                     * has its own FX_CENTER_FREQUENCY knob at position=1;
+                     * routing it into cutoff_oncc accumulated with the real
+                     * Filter knob at position=0 and pushed the voice biquad
+                     * past Nyquist — bilinear-transform instability
+                     * produced unbounded noise + NaN that silenced the
+                     * voice chain. */
+                    int is_filter_effect =
+                        strcmp(f->type, "lowpass") == 0 ||
+                        strcmp(f->type, "lowpass_1pl") == 0 ||
+                        strcmp(f->type, "lowpass_4pl") == 0 ||
+                        strcmp(f->type, "highpass") == 0 ||
+                        strcmp(f->type, "bandpass") == 0 ||
+                        strcmp(f->type, "notch") == 0 ||
+                        strcmp(f->type, "peak") == 0;
+                    /* Phase 7: FX_CENTER_FREQUENCY on a bandpass effect
+                     * routes through the same cutoff_oncc path as
+                     * FX_FILTER_FREQUENCY — xsynth's biquad doesn't
+                     * distinguish (the static fil_type=bpf_2p does). */
+                    if (is_filter_effect &&
+                        (strcmp(param, "FX_FILTER_FREQUENCY") == 0 ||
+                         strcmp(param, "FX_CENTER_FREQUENCY") == 0)) {
                         /* Phase 5: emit cutoff_oncc<CC>=<cents> when the
                          * knob has a synthetic CC. base_hz comes from the
                          * knob-min endpoint (silent-endpoint baseline);
@@ -618,7 +641,8 @@ static void apply_ui_overrides(const char *src,
                         } else {
                             strncpy(f->freq, effective, 31); f->freq[31] = '\0';
                         }
-                    } else if (strcmp(param, "FX_FILTER_RESONANCE") == 0) {
+                    } else if (is_filter_effect &&
+                               strcmp(param, "FX_FILTER_RESONANCE") == 0) {
                         if (knob_cc >= 0 &&
                             filter_res_out && filter_res_count_io &&
                             *filter_res_count_io < DS_MAX_KNOBS) {
@@ -835,6 +859,7 @@ static int binding_param_is_live(const char *parameter) {
            strcmp(parameter, "TAG_VOLUME") == 0 ||
            /* Phase 5: filter + pan live oncc. */
            strcmp(parameter, "FX_FILTER_FREQUENCY") == 0 ||
+           strcmp(parameter, "FX_CENTER_FREQUENCY") == 0 ||
            strcmp(parameter, "FX_FILTER_RESONANCE") == 0 ||
            strcmp(parameter, "PAN") == 0 ||
            /* Phase 10: reverb wet routes to the channel reverb via the
@@ -919,7 +944,8 @@ static int tab_index_at_position(const char *src, const char *pos,
 
 static int enumerate_ui_knobs(const char *src,
                               ds_knob_t knobs_out[DS_MAX_KNOBS],
-                              const ds_tab_t *tabs, int tab_count) {
+                              const ds_tab_t *tabs, int tab_count,
+                              const ds_effect_t *fx, int fx_count) {
     int kc = 0;
     int next_cc = 102;
     const char *p = src;
@@ -979,6 +1005,7 @@ static int enumerate_ui_knobs(const char *src,
         int any_live = 0;
         int any_reverb_wet = 0;
         int any_delay_time = 0, any_delay_fb = 0, any_delay_mix = 0;
+        int any_chorus_rate = 0, any_chorus_depth = 0, any_chorus_mix = 0;
         char first_param[64] = "";
         int first_position = -1;
         const char *bp = bind_start;
@@ -995,13 +1022,22 @@ static int enumerate_ui_knobs(const char *src,
             char param[64], pos_str[16];
             xml_get_attr(btag, "parameter", param, sizeof(param));
             xml_get_attr(btag, "position",  pos_str, sizeof(pos_str));
+            int pos_idx = pos_str[0] ? atoi(pos_str) : -1;
+            const char *fx_type = (pos_idx >= 0 && pos_idx < fx_count)
+                                  ? fx[pos_idx].type : "";
+            int is_chorus_target = (strcmp(fx_type, "chorus") == 0);
+            int is_delay_target  = (strcmp(fx_type, "delay") == 0);
             if (binding_param_is_live(param)) any_live = 1;
             if (strcmp(param, "FX_REVERB_WET_LEVEL") == 0) any_reverb_wet = 1;
             if (strcmp(param, "FX_DELAY_TIME")       == 0) any_delay_time = 1;
-            if (strcmp(param, "FX_FEEDBACK")         == 0) any_delay_fb   = 1;
-            /* DS convention: delay wet uses FX_WET_LEVEL; FX_MIX is
-             * the chorus/phaser convention (not handled yet). */
+            if (strcmp(param, "FX_FEEDBACK") == 0 && is_delay_target) any_delay_fb = 1;
             if (strcmp(param, "FX_WET_LEVEL")        == 0) any_delay_mix  = 1;
+            /* Phase 12: chorus knobs share FX_MOD_RATE/FX_MOD_DEPTH/
+             * FX_MIX with phaser. Disambiguate by the binding's
+             * position pointing at a `<effect type="chorus">`. */
+            if (strcmp(param, "FX_MOD_RATE") == 0  && is_chorus_target) any_chorus_rate  = 1;
+            if (strcmp(param, "FX_MOD_DEPTH") == 0 && is_chorus_target) any_chorus_depth = 1;
+            if (strcmp(param, "FX_MIX") == 0       && is_chorus_target) any_chorus_mix   = 1;
             if (first_param[0] == '\0' && param[0]) {
                 strncpy(first_param, param, sizeof(first_param) - 1);
                 first_param[sizeof(first_param) - 1] = '\0';
@@ -1047,15 +1083,19 @@ static int enumerate_ui_knobs(const char *src,
          * cc_number=-1 (no live CC, but still listed in the menu
          * so they're discoverable). */
         k->cc_number     = (next_cc <= 119) ? next_cc++ : -1;
-        /* Phase 9/10: knobs targeting fundsp post-mix effects are
+        /* Phase 9/10/12: knobs targeting fundsp post-mix effects are
          * surfaced as live — the plugin routes their values at
          * set_param time. */
         k->live          = any_live || any_reverb_wet ||
-                           any_delay_time || any_delay_fb || any_delay_mix;
+                           any_delay_time || any_delay_fb || any_delay_mix ||
+                           any_chorus_rate || any_chorus_depth || any_chorus_mix;
         k->reverb_wet    = any_reverb_wet;
         k->delay_time    = any_delay_time;
         k->delay_feedback= any_delay_fb;
         k->delay_mix     = any_delay_mix;
+        k->chorus_rate   = any_chorus_rate;
+        k->chorus_depth  = any_chorus_depth;
+        k->chorus_mix    = any_chorus_mix;
         k->tab_idx       = tab_index_at_position(src, p, tab_count);
         (void)tabs;
 
@@ -1085,11 +1125,13 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
                                       ds_tab_t  *out_tabs,
                                       int *out_tab_count,
                                       ds_reverb_cfg_t *out_reverb,
-                                      ds_delay_cfg_t  *out_delay) {
+                                      ds_delay_cfg_t  *out_delay,
+                                      ds_chorus_cfg_t *out_chorus) {
     if (out_knob_count) *out_knob_count = 0;
     if (out_tab_count)  *out_tab_count  = 0;
     if (out_reverb)     { memset(out_reverb, 0, sizeof(*out_reverb)); }
     if (out_delay)      { memset(out_delay,  0, sizeof(*out_delay));  }
+    if (out_chorus)     { memset(out_chorus, 0, sizeof(*out_chorus)); }
     /* Base directory for sample-path resolution (the dspreset's parent). */
     char base_dir[1024];
     snprintf(base_dir, sizeof(base_dir), "%s", path);
@@ -1165,7 +1207,8 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
     int tab_count_local = enumerate_ui_tabs(src, use_tabs);
     if (out_tabs && out_tab_count) *out_tab_count = tab_count_local;
     int knob_count_local = enumerate_ui_knobs(src, use_knobs,
-                                              use_tabs, tab_count_local);
+                                              use_tabs, tab_count_local,
+                                              fx, fx_count);
     if (out_knobs && out_knob_count) {
         *out_knob_count = knob_count_local;
     }
@@ -1225,6 +1268,15 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
              * UI knob to FX_WET_LEVEL; either way overrides this. */
             out_delay->mix           = fx[i].wet_level[0] ? atof(fx[i].wet_level)
                                        : (fx[i].mix[0]    ? atof(fx[i].mix) : 0.0);
+        }
+        if (out_chorus && !out_chorus->enabled &&
+            strcmp(fx[i].type, "chorus") == 0) {
+            out_chorus->enabled = 1;
+            /* Initial mix at 0 (dry) — author opts in via the
+             * `<effect mix=>` attr or a UI knob bound to FX_MIX. */
+            out_chorus->mix   = fx[i].mix[0]      ? atof(fx[i].mix)      : 0.0;
+            out_chorus->rate  = 0.7;  /* fundsp chorus default */
+            out_chorus->depth = 0.5;
         }
     }
 

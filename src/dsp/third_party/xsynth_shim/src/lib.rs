@@ -667,6 +667,54 @@ pub unsafe extern "C" fn xshim_set_delay_mix(handle: *mut XSynthHandle, mix: f32
     }));
 }
 
+/// MOVE / Phase 12: install / remove the channel stereo chorus.
+#[no_mangle]
+pub unsafe extern "C" fn xshim_set_chorus(
+    handle: *mut XSynthHandle,
+    enable: u32,
+    rate: f32,
+    depth: f32,
+) {
+    if handle.is_null() { return; }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        let params = if enable != 0 { Some((rate, depth)) } else { None };
+        h.group.send_event(SynthEvent::AllChannels(ChannelEvent::Config(
+            ChannelConfigEvent::SetChorus(params),
+        )));
+    }));
+}
+#[no_mangle]
+pub unsafe extern "C" fn xshim_set_chorus_rate(handle: *mut XSynthHandle, rate: f32) {
+    if handle.is_null() { return; }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        h.group.send_event(SynthEvent::AllChannels(ChannelEvent::Config(
+            ChannelConfigEvent::SetChorusRate(rate),
+        )));
+    }));
+}
+#[no_mangle]
+pub unsafe extern "C" fn xshim_set_chorus_depth(handle: *mut XSynthHandle, depth: f32) {
+    if handle.is_null() { return; }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        h.group.send_event(SynthEvent::AllChannels(ChannelEvent::Config(
+            ChannelConfigEvent::SetChorusDepth(depth),
+        )));
+    }));
+}
+#[no_mangle]
+pub unsafe extern "C" fn xshim_set_chorus_mix(handle: *mut XSynthHandle, mix: f32) {
+    if handle.is_null() { return; }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        h.group.send_event(SynthEvent::AllChannels(ChannelEvent::Config(
+            ChannelConfigEvent::SetChorusMix(mix),
+        )));
+    }));
+}
+
 /// MOVE: spawn burst limit. Max NoteOn events drained per render block;
 /// surplus events defer to subsequent blocks. Quantized chord bursts
 /// (e.g. sequence step lands 10 notes at once) overwhelm a single

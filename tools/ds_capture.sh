@@ -18,7 +18,14 @@ DUR="${5:-2.0}"
 TAIL="${6:-2.0}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-TOTAL=$(python3 -c "print(${DUR}+${TAIL})")
+# MOVE FORK / 2026-05-16: ffmpeg needs ~0.6s after start to begin
+# recording reliably; for short tests (e.g. 26_attack_fast with
+# DUR=0.2, TAIL=0.2) the recording window was finishing before
+# NoteOn was even sent. Pad TOTAL by FF_WARMUP so the MIDI lands
+# well inside the captured buffer. wav_diff trims leading silence
+# anyway.
+FF_WARMUP=1.0
+TOTAL=$(python3 -c "print(${DUR}+${TAIL}+${FF_WARMUP})")
 SETTLE=6.0   # let DS load the preset (samples can be many MB on disk)
 
 # Compute the ffmpeg input index for BlackHole 2ch (varies by machine).

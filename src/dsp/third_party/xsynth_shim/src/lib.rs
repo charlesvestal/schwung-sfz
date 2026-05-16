@@ -715,6 +715,78 @@ pub unsafe extern "C" fn xshim_set_chorus_mix(handle: *mut XSynthHandle, mix: f3
     }));
 }
 
+/// MOVE / Phase 12: install / remove the channel stereo phaser.
+#[no_mangle]
+pub unsafe extern "C" fn xshim_set_phaser(
+    handle: *mut XSynthHandle,
+    enable: u32,
+    rate: f32,
+    depth: f32,
+    feedback: f32,
+) {
+    if handle.is_null() { return; }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        let params = if enable != 0 { Some((rate, depth, feedback)) } else { None };
+        h.group.send_event(SynthEvent::AllChannels(ChannelEvent::Config(
+            ChannelConfigEvent::SetPhaser(params),
+        )));
+    }));
+}
+#[no_mangle]
+pub unsafe extern "C" fn xshim_set_phaser_rate(handle: *mut XSynthHandle, rate: f32) {
+    if handle.is_null() { return; }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        h.group.send_event(SynthEvent::AllChannels(ChannelEvent::Config(
+            ChannelConfigEvent::SetPhaserRate(rate),
+        )));
+    }));
+}
+#[no_mangle]
+pub unsafe extern "C" fn xshim_set_phaser_depth(handle: *mut XSynthHandle, depth: f32) {
+    if handle.is_null() { return; }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        h.group.send_event(SynthEvent::AllChannels(ChannelEvent::Config(
+            ChannelConfigEvent::SetPhaserDepth(depth),
+        )));
+    }));
+}
+#[no_mangle]
+pub unsafe extern "C" fn xshim_set_phaser_feedback(handle: *mut XSynthHandle, fb: f32) {
+    if handle.is_null() { return; }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        h.group.send_event(SynthEvent::AllChannels(ChannelEvent::Config(
+            ChannelConfigEvent::SetPhaserFeedback(fb),
+        )));
+    }));
+}
+#[no_mangle]
+pub unsafe extern "C" fn xshim_set_phaser_mix(handle: *mut XSynthHandle, mix: f32) {
+    if handle.is_null() { return; }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        h.group.send_event(SynthEvent::AllChannels(ChannelEvent::Config(
+            ChannelConfigEvent::SetPhaserMix(mix),
+        )));
+    }));
+}
+
+/// MOVE / Phase 13: channel M/S stereo widener. `width` is the side-
+/// signal scale factor (1.0 = neutral, 0 = mono, 2.0 = exaggerated).
+#[no_mangle]
+pub unsafe extern "C" fn xshim_set_widener(handle: *mut XSynthHandle, width: f32) {
+    if handle.is_null() { return; }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        h.group.send_event(SynthEvent::AllChannels(ChannelEvent::Config(
+            ChannelConfigEvent::SetWidener(width),
+        )));
+    }));
+}
+
 /// MOVE: spawn burst limit. Max NoteOn events drained per render block;
 /// surplus events defer to subsequent blocks. Quantized chord bursts
 /// (e.g. sequence step lands 10 notes at once) overwhelm a single

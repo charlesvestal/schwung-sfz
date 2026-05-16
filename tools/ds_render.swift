@@ -1,106 +1,140 @@
-// ds_render — host the DecentSampler AU offline, send MIDI, write WAV.
+// ds_render — drive DecentSampler AU directly via AudioUnit C APIs.
+// AVAudioEngine.manualRendering doesn't advance JUCE's async preset
+// loader; using the C API + CFRunLoop pumping + an "OfflineRender"
+// hint does.
 //
-//   swift ds_render.swift <preset.dspreset> <output.wav> [note=60] [vel=100] \
-//                         [duration_s=2.0] [tail_s=2.0] [rate=44100]
-//
-// Loads the DS AU (aumu Dsmp Dldy), tries to load the given .dspreset via
-// the AU's fullState (key "DS_PRESET_PATH" — DS happens to honor this on
-// load; if a future DS build changes the key, dump the state from a Logic
-// session and inspect). Renders offline via AVAudioEngine.manualRendering.
+//   swift ds_render.swift <preset.dspreset> <out.wav> [note=60] [vel=100] \
+//                          [duration_s=2.0] [tail_s=2.0] [rate=44100]
 
 import Foundation
+import AudioToolbox
 import AVFoundation
 
-// MARK: - args
 let args = CommandLine.arguments
 guard args.count >= 3 else {
-    FileHandle.standardError.write("usage: ds_render <preset.dspreset> <out.wav> [note] [vel] [dur_s] [tail_s] [rate]\n".data(using: .utf8)!)
+    FileHandle.standardError.write("usage: ds_render <preset.dspreset> <out.wav>...\n".data(using: .utf8)!)
     exit(1)
 }
 let presetPath = (args[1] as NSString).expandingTildeInPath
 let outPath    = (args[2] as NSString).expandingTildeInPath
-// chdir to the preset's directory so DS's relative sample-path lookup
-// finds the .wav files (DS stores `_samplePath` as a working-directory
-// hint; it falls back to cwd otherwise).
-let presetDir = (presetPath as NSString).deletingLastPathComponent
-FileManager.default.changeCurrentDirectoryPath(presetDir)
 let note: UInt8 = UInt8(args.count > 3 ? Int(args[3]) ?? 60 : 60)
 let vel:  UInt8 = UInt8(args.count > 4 ? Int(args[4]) ?? 100 : 100)
-let durS:    Double = args.count > 5 ? Double(args[5]) ?? 2.0 : 2.0
-let tailS:   Double = args.count > 6 ? Double(args[6]) ?? 2.0 : 2.0
+let durS:  Double = args.count > 5 ? Double(args[5]) ?? 2.0 : 2.0
+let tailS: Double = args.count > 6 ? Double(args[6]) ?? 2.0 : 2.0
 let sampleRate: Double = args.count > 7 ? Double(args[7]) ?? 44100 : 44100
 
-// MARK: - load DS AU
-let desc = AudioComponentDescription(
-    componentType: kAudioUnitType_MusicDevice,
-    componentSubType: 0x44736D70,   // 'Dsmp'
-    componentManufacturer: 0x446C6479, // 'Dldy'
-    componentFlags: 0, componentFlagsMask: 0)
+let presetDir = (presetPath as NSString).deletingLastPathComponent
+FileManager.default.changeCurrentDirectoryPath(presetDir)
 
-let engine = AVAudioEngine()
-let semaphore = DispatchSemaphore(value: 0)
-var dsUnit: AVAudioUnit?
-var loadError: Error?
-AVAudioUnit.instantiate(with: desc, options: []) { unit, err in
-    dsUnit = unit
-    loadError = err
-    semaphore.signal()
-}
-semaphore.wait()
-guard let ds = dsUnit, loadError == nil else {
-    FileHandle.standardError.write("instantiate failed: \(String(describing: loadError))\n".data(using: .utf8)!)
+// ----- 1) instantiate DS AU directly via the C API -----
+var desc = AudioComponentDescription(
+    componentType: kAudioUnitType_MusicDevice,
+    componentSubType: 0x44736D70,
+    componentManufacturer: 0x446C6479,
+    componentFlags: 0, componentFlagsMask: 0)
+guard let comp = AudioComponentFindNext(nil, &desc) else {
+    FileHandle.standardError.write("DS AU not found\n".data(using: .utf8)!)
     exit(2)
 }
+var unitOpt: AudioUnit? = nil
+var st = AudioComponentInstanceNew(comp, &unitOpt)
+guard st == noErr, let unit = unitOpt else {
+    FileHandle.standardError.write("instance new: \(st)\n".data(using: .utf8)!)
+    exit(3)
+}
 
-engine.attach(ds)
-let stereoFormat = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 2)!
-engine.connect(ds, to: engine.mainMixerNode, format: stereoFormat)
+// Hint offline render (some AUs disable the audio-thread requirement here).
+var off: UInt32 = 1
+_ = AudioUnitSetProperty(unit, kAudioUnitProperty_OfflineRender,
+                          kAudioUnitScope_Global, 0,
+                          &off, UInt32(MemoryLayout<UInt32>.size))
 
-// MARK: - load the dspreset via JUCE plugin state
-// DS is a JUCE plugin; its state lives under fullState key
-// "jucePluginState" as a 'VC2!'-magic blob containing XML where
-// `_libraryUrl` holds the file URL of the .dspreset. Build the XML,
-// wrap it in the JUCE blob format, drop it on the AU.
+// ----- 2) format: NON-interleaved stereo (CoreAudio's canonical AU layout) -----
+var fmt = AudioStreamBasicDescription(
+    mSampleRate: sampleRate,
+    mFormatID: kAudioFormatLinearPCM,
+    mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked
+                | kAudioFormatFlagIsNonInterleaved,
+    mBytesPerPacket: 4, mFramesPerPacket: 1,
+    mBytesPerFrame: 4, mChannelsPerFrame: 2,
+    mBitsPerChannel: 32, mReserved: 0)
+st = AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat,
+                           kAudioUnitScope_Output, 0,
+                           &fmt, UInt32(MemoryLayout<AudioStreamBasicDescription>.size))
+guard st == noErr else {
+    FileHandle.standardError.write("set format: \(st)\n".data(using: .utf8)!)
+    exit(4)
+}
+
+var maxFrames: UInt32 = 4096
+_ = AudioUnitSetProperty(unit, kAudioUnitProperty_MaximumFramesPerSlice,
+                          kAudioUnitScope_Global, 0,
+                          &maxFrames, UInt32(MemoryLayout<UInt32>.size))
+
+st = AudioUnitInitialize(unit)
+guard st == noErr else {
+    FileHandle.standardError.write("AudioUnitInitialize: \(st)\n".data(using: .utf8)!)
+    exit(5)
+}
+
+// ----- 3) set state pointing at our preset -----
 let fileURL = URL(fileURLWithPath: presetPath)
 let urlString = fileURL.absoluteString
-// Generate a security-scoped bookmark — DS requires one to actually
-// follow the URL (an empty `_libraryBookmark` makes it reset URL=""
-// silently). Bookmarks are file URL → opaque data; base64-encoded
-// into the XML attribute.
 var bookmarkB64 = ""
-do {
-    let bd = try fileURL.bookmarkData(options: [.withSecurityScope],
-                                      includingResourceValuesForKeys: nil,
-                                      relativeTo: nil)
+if let bd = try? fileURL.bookmarkData(options: [.withSecurityScope],
+                                     includingResourceValuesForKeys: nil,
+                                     relativeTo: nil) {
     bookmarkB64 = bd.base64EncodedString()
-} catch {
-    FileHandle.standardError.write("bookmark create failed: \(error)\n".data(using: .utf8)!)
 }
 let xml = """
-<?xml version="1.0" encoding="UTF-8"?> <DecentSampler _presetName="\(fileURL.lastPathComponent)" _libraryUrl="\(urlString)" _libraryCanonicalUrl="\(urlString)" _samplePath="" _sampleLibraryId="0" _libraryBookmark="\(bookmarkB64)" _tuningA69Frequency="440.0" _velocityPreprocessorOutLow="0" _velocityPreprocessorOutHigh="127" _velocityPreprocessorDrive="0.0" _velocityPreprocessorCompression="0.0" _velocityPreprocessorRandom="0" _mpeTimbreSensitivity="0.0" _mpeTimbreMin="0.0" _mpeTimbreMax="1.0" _mpePressureSensitivity="0.0" _mpePressureMin="0.0" _mpePressureMax="1.0"><ui/><effects/><groups/><tags/><buses/><midi/><modulators/><noteSequences/></DecentSampler>
+<?xml version="1.0" encoding="UTF-8"?> <DecentSampler _presetName="\(fileURL.lastPathComponent)" _libraryUrl="\(urlString)" _libraryCanonicalUrl="\(urlString)" _samplePath="\(presetDir)" _sampleLibraryId="0" _libraryBookmark="\(bookmarkB64)" _tuningA69Frequency="440.0" _velocityPreprocessorOutLow="0" _velocityPreprocessorOutHigh="127" _velocityPreprocessorDrive="0.0" _velocityPreprocessorCompression="0.0" _velocityPreprocessorRandom="0" _mpeTimbreSensitivity="0.0" _mpeTimbreMin="0.0" _mpeTimbreMax="1.0" _mpePressureSensitivity="0.0" _mpePressureMin="0.0" _mpePressureMax="1.0"><ui/><effects/><groups/><tags/><buses/><midi/><modulators/><noteSequences/></DecentSampler>
 """
 let xmlBytes = Array(xml.utf8)
-var jucePluginState = Data()
-jucePluginState.append(contentsOf: [0x56, 0x43, 0x32, 0x21])  // 'VC2!'
+var juceData = Data([0x56, 0x43, 0x32, 0x21])
 var xmlLen = UInt32(xmlBytes.count).littleEndian
-withUnsafeBytes(of: &xmlLen) { jucePluginState.append(contentsOf: $0) }
-jucePluginState.append(contentsOf: xmlBytes)
+withUnsafeBytes(of: &xmlLen) { juceData.append(contentsOf: $0) }
+juceData.append(contentsOf: xmlBytes)
 
-let cls: [String: Any] = [
+let dict: NSDictionary = [
     "type":            Int(desc.componentType),
     "subtype":         Int(desc.componentSubType),
     "manufacturer":    Int(desc.componentManufacturer),
     "version":         0,
-    "data":            Data(),
-    "jucePluginState": jucePluginState,
+    "data":            NSData(),
+    "jucePluginState": juceData as NSData,
     "name":            "Untitled",
 ]
-// Defer setting state until AFTER engine.start() — starting the engine
-// re-initializes the AU and would otherwise wipe whatever we set.
-// (Marker — actual set happens below.)
+var dictRef: CFPropertyList? = dict as CFPropertyList
+let setSt = AudioUnitSetProperty(unit, kAudioUnitProperty_ClassInfo,
+                                  kAudioUnitScope_Global, 0,
+                                  &dictRef,
+                                  UInt32(MemoryLayout<CFPropertyList?>.size))
+FileHandle.standardError.write("[ds_render] ClassInfo set: \(setSt)\n".data(using: .utf8)!)
 
-// MARK: - prepare offline rendering
-let outURL = URL(fileURLWithPath: outPath)
+// ----- 4) pump the run loop so JUCE's async loader fires -----
+let loadDeadline = Date().addingTimeInterval(8.0)
+while Date() < loadDeadline {
+    RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+}
+
+// Diagnostic dump.
+var classOut: CFPropertyList? = nil
+var classSize = UInt32(MemoryLayout<CFPropertyList?>.size)
+let getSt = AudioUnitGetProperty(unit, kAudioUnitProperty_ClassInfo,
+                                  kAudioUnitScope_Global, 0,
+                                  &classOut, &classSize)
+if getSt == noErr, let d = classOut as? [String: Any],
+   let jd = d["jucePluginState"] as? Data {
+    let bx = jd.subdata(in: 8..<jd.count)
+    try? bx.write(to: URL(fileURLWithPath: "/tmp/ds_state_after.xml"))
+    let s = String(data: bx, encoding: .utf8) ?? ""
+    FileHandle.standardError.write("[ds_render] state-after (\(bx.count)B): \(String(s.prefix(200)))\n".data(using: .utf8)!)
+}
+
+// ----- 5) output WAV -----
+let stereoFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                               sampleRate: sampleRate, channels: 2,
+                               interleaved: false)!
 let outSettings: [String: Any] = [
     AVFormatIDKey: kAudioFormatLinearPCM,
     AVLinearPCMBitDepthKey: 16,
@@ -110,114 +144,74 @@ let outSettings: [String: Any] = [
     AVSampleRateKey: sampleRate,
     AVNumberOfChannelsKey: 2,
 ]
-// Use an optional so we can release it before exit to flush the WAV
-// header (AVAudioFile only finalizes RIFF size on deinit).
-var outFile: AVAudioFile? = nil
-do {
-    outFile = try AVAudioFile(forWriting: outURL, settings: outSettings,
-                              commonFormat: .pcmFormatFloat32, interleaved: false)
-} catch {
-    FileHandle.standardError.write("open out: \(error)\n".data(using: .utf8)!)
-    exit(3)
-}
+var outFile: AVAudioFile? = try AVAudioFile(forWriting: URL(fileURLWithPath: outPath),
+                                             settings: outSettings,
+                                             commonFormat: .pcmFormatFloat32,
+                                             interleaved: false)
 
-let blockFrames: AVAudioFrameCount = 128
-do {
-    try engine.enableManualRenderingMode(.offline,
-        format: stereoFormat,
-        maximumFrameCount: blockFrames)
-} catch {
-    FileHandle.standardError.write("manualRendering: \(error)\n".data(using: .utf8)!)
-    exit(4)
-}
-try? engine.start()
+// ----- 6) render via AudioUnitRender. Non-interleaved → 2 buffers. -----
+let block: UInt32 = 256
+let chBytes = Int(block) * 4  // 1 ch × 4 bytes
+let rawL = UnsafeMutableRawPointer.allocate(byteCount: chBytes, alignment: 4)
+let rawR = UnsafeMutableRawPointer.allocate(byteCount: chBytes, alignment: 4)
+defer { rawL.deallocate(); rawR.deallocate() }
+let abl = AudioBufferList.allocate(maximumBuffers: 2)
+defer { abl.unsafeMutablePointer.deallocate() }
+abl[0] = AudioBuffer(mNumberChannels: 1, mDataByteSize: UInt32(chBytes), mData: rawL)
+abl[1] = AudioBuffer(mNumberChannels: 1, mDataByteSize: UInt32(chBytes), mData: rawR)
 
-// NOW apply the JUCE state, so engine.start()'s AU init doesn't wipe it.
-ds.auAudioUnit.fullState = cls
-Thread.sleep(forTimeInterval: 5.0)
-if let back = ds.auAudioUnit.fullState,
-   let bjuce = back["jucePluginState"] as? Data {
-    let bxml = bjuce.subdata(in: 8..<bjuce.count)
-    try? bxml.write(to: URL(fileURLWithPath: "/tmp/ds_state_after.xml"))
-    FileHandle.standardError.write("[ds_render] dumped state (\(bxml.count) bytes)\n".data(using: .utf8)!)
-}
-
-// MARK: - MIDI scheduling helper
-// Prefer the AUv3 scheduleMIDIEventListBlock (matches how a modern host
-// like Logic delivers MIDI), fall back to MusicDeviceMIDIEvent.
-let mdUnit = ds.audioUnit
-typealias MDMIDIEventFn = @convention(c) (AudioUnit, UInt32, UInt32, UInt32, UInt32) -> OSStatus
-let musicDeviceMIDIEvent: MDMIDIEventFn = MusicDeviceMIDIEvent
-let midiListBlock = ds.auAudioUnit.scheduleMIDIEventListBlock
+var ts = AudioTimeStamp()
+ts.mFlags = .sampleTimeValid
+ts.mSampleTime = 0
+var flags: AudioUnitRenderActionFlags = []
 
 func sendMIDI(_ status: UInt8, _ d1: UInt8, _ d2: UInt8) {
-    if let block = midiListBlock {
-        var words: [UInt32] = [UInt32(status) << 16 | UInt32(d1) << 8 | UInt32(d2)]
-        words.withUnsafeMutableBufferPointer { buf in
-            let raw = UnsafeMutableRawPointer(buf.baseAddress!)
-            // MIDIEventList header: numPackets, then packets (timestamp + wordCount + words[])
-            var list = MIDIEventList()
-            list.protocol = ._1_0
-            list.numPackets = 1
-            list.packet.timeStamp = 0
-            list.packet.wordCount = 1
-            withUnsafeMutablePointer(to: &list.packet.words) { wp in
-                wp.withMemoryRebound(to: UInt32.self, capacity: 64) { p in
-                    p[0] = UInt32(status) << 16 | UInt32(d1) << 8 | UInt32(d2)
-                }
-            }
-            _ = raw  // suppress unused warning
-            _ = block(AUEventSampleTimeImmediate, 0, &list)
-        }
-    } else {
-        _ = musicDeviceMIDIEvent(mdUnit, UInt32(status), UInt32(d1), UInt32(d2), 0)
-    }
+    _ = MusicDeviceMIDIEvent(unit, UInt32(status), UInt32(d1), UInt32(d2), 0)
 }
 
-// MARK: - render
-let renderBuf = AVAudioPCMBuffer(pcmFormat: stereoFormat, frameCapacity: blockFrames)!
-let noteFrames: Int64 = Int64(durS  * sampleRate)
-let tailFrames: Int64 = Int64(tailS * sampleRate)
-let totalFrames: Int64 = noteFrames + tailFrames
+let preFrames = Int64(sampleRate * 1.0)
+let noteFrames = Int64(durS * sampleRate)
+let tailFrames = Int64(tailS * sampleRate)
 
-// Pre-roll: render ~1s of blocks WITHOUT MIDI so DS can finish its
-// async preset / sample load before we send the NoteOn. The block
-// rendering drains JUCE's audio-thread callbacks which is what
-// actually advances the loader. Output discarded.
-let preRollFrames = Int64(sampleRate * 1.0)
-var preRolled: Int64 = 0
-while preRolled < preRollFrames {
-    let want = min(AVAudioFrameCount(preRollFrames - preRolled), blockFrames)
-    _ = try engine.renderOffline(want, to: renderBuf)
-    preRolled += Int64(want)
+let pcmBuf = AVAudioPCMBuffer(pcmFormat: stereoFmt, frameCapacity: block)!
+
+var pre: Int64 = 0
+while pre < preFrames {
+    let want = UInt32(min(Int64(block), preFrames - pre))
+    _ = AudioUnitRender(unit, &flags, &ts, 0, want, abl.unsafeMutablePointer)
+    ts.mSampleTime += Double(want)
+    pre += Int64(want)
+    RunLoop.current.run(mode: .default, before: Date())
 }
 
-// NoteOn now (BEFORE the first scored render block).
 sendMIDI(0x90, note, vel)
 
 var rendered: Int64 = 0
-var noteReleased = false
-while rendered < totalFrames {
-    if !noteReleased && rendered >= noteFrames {
+var released = false
+let total = noteFrames + tailFrames
+while rendered < total {
+    if !released && rendered >= noteFrames {
         sendMIDI(0x80, note, 0)
-        noteReleased = true
+        released = true
     }
-    let want = min(AVAudioFrameCount(totalFrames - rendered), blockFrames)
-    do {
-        let st = try engine.renderOffline(want, to: renderBuf)
-        if st != .success { break }
-        try outFile!.write(from: renderBuf)
-        rendered += Int64(want)
-    } catch {
-        FileHandle.standardError.write("render: \(error)\n".data(using: .utf8)!)
-        exit(5)
+    let want = UInt32(min(Int64(block), total - rendered))
+    let rs = AudioUnitRender(unit, &flags, &ts, 0, want, abl.unsafeMutablePointer)
+    if rs != noErr {
+        FileHandle.standardError.write("render: \(rs)\n".data(using: .utf8)!)
+        break
     }
+    ts.mSampleTime += Double(want)
+    pcmBuf.frameLength = want
+    let dstL = pcmBuf.floatChannelData![0]
+    let dstR = pcmBuf.floatChannelData![1]
+    let srcL = rawL.bindMemory(to: Float.self, capacity: Int(want))
+    let srcR = rawR.bindMemory(to: Float.self, capacity: Int(want))
+    for i in 0..<Int(want) { dstL[i] = srcL[i]; dstR[i] = srcR[i] }
+    try? outFile?.write(from: pcmBuf)
+    rendered += Int64(want)
 }
 
-engine.stop()
-// Release AVAudioFile so its deinit flushes the RIFF size into the
-// WAV header. Without this, the file's RIFF size stays at 0 (whatever
-// it was when first opened) and `wave` / `afinfo` see 0 frames even
-// though all the audio bytes are on disk.
+AudioUnitUninitialize(unit)
+AudioComponentInstanceDispose(unit)
 outFile = nil
 FileHandle.standardError.write("[ds_render] wrote \(rendered) frames to \(outPath)\n".data(using: .utf8)!)

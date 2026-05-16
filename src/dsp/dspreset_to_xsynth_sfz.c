@@ -646,22 +646,94 @@ static void apply_ui_overrides(const char *src,
                         if (knob_cc >= 0 &&
                             filter_res_out && filter_res_count_io &&
                             *filter_res_count_io < DS_MAX_KNOBS) {
-                            double v_at_min = apply_binding_xform(bind_tag, knob_min,
+                            double q_at_min = apply_binding_xform(bind_tag, knob_min,
                                                                   knob_max, knob_min);
-                            double v_at_max = apply_binding_xform(bind_tag, knob_min,
+                            double q_at_max = apply_binding_xform(bind_tag, knob_min,
                                                                   knob_max, knob_max);
-                            /* DS resonance ranges 0..1 (Q-like). xsynth's
-                             * SFZ `resonance` is dB. Pass through directly
-                             * (matches existing static behavior, ~0.7 ≈ 0
-                             * dB). Future: scale to a fuller dB range. */
+                            /* MOVE FORK / 2026-05-16: DS resonance is a
+                             * Q-like multiplier (≈0.7 Butterworth, >1 peaks
+                             * toward self-oscillation). xsynth-core
+                             * computes biquad Q as
+                             *   db_to_amp(res_dB) · Q_BUTTERWORTH (0.7071)
+                             * so the conversion is
+                             *   dB = 20·log10(ds_res / 0.7071)
+                             *     = 20·log10(ds_res) + 3.01
+                             * Apply to BOTH endpoints (not just min) so
+                             * the oncc delta is in dB units — previously
+                             * we passed Q raw, and the knob's live range
+                             * never reached the authored peak. K4-Acoustic's
+                             * resonance knob (0..2) was dead at the top end
+                             * because we emitted oncc=2 (= +2 dB) instead
+                             * of oncc=12 (= Q=2). */
+                            if (q_at_min < 1e-3) q_at_min = 1e-3;
+                            if (q_at_max < 1e-3) q_at_max = 1e-3;
+                            /* MOVE FORK / 2026-05-16: impulse-response
+                             * probe at cutoff=2 kHz, ds_res=2 shows DS
+                             * peak = +6 dB at cutoff (Q=2). xsynth
+                             * computes Q = db_to_amp(dB)·0.7071, so
+                             *   dB = 20·log10(Q / 0.7071)
+                             *      = 20·log10(ds_res) + 3.01
+                             * Earlier noise-rms probe suggested no
+                             * offset, but that was conflating two
+                             * issues: the static formula AND DS's
+                             * natural Q rolloff as cutoff → Nyquist
+                             * (which the bilinear biquad already
+                             * reproduces). With the offset back,
+                             * impulse-response peak heights match
+                             * within 0.5 dB at audible cutoffs. */
+                            double db_min = 20.0 * log10(q_at_min) + 3.01;
+                            double db_max = 20.0 * log10(q_at_max) + 3.01;
                             ds_filter_res_oncc_t *e =
                                 &filter_res_out[*filter_res_count_io];
                             e->cc_number = knob_cc;
-                            e->base_db   = v_at_min;
-                            e->db_delta  = v_at_max - v_at_min;
-                            e->curve_id  = -1; /* linear ok for resonance */
+                            e->base_db   = db_min;
+                            e->db_delta  = db_max - db_min;
+                            /* MOVE FORK / 2026-05-16: hand-build the
+                             * Q→dB curve so it matches the runtime
+                             * formula exactly. build_curve(kind=0)
+                             * uses lin_to_db (-80 dB floor on
+                             * 0-input), which produces a 23 dB range
+                             * mismatch vs my 20·log10+3.01 endpoints
+                             * — the runtime then applies a smaller
+                             * dB span to a bigger curve fraction,
+                             * biasing the whole knob travel toward
+                             * high Q (K4 res knob at 18% produced
+                             * audible Q≈0.54 instead of authored 0.36).
+                             * Inline build so endpoints + interior
+                             * points share one formula. */
+                            int cid = -1;
+                            if (curves_out && curves_count_io
+                                    && *curves_count_io < DS_MAX_CURVES) {
+                                cid = 100 + *curves_count_io;
+                                ds_curve_t *cv = &curves_out[*curves_count_io];
+                                cv->id = cid;
+                                double range = db_max - db_min;
+                                for (int ci = 0; ci < 128; ci++) {
+                                    double kp = knob_min
+                                              + (knob_max - knob_min)
+                                                * (double)ci / 127.0;
+                                    double vv = apply_binding_xform(bind_tag,
+                                                                    knob_min, knob_max,
+                                                                    kp);
+                                    if (vv < 1e-3) vv = 1e-3;
+                                    double dbv = 20.0 * log10(vv) + 3.01;
+                                    double f = range != 0.0
+                                              ? (dbv - db_min) / range
+                                              : 0.0;
+                                    if (f < 0.0) f = 0.0;
+                                    if (f > 1.0) f = 1.0;
+                                    cv->v[ci] = f;
+                                }
+                                (*curves_count_io)++;
+                            }
+                            e->curve_id  = cid;
                             (*filter_res_count_io)++;
-                            snprintf(f->resonance, sizeof(f->resonance), "%.4f", v_at_min);
+                            /* Keep f->resonance in DS Q units so the
+                             * downstream static emit (which applies the
+                             * Q→dB formula itself) doesn't double-
+                             * convert. We've already captured the dB
+                             * endpoints in the oncc record. */
+                            snprintf(f->resonance, sizeof(f->resonance), "%.4f", q_at_min);
                         } else {
                             strncpy(f->resonance, effective, 31); f->resonance[31] = '\0';
                         }
@@ -2347,10 +2419,12 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
         if (fx[lp_idx].resonance[0]) {
             double ds_res = atof(fx[lp_idx].resonance);
             if (ds_res < 1e-3) ds_res = 1e-3;
+            /* See FX_FILTER_RESONANCE knob-path for derivation:
+             * dB = 20·log10(ds_res) + 3.01 (xsynth Q = db_to_amp(dB)·0.7071). */
             double q_db = 20.0 * log10(ds_res) + 3.01;
             snprintf(q_buf, sizeof(q_buf), "%.4f", q_db);
         } else {
-            snprintf(q_buf, sizeof(q_buf), "0");  /* Butterworth */
+            snprintf(q_buf, sizeof(q_buf), "0");  /* Butterworth (xsynth default) */
         }
         pos += snprintf(sfz + pos, out_cap - pos,
                         "fil_type=%s\ncutoff=%s\nresonance=%s\n",

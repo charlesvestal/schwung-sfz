@@ -1309,43 +1309,104 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
     uint64_t voices_before = xshim_voice_count(inst->synth);
 
     /* xsynth renders interleaved f32 stereo directly into render_buf. */
-    struct timespec _t0, _t1;
+    struct timespec _t0, _t1, _t_sil, _t_clip0, _t_clip1;
     clock_gettime(CLOCK_MONOTONIC, &_t0);
     xshim_render(inst->synth, inst->render_buf, (size_t)(frames * 2));
     clock_gettime(CLOCK_MONOTONIC, &_t1);
     long render_us = (_t1.tv_sec - _t0.tv_sec) * 1000000L +
                      (_t1.tv_nsec - _t0.tv_nsec) / 1000L;
 
+    /* Fast path: when the synth produced exact silence (idle render —
+     * xsynth's ChannelGroup::render_to early-returned with a zeroed
+     * buffer), memset the output and skip the tanh soft-clip loop
+     * entirely. The per-sample tanhf is ~1.5-2 µs on ARM; 256 samples
+     * × 2 ch was ~500 µs every block of an idle slot. This costs one
+     * memcmp-like scan (~0.3 µs).
+     *
+     * We OR-reduce the f32 bit patterns: an all-zero render_buf has
+     * every word == 0, so a non-zero OR result means real audio. This
+     * catches denormals as non-silent (safe — we want to clip them),
+     * and false-positives only on +/-0.0 which is harmless.
+     */
+    int silent_path;
+    long silence_us, clip_us;
+    {
+        clock_gettime(CLOCK_MONOTONIC, &_t_sil);
+        const uint32_t *bits = (const uint32_t *)inst->render_buf;
+        size_t n = (size_t)frames * 2;
+        uint32_t acc = 0;
+        for (size_t i = 0; i < n; i++) acc |= bits[i];
+        silent_path = (acc == 0);
+        clock_gettime(CLOCK_MONOTONIC, &_t_clip0);
+        silence_us = (_t_clip0.tv_sec - _t_sil.tv_sec) * 1000000L +
+                     (_t_clip0.tv_nsec - _t_sil.tv_nsec) / 1000L;
+        if (silent_path) {
+            memset(out_interleaved_lr, 0, frames * 2 * sizeof(int16_t));
+        }
+    }
+
+    /* Convert interleaved f32 → int16 with gain and tanh soft-clip. */
+    if (!silent_path) {
+        clock_gettime(CLOCK_MONOTONIC, &_t_clip0);
+        float g = inst->gain;
+        for (int i = 0; i < frames; i++) {
+            float l = tanhf(inst->render_buf[i * 2]     * g);
+            float r = tanhf(inst->render_buf[i * 2 + 1] * g);
+            out_interleaved_lr[i * 2]     = (int16_t)(l * 32767.0f);
+            out_interleaved_lr[i * 2 + 1] = (int16_t)(r * 32767.0f);
+        }
+        clock_gettime(CLOCK_MONOTONIC, &_t_clip1);
+        clip_us = (_t_clip1.tv_sec - _t_clip0.tv_sec) * 1000000L +
+                  (_t_clip1.tv_nsec - _t_clip0.tv_nsec) / 1000L;
+    } else {
+        clip_us = 0;
+    }
+
     /* Log perf when there was a spawn burst, render was heavy, or every
      * 256 blocks for baseline. Breakdown: par = event drain + per-key
      * render inside rayon. sum = serial mix of per-key bufs. fx = volume
      * + pan + cutoff sweep. tot = total inside push_key_events_and_render
      * (xsynth side). The (render - tot) gap is shim/render_to wrapping
-     * overhead. */
+     * overhead.
+     *
+     * 2026-05-16: added silent_path / silence_us / clip_us so we can
+     * answer "did the OR-reduce fire?" and "what fraction of v2_render_
+     * block went to tanhf vs xshim_render?" without re-deploying.
+     *
+     * Outlier capture: when v2_render_block exceeds 5 ms we also dump
+     * voice state + last note number so we can correlate spikes against
+     * note-on activity vs steady idle. */
     static int log_throttle = 0;
-    if (render_us > 800 || noteons_this_block > 0 || ++log_throttle >= 256) {
+    long total_us = render_us + silence_us + clip_us;
+    int is_outlier = (total_us > 5000);
+    if (is_outlier || render_us > 800 || noteons_this_block > 0 ||
+            ++log_throttle >= 256) {
         log_throttle = 0;
         uint64_t voices_after = xshim_voice_count(inst->synth);
         uint32_t bd[4] = {0};
         xshim_take_render_breakdown(inst->synth, bd);
-        char msg[224];
+        char msg[256];
         snprintf(msg, sizeof(msg),
-                 "perf: render=%ld us  vb=%llu va=%llu noteon=%u  par=%u sum=%u fx=%u tot=%u",
-                 render_us,
+                 "perf: tot=%ld render=%ld sil=%ld clip=%ld silent=%d "
+                 "vb=%llu va=%llu noteon=%u par=%u sum=%u fx=%u tot_in=%u",
+                 total_us, render_us, silence_us, clip_us, silent_path,
                  (unsigned long long)voices_before,
                  (unsigned long long)voices_after,
                  (unsigned)noteons_this_block,
                  bd[0], bd[1], bd[2], bd[3]);
         plugin_log(msg);
-    }
-
-    /* Convert interleaved f32 → int16 with gain and tanh soft-clip. */
-    float g = inst->gain;
-    for (int i = 0; i < frames; i++) {
-        float l = tanhf(inst->render_buf[i * 2]     * g);
-        float r = tanhf(inst->render_buf[i * 2 + 1] * g);
-        out_interleaved_lr[i * 2]     = (int16_t)(l * 32767.0f);
-        out_interleaved_lr[i * 2 + 1] = (int16_t)(r * 32767.0f);
+        if (is_outlier) {
+            char om[160];
+            snprintf(om, sizeof(om),
+                     "outlier: tot=%ld us  vb=%llu va=%llu noteon=%u "
+                     "silent=%d silence_us=%ld clip_us=%ld",
+                     total_us,
+                     (unsigned long long)voices_before,
+                     (unsigned long long)voices_after,
+                     (unsigned)noteons_this_block,
+                     silent_path, silence_us, clip_us);
+            plugin_log(om);
+        }
     }
 }
 

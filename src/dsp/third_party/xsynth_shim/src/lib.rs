@@ -136,7 +136,13 @@ pub unsafe extern "C" fn xshim_create(sample_rate: u32, channels: u32) -> *mut X
         };
         let cfg = ChannelGroupConfig {
             channel_init_options: ChannelInitOptions { fade_out_killing: true },
-            format: SynthFormat::Midi,
+            // MOVE FORK: SFZ player only routes to channel 0 — every
+            // xshim_note_on/cc/etc targets channel 0 explicitly. The
+            // default `SynthFormat::Midi` spawns 16 channels; the other
+            // 15 sit idle but still pay per-block cost (has_work() scan
+            // + rayon dispatch overhead). Going single-channel cuts the
+            // idle-probe cost ~16x.
+            format: SynthFormat::Custom { channels: 1 },
             audio_params: AudioStreamParams::new(sample_rate, cc),
             parallelism: ParallelismOptions::AUTO_PER_CHANNEL,
         };

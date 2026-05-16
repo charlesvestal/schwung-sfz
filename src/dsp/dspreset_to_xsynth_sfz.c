@@ -1399,6 +1399,15 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
         double pan_lfo_depth_pct;
         double pitch_lfo_freq;
         double pitch_lfo_depth_cents;
+        /* MOVE FORK / 2026-05-16: optional CC routing for pitch LFO
+         * depth. When a UI knob binds to this LFO's MOD_AMOUNT,
+         * `pitch_lfo_depth_cc` holds the allocated CC and
+         * `pitch_lfo_depth_delta` the cents span the knob covers. The
+         * load-time depth is set from the knob's `value=` (so the
+         * preset opens with the authored vibrato amount); the delta
+         * lets later knob moves still drive the vibrato. */
+        int    pitch_lfo_depth_cc;
+        double pitch_lfo_depth_delta;
         double fileg_attack_s;
         double fileg_decay_s;
         double fileg_sustain;
@@ -1646,9 +1655,118 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
                          * Cap ±1200 cents (one octave). */
                         double depth_cents = full_swing * 100.0 * mod_amount;
                         if (depth_cents > 1200.0) depth_cents = 1200.0;
+                        /* MOVE FORK / 2026-05-16: scale by any UI knob
+                         * that targets this LFO's MOD_AMOUNT — DS uses
+                         * the knob's *current value* as a depth fader
+                         * (Tremolo knob in WörliTzer routes to both the
+                         * amp and pitch LFOs). At load time we apply
+                         * the knob's normalized position so a knob
+                         * defaulting to 0 silences the vibrato. Full
+                         * runtime CC routing for pitch LFO depth would
+                         * need a pitchlfo_depth_oncc emit + per-group
+                         * delta tracking — punt that until a preset
+                         * actually needs live-knob vibrato control. */
+                        char pn[96];
+                        snprintf(pn, sizeof(pn),
+                                 "type=\"modulator\" position=\"%d\"", mod_idx);
+                        double knob_frac = 1.0;
+                        int knob_cc = -1;
+                        int knob_walk_ix = 0;
+                        int found_knob = 0;
+                        const char *kp_p = src;
+                        while (kp_p && !found_knob) {
+                            const char *cs = NULL; size_t pl = 0;
+                            const char *c1 = strstr(kp_p, "<control");
+                            const char *c2 = strstr(kp_p, "<labeled-knob");
+                            if (c1 && c2) {
+                                if (c1 < c2) { cs = c1; pl = 8; }
+                                else         { cs = c2; pl = 13; }
+                            } else if (c1) { cs = c1; pl = 8; }
+                            else if (c2)   { cs = c2; pl = 13; }
+                            else break;
+                            char nxt = cs[pl];
+                            if (nxt != ' ' && nxt != '\t' && nxt != '\n' &&
+                                nxt != '\r' && nxt != '>' && nxt != '/') {
+                                kp_p = cs + pl; continue;
+                            }
+                            const char *cte_p = strchr(cs, '>');
+                            if (!cte_p) break;
+                            int self_p = (*(cte_p - 1) == '/');
+                            const char *cclose = NULL;
+                            if (!self_p) {
+                                const char *e1 = strstr(cte_p, "</control>");
+                                const char *e2 = strstr(cte_p, "</labeled-knob>");
+                                if (e1 && e2)       cclose = (e1 < e2) ? e1 : e2;
+                                else if (e1)        cclose = e1;
+                                else if (e2)        cclose = e2;
+                            }
+                            const char *bsearch_end = self_p ? cte_p : cclose;
+                            if (bsearch_end) {
+                                const char *needle_hit = strstr(cte_p + 1, pn);
+                                if (needle_hit && needle_hit < bsearch_end) {
+                                    /* Walk bindings to confirm
+                                     * MOD_AMOUNT on this LFO. */
+                                    const char *bs_p = cte_p + 1;
+                                    while (bs_p < bsearch_end) {
+                                        const char *bb_p = strstr(bs_p, "<binding");
+                                        if (!bb_p || bb_p >= bsearch_end) break;
+                                        const char *bbe_p = strchr(bb_p, '>');
+                                        if (!bbe_p) break;
+                                        char bbt[512];
+                                        int bbl_p = (int)(bbe_p - bb_p);
+                                        if (bbl_p > 511) bbl_p = 511;
+                                        memcpy(bbt, bb_p, bbl_p); bbt[bbl_p] = '\0';
+                                        if (strstr(bbt, pn)) {
+                                            char bpar[64];
+                                            xml_get_attr(bbt, "parameter", bpar, sizeof(bpar));
+                                            if (strcmp(bpar, "MOD_AMOUNT") == 0) {
+                                                char cbuf[1024];
+                                                int cln = (int)(cte_p - cs);
+                                                if (cln >= (int)sizeof(cbuf)) cln = sizeof(cbuf)-1;
+                                                memcpy(cbuf, cs, cln); cbuf[cln] = '\0';
+                                                char vstr[32], nstr[32], xstr[32];
+                                                xml_get_attr(cbuf, "value",    vstr, sizeof(vstr));
+                                                xml_get_attr(cbuf, "minValue", nstr, sizeof(nstr));
+                                                xml_get_attr(cbuf, "maxValue", xstr, sizeof(xstr));
+                                                double vv = vstr[0] ? atof(vstr) : 0.0;
+                                                double mn = nstr[0] ? atof(nstr) : 0.0;
+                                                double mx = xstr[0] ? atof(xstr) : 1.0;
+                                                if (mx > mn) {
+                                                    knob_frac = (vv - mn) / (mx - mn);
+                                                    if (knob_frac < 0.0) knob_frac = 0.0;
+                                                    if (knob_frac > 1.0) knob_frac = 1.0;
+                                                    found_knob = 1;
+                                                    if (knob_walk_ix < knob_count_local) {
+                                                        const ds_knob_t *kk = &use_knobs[knob_walk_ix];
+                                                        if (kk->cc_number >= 0) knob_cc = kk->cc_number;
+                                                    }
+                                                }
+                                                break;
+                                            }
+                                        }
+                                        bs_p = bbe_p + 1;
+                                    }
+                                }
+                            }
+                            kp_p = bsearch_end ? bsearch_end : cte_p + 1;
+                            knob_walk_ix++;
+                        }
+                        /* full_swing already collapsed mod_amount into
+                         * depth_cents above; max_for_delta is the full
+                         * authored depth (knob at max), which we use as
+                         * the oncc delta span. */
+                        double max_depth_cents_for_delta = depth_cents;
+                        depth_cents *= knob_frac;
                         if (is_group_scoped) {
                             pgm[target_group].pitch_lfo_freq = freq;
                             pgm[target_group].pitch_lfo_depth_cents = depth_cents;
+                            pgm[target_group].pitch_lfo_depth_cc    = -1;
+                            pgm[target_group].pitch_lfo_depth_delta = 0.0;
+                            if (found_knob && knob_cc >= 0
+                                    && max_depth_cents_for_delta > 0.0) {
+                                pgm[target_group].pitch_lfo_depth_cc    = knob_cc;
+                                pgm[target_group].pitch_lfo_depth_delta = max_depth_cents_for_delta;
+                            }
                             bp = bte + 1; continue;
                         }
                         pitch_lfo_freq = freq;
@@ -2327,10 +2445,24 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
                                 "panlfo_freq=%.4f\npanlfo_depth=%.2f\n",
                                 m->pan_lfo_freq, m->pan_lfo_depth_pct);
             }
-            if (m->pitch_lfo_freq > 0.0 && m->pitch_lfo_depth_cents > 0.0) {
+            /* MOVE FORK / 2026-05-16: emit pitch LFO whenever freq > 0,
+             * even if static depth is 0 — that path enables knob-driven
+             * runtime vibrato via pitchlfo_depth_oncc. The xsynth
+             * SIMDVoiceLfoPitch short-circuits to static_pitch when
+             * both base depth and all oncc deltas are 0, so there's no
+             * cost when the binding isn't active. */
+            if (m->pitch_lfo_freq > 0.0
+                    && (m->pitch_lfo_depth_cents > 0.0
+                        || m->pitch_lfo_depth_cc   >= 0)) {
                 pos += snprintf(sfz + pos, out_cap - pos,
                                 "pitchlfo_freq=%.4f\npitchlfo_depth=%.2f\n",
                                 m->pitch_lfo_freq, m->pitch_lfo_depth_cents);
+                if (m->pitch_lfo_depth_cc >= 0) {
+                    pos += snprintf(sfz + pos, out_cap - pos,
+                                    "pitchlfo_depth_oncc%d=%.2f\n",
+                                    m->pitch_lfo_depth_cc,
+                                    m->pitch_lfo_depth_delta);
+                }
             }
             if (m->fileg_depth_cents > 0.0) {
                 pos += snprintf(sfz + pos, out_cap - pos,

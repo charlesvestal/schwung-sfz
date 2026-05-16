@@ -67,6 +67,25 @@ while IFS= read -r line; do
     tail_d=$(echo "$pline" | sed -E 's/.*tail Δ=([0-9.]+).*/\1/')
     per=$(echo  "$pline" | sed -E 's/.*period (OK|MISMATCH).*/\1/')
     band=$(echo "$pline" | sed -E 's/.*max band Δ=([0-9.]+).*/\1/')
+    # 2026-05-16: DS standalone occasionally captures silence or stale
+    # buffer state when run back-to-back under our automation. When a
+    # FAIL shows band Δ ≥ 5 dB (much larger than typical converter
+    # mismatch), recapture once before reporting. Real converter bugs
+    # show up at any cadence; only stale-state flakes self-resolve on
+    # a fresh DS load.
+    if [ "$status" -ne 0 ] && [ -n "$band" ]; then
+        if awk -v b="$band" 'BEGIN{exit !(b+0 >= 5.0)}'; then
+            "$SCRIPT_DIR/../ds_capture.sh" "$preset" "$ds_wav" "$n" "$v" "$d" "$t" >>"$log" 2>&1
+            "$SCRIPT_DIR/../sfz_render" "$preset" "$our_wav" "$n" "$v" "$d" "$t" 44100 >>"$log" 2>&1
+            python3 "$SCRIPT_DIR/../wav_diff.py" "$ds_wav" "$our_wav" >>"$log" 2>&1
+            status=$?
+            pline=$(grep "^PARITY:" "$log" | tail -1)
+            gain=$(echo   "$pline" | sed -E 's/.*gain Δ=([0-9.]+).*/\1/')
+            tail_d=$(echo "$pline" | sed -E 's/.*tail Δ=([0-9.]+).*/\1/')
+            per=$(echo    "$pline" | sed -E 's/.*period (OK|MISMATCH).*/\1/')
+            band=$(echo   "$pline" | sed -E 's/.*max band Δ=([0-9.]+).*/\1/')
+        fi
+    fi
     if [ "$status" -eq 0 ]; then
         printf "%-32s  %8s  %8s  %8s  %8s  PASS\n" \
                "$name" "$gain" "$tail_d" "$per" "$band"

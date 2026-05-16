@@ -182,12 +182,16 @@ int main(int argc, char **argv) {
     }
     if (cho.enabled) {
         xshim_set_chorus(synth, 1, (float)cho.rate, (float)cho.depth);
-        xshim_set_chorus_mix(synth, 0.0f);
+        float cmx = (float)cho.mix;
+        if (cmx < 0) cmx = 0; if (cmx > 1) cmx = 1;
+        xshim_set_chorus_mix(synth, cmx);
     }
     if (pha.enabled) {
         xshim_set_phaser(synth, 1, (float)pha.rate, (float)pha.depth,
                          (float)pha.feedback);
-        xshim_set_phaser_mix(synth, 0.0f);
+        float pmx = (float)pha.mix;
+        if (pmx < 0) pmx = 0; if (pmx > 1) pmx = 1;
+        xshim_set_phaser_mix(synth, pmx);
     }
 
     /* Step 4: push each knob's default CC value so voices observe the

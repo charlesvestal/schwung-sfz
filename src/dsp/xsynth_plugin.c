@@ -473,7 +473,13 @@ static int load_sfz_file(xsynth_instance_t *inst, const char *path) {
                 xshim_set_chorus(inst->synth, 1,
                                  (float)chorus_cfg.rate,
                                  (float)chorus_cfg.depth);
-                xshim_set_chorus_mix(inst->synth, 0.0f);
+                /* Honor the `<effect mix=>` attribute — DS presets
+                 * without an FX_MIX knob still expect the authored
+                 * mix to be applied at load. Knob bindings (when
+                 * present) overwrite this later in the load path. */
+                float cmx = (float)chorus_cfg.mix;
+                if (cmx < 0.0f) cmx = 0.0f; if (cmx > 1.0f) cmx = 1.0f;
+                xshim_set_chorus_mix(inst->synth, cmx);
             } else {
                 xshim_set_chorus(inst->synth, 0, 0.0f, 0.0f);
                 xshim_set_chorus_mix(inst->synth, 0.0f);
@@ -502,7 +508,10 @@ static int load_sfz_file(xsynth_instance_t *inst, const char *path) {
                                  (float)phaser_cfg.rate,
                                  (float)phaser_cfg.depth,
                                  (float)phaser_cfg.feedback);
-                xshim_set_phaser_mix(inst->synth, 0.0f);
+                /* Same as chorus — honor the authored <effect mix=>. */
+                float pmx = (float)phaser_cfg.mix;
+                if (pmx < 0.0f) pmx = 0.0f; if (pmx > 1.0f) pmx = 1.0f;
+                xshim_set_phaser_mix(inst->synth, pmx);
             } else {
                 xshim_set_phaser(inst->synth, 0, 0.0f, 0.0f, 0.0f);
                 xshim_set_phaser_mix(inst->synth, 0.0f);

@@ -1933,11 +1933,46 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
 
     pos += snprintf(sfz + pos, out_cap - pos, "<global>\n");
 
+    /* Count `<group>` elements that will produce audible voices on
+     * NoteOn (skip release-trigger groups and explicitly disabled
+     * groups). DS auto-scales the bus to keep the sum from clipping
+     * when multiple groups layer onto the same note; without an
+     * equivalent we drove the int16 ceiling and clipped through the
+     * tanhf soft-clip on multi-group presets like Cosmos or K4.
+     * Power-preserving headroom (-3 dB per group doubling) keeps
+     * single-group presets unchanged and N-group presets at the same
+     * peak as DS. */
+    int active_group_count = 0;
+    {
+        const char *gp = src;
+        while ((gp = strstr(gp, "<group")) != NULL) {
+            if (gp[6] == 's' || gp[6] == 'S') { gp += 7; continue; }
+            const char *gt = strchr(gp, '>');
+            if (!gt) break;
+            char gtb[1024];
+            int gtl = gt - gp; if (gtl >= (int)sizeof(gtb)) gtl = sizeof(gtb)-1;
+            memcpy(gtb, gp, gtl); gtb[gtl] = '\0';
+            char trig[16] = "", ena[16] = "";
+            xml_get_attr(gtb, "trigger", trig, sizeof(trig));
+            xml_get_attr(gtb, "enabled", ena,  sizeof(ena));
+            int is_release_trig = (strcmp(trig, "release") == 0);
+            int is_disabled     = (strcmp(ena,  "false")   == 0);
+            if (!is_release_trig && !is_disabled) active_group_count++;
+            gp = gt + 1;
+        }
+    }
+    double mix_headroom_db = 0.0;
+    if (active_group_count > 1) {
+        /* -10·log10(N): power-preserving for correlated signals. */
+        mix_headroom_db = -10.0 *
+                          (log(active_group_count) / log(10.0));
+    }
+
     /* Volume: wrapper attr + gain effect (both in dB). xsynth caps volume
      * at +6 dB and clamps to -144 dB, so we add and pass through.
      * xsynth's SFZ parser uses `parse_i16_in_range(-144..=6)` and rejects
      * decimals — emit as integer. */
-    double global_vol_db = 0.0;
+    double global_vol_db = mix_headroom_db;
     if (wrap_volume[0]) global_vol_db += atof(wrap_volume);
     if (gain_idx >= 0 && fx[gain_idx].level[0]) global_vol_db += atof(fx[gain_idx].level);
     /* `<global> volume=` carries only the static-only pieces

@@ -755,6 +755,22 @@ static int resolve_sample_path_ci(const char *base, const char *rel,
 }
 
 static int count_rr_groups(const char *src) {
+    /* MOVE FORK / 2026-05-16: also honor `seqMode="round_robin"` on the
+     * `<groups>` parent — each child `<group>` then inherits RR mode and
+     * uses its own seqPosition for slot membership. */
+    int groups_rr = 0;
+    const char *gp = strstr(src, "<groups");
+    if (gp) {
+        const char *ge = strchr(gp, '>');
+        if (ge) {
+            char gbuf[1024];
+            int gl = (int)(ge - gp); if (gl > 1023) gl = 1023;
+            memcpy(gbuf, gp, gl); gbuf[gl] = '\0';
+            char gm[32];
+            xml_get_attr(gbuf, "seqMode", gm, sizeof(gm));
+            if (strcmp(gm, "round_robin") == 0) groups_rr = 1;
+        }
+    }
     int count = 0;
     const char *p = src;
     while ((p = strstr(p, "<group ")) != NULL) {
@@ -767,7 +783,9 @@ static int count_rr_groups(const char *src) {
         tag[tlen] = '\0';
         char mode[32];
         xml_get_attr(tag, "seqMode", mode, sizeof(mode));
-        if (strcmp(mode, "round_robin") == 0) count++;
+        /* A group counts toward the RR rotation when either it
+         * declares seqMode itself or it inherits one from <groups>. */
+        if (strcmp(mode, "round_robin") == 0 || groups_rr) count++;
         p = tag_end + 1;
     }
     return count;
@@ -1938,6 +1956,7 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
     char wrap_attack[64] = "", wrap_decay[64] = "";
     char wrap_sustain[64] = "", wrap_release[64] = "";
     char wrap_volume[64] = "", wrap_loop[64] = "";
+    char wrap_seqmode[32] = "";
     if (groups_tag) {
         char *gt_end = strchr(groups_tag, '>');
         if (gt_end) {
@@ -1952,6 +1971,12 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
             xml_get_attr(tag_buf, "sustain",     wrap_sustain, sizeof(wrap_sustain));
             xml_get_attr(tag_buf, "release",     wrap_release, sizeof(wrap_release));
             xml_get_attr(tag_buf, "loopEnabled", wrap_loop,    sizeof(wrap_loop));
+            /* MOVE FORK / 2026-05-16: DS allows `seqMode` on the
+             * `<groups>` parent — every child `<group>` inherits it.
+             * Without this propagation, RR presets like 18_round_robin
+             * (seqMode on <groups>, seqPosition on each <group>) fired
+             * every group simultaneously. */
+            xml_get_attr(tag_buf, "seqMode",     wrap_seqmode, sizeof(wrap_seqmode));
         }
     }
 
@@ -2136,9 +2161,10 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
                         "pitchlfo_freq=%.4f\npitchlfo_depth=%.2f\n",
                         pitch_lfo_freq, pitch_lfo_depth_cents);
     }
-    if (wrap_loop[0])
-        pos += snprintf(sfz + pos, out_cap - pos, "loop_mode=%s\n",
-                        strcmp(wrap_loop, "true") == 0 ? "loop_continuous" : "no_loop");
+    /* MOVE FORK / 2026-05-16: do NOT emit loop_mode at <global>. Each
+     * region's loop state is set per-<sample> below — when a sample
+     * has no explicit `loopEnabled`, it defaults to one-shot rather
+     * than inheriting from a sibling that opted into looping. */
 
     /* Filter: map DS filter types to xsynth's SFZ parser variants.
      * xsynth supports lpf_{1,2,4,6}p, hpf_{1,2,4,6}p, bpf_{1,2}p. DS
@@ -2435,13 +2461,15 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
         xml_get_attr(tag_buf, "release", val, sizeof(val));
         if (val[0]) pos += snprintf(sfz + pos, out_cap - pos, "ampeg_release=%s\n", val);
 
-        /* Round-robin: xsynth's parser silently ignores seq_position /
-         * seq_length, so the regions in different RR groups will all sound
-         * simultaneously on each note (same as no-RR). Acceptable
-         * degradation — most layered DS patches don't depend on RR; the
-         * ones that do (Frozen Glock, etc.) need explicit Phase 3 work. */
+        /* Round-robin: xsynth's parser honors seq_position / seq_length
+         * (RrState in soundfont/mod.rs). Inherit `seqMode` from the
+         * <groups> parent so presets that hoist it (18_round_robin and
+         * most real-world DS RR libs) emit per-group seq opcodes
+         * correctly instead of all firing simultaneously. */
         xml_get_attr(tag_buf, "seqMode", val, sizeof(val));
-        if (strcmp(val, "round_robin") == 0 && rr_total > 0) {
+        int group_is_rr = (strcmp(val, "round_robin") == 0)
+                       || (strcmp(wrap_seqmode, "round_robin") == 0);
+        if (group_is_rr && rr_total > 0) {
             char rr_pos[16];
             xml_get_attr(tag_buf, "seqPosition", rr_pos, sizeof(rr_pos));
             if (rr_pos[0]) {
@@ -2571,10 +2599,18 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
                 if (vi != 0)
                     pos += snprintf(sfz + pos, out_cap - pos, "volume=%d\n", vi);
             }
+            /* MOVE FORK / 2026-05-16: each <sample> opts in to looping
+             * via its own `loopEnabled`. DS accepts "true"/"1"/"yes"
+             * as truthy. When the sample omits the attribute, default
+             * to one-shot — DON'T inherit from the <groups> parent;
+             * that was the old behavior and caused unexpected looping
+             * for sibling samples after one author opted in. */
             xml_get_attr(stag, "loopEnabled", val, sizeof(val));
-            if (val[0])
-                pos += snprintf(sfz + pos, out_cap - pos, "loop_mode=%s\n",
-                                strcmp(val, "true") == 0 ? "loop_continuous" : "no_loop");
+            int loop_on = (val[0] && (strcmp(val, "true") == 0
+                                   || strcmp(val, "1")    == 0
+                                   || strcmp(val, "yes")  == 0));
+            pos += snprintf(sfz + pos, out_cap - pos, "loop_mode=%s\n",
+                            loop_on ? "loop_continuous" : "no_loop");
             xml_get_attr(stag, "loopStart", val, sizeof(val));
             if (val[0]) pos += snprintf(sfz + pos, out_cap - pos, "loop_start=%s\n", val);
             xml_get_attr(stag, "loopEnd", val, sizeof(val));

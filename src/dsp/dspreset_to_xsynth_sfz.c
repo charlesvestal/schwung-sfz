@@ -778,6 +778,28 @@ static int count_rr_groups(const char *src) {
 /* Short fallback label derived from a binding's DS `parameter=` name.
  * Returns NULL when the target has no obvious short alias (caller falls
  * back to "Knob" / group-name lookup). */
+/* Effect-type prefix for ambiguous params (Rate/Depth/Mix/FB shared
+ * across delay/chorus/phaser/reverb). Returns NULL if no disambiguation
+ * is needed at this position. */
+static const char *fx_short_prefix(const char *fx_type) {
+    if (!fx_type || !fx_type[0]) return NULL;
+    if (strcmp(fx_type, "delay")   == 0) return "Dly";
+    if (strcmp(fx_type, "chorus")  == 0) return "Cho";
+    if (strcmp(fx_type, "phaser")  == 0) return "Phs";
+    if (strcmp(fx_type, "reverb")  == 0) return "Rev";
+    return NULL;
+}
+
+/* True for DS params that are generic enough that multiple effects use
+ * them — we'll prefix with the effect short name when found. */
+static int param_is_ambiguous(const char *p) {
+    return strcmp(p, "FX_FEEDBACK")  == 0 ||
+           strcmp(p, "FX_MIX")       == 0 ||
+           strcmp(p, "FX_MOD_RATE")  == 0 ||
+           strcmp(p, "FX_MOD_DEPTH") == 0 ||
+           strcmp(p, "FX_WET_LEVEL") == 0;
+}
+
 static const char *target_alias(const char *ds_param) {
     if (!ds_param || !ds_param[0]) return NULL;
     if (strcmp(ds_param, "FX_FILTER_FREQUENCY") == 0) return "Filter";
@@ -1006,6 +1028,9 @@ static int enumerate_ui_knobs(const char *src,
         int any_reverb_wet = 0;
         int any_delay_time = 0, any_delay_fb = 0, any_delay_mix = 0;
         int any_chorus_rate = 0, any_chorus_depth = 0, any_chorus_mix = 0;
+        int any_phaser_rate = 0, any_phaser_depth = 0, any_phaser_mix = 0,
+            any_phaser_feedback = 0;
+        int any_widener = 0;
         char first_param[64] = "";
         int first_position = -1;
         const char *bp = bind_start;
@@ -1026,6 +1051,7 @@ static int enumerate_ui_knobs(const char *src,
             const char *fx_type = (pos_idx >= 0 && pos_idx < fx_count)
                                   ? fx[pos_idx].type : "";
             int is_chorus_target = (strcmp(fx_type, "chorus") == 0);
+            int is_phaser_target = (strcmp(fx_type, "phaser") == 0);
             int is_delay_target  = (strcmp(fx_type, "delay") == 0);
             if (binding_param_is_live(param)) any_live = 1;
             if (strcmp(param, "FX_REVERB_WET_LEVEL") == 0) any_reverb_wet = 1;
@@ -1038,6 +1064,16 @@ static int enumerate_ui_knobs(const char *src,
             if (strcmp(param, "FX_MOD_RATE") == 0  && is_chorus_target) any_chorus_rate  = 1;
             if (strcmp(param, "FX_MOD_DEPTH") == 0 && is_chorus_target) any_chorus_depth = 1;
             if (strcmp(param, "FX_MIX") == 0       && is_chorus_target) any_chorus_mix   = 1;
+            /* Phase 12: phaser shares the same FX_MOD_* params with
+             * chorus — disambiguated by the binding's position pointing
+             * at <effect type="phaser">. FX_FEEDBACK on a phaser routes
+             * to the phaser, NOT the delay. */
+            if (strcmp(param, "FX_MOD_RATE") == 0  && is_phaser_target) any_phaser_rate  = 1;
+            if (strcmp(param, "FX_MOD_DEPTH") == 0 && is_phaser_target) any_phaser_depth = 1;
+            if (strcmp(param, "FX_MIX") == 0       && is_phaser_target) any_phaser_mix   = 1;
+            if (strcmp(param, "FX_FEEDBACK") == 0  && is_phaser_target) any_phaser_feedback = 1;
+            /* Phase 13: FX_STEREO_OFFSET routes to channel widener. */
+            if (strcmp(param, "FX_STEREO_OFFSET") == 0) any_widener = 1;
             if (first_param[0] == '\0' && param[0]) {
                 strncpy(first_param, param, sizeof(first_param) - 1);
                 first_param[sizeof(first_param) - 1] = '\0';
@@ -1070,8 +1106,19 @@ static int enumerate_ui_knobs(const char *src,
         } else {
             lbl = target_alias(first_param);
         }
+        /* Prefix ambiguous params (Rate/Depth/Mix/FB/Wet) with the
+         * effect-type short name when we can identify it — otherwise the
+         * params menu shows two indistinguishable "Feedback" entries when
+         * a preset has both delay and phaser feedback knobs. */
+        const char *prefix = NULL;
+        if (lbl && param_is_ambiguous(first_param) &&
+                first_position >= 0 && first_position < fx_count) {
+            prefix = fx_short_prefix(fx[first_position].type);
+        }
         if (!lbl || !lbl[0]) {
             snprintf(k->label, sizeof(k->label), "Knob %d", kc + 1);
+        } else if (prefix) {
+            snprintf(k->label, sizeof(k->label), "%s %s", prefix, lbl);
         } else {
             snprintf(k->label, sizeof(k->label), "%s", lbl);
         }
@@ -1088,7 +1135,10 @@ static int enumerate_ui_knobs(const char *src,
          * set_param time. */
         k->live          = any_live || any_reverb_wet ||
                            any_delay_time || any_delay_fb || any_delay_mix ||
-                           any_chorus_rate || any_chorus_depth || any_chorus_mix;
+                           any_chorus_rate || any_chorus_depth || any_chorus_mix ||
+                           any_phaser_rate || any_phaser_depth || any_phaser_mix ||
+                           any_phaser_feedback ||
+                           any_widener;
         k->reverb_wet    = any_reverb_wet;
         k->delay_time    = any_delay_time;
         k->delay_feedback= any_delay_fb;
@@ -1096,6 +1146,11 @@ static int enumerate_ui_knobs(const char *src,
         k->chorus_rate   = any_chorus_rate;
         k->chorus_depth  = any_chorus_depth;
         k->chorus_mix    = any_chorus_mix;
+        k->phaser_rate   = any_phaser_rate;
+        k->phaser_depth  = any_phaser_depth;
+        k->phaser_feedback = any_phaser_feedback;
+        k->phaser_mix    = any_phaser_mix;
+        k->widener       = any_widener;
         k->tab_idx       = tab_index_at_position(src, p, tab_count);
         (void)tabs;
 
@@ -1126,12 +1181,14 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
                                       int *out_tab_count,
                                       ds_reverb_cfg_t *out_reverb,
                                       ds_delay_cfg_t  *out_delay,
-                                      ds_chorus_cfg_t *out_chorus) {
+                                      ds_chorus_cfg_t *out_chorus,
+                                      ds_phaser_cfg_t *out_phaser) {
     if (out_knob_count) *out_knob_count = 0;
     if (out_tab_count)  *out_tab_count  = 0;
     if (out_reverb)     { memset(out_reverb, 0, sizeof(*out_reverb)); }
     if (out_delay)      { memset(out_delay,  0, sizeof(*out_delay));  }
     if (out_chorus)     { memset(out_chorus, 0, sizeof(*out_chorus)); }
+    if (out_phaser)     { memset(out_phaser, 0, sizeof(*out_phaser)); }
     /* Base directory for sample-path resolution (the dspreset's parent). */
     char base_dir[1024];
     snprintf(base_dir, sizeof(base_dir), "%s", path);
@@ -1278,6 +1335,15 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
             out_chorus->rate  = 0.7;  /* fundsp chorus default */
             out_chorus->depth = 0.5;
         }
+        if (out_phaser && !out_phaser->enabled &&
+            strcmp(fx[i].type, "phaser") == 0) {
+            out_phaser->enabled = 1;
+            /* Author opts in via UI knob bound to FX_MIX; install dry. */
+            out_phaser->mix      = fx[i].mix[0] ? atof(fx[i].mix) : 0.0;
+            out_phaser->rate     = 0.4;  /* DS default phaser rate */
+            out_phaser->depth    = 0.5;
+            out_phaser->feedback = fx[i].feedback[0] ? atof(fx[i].feedback) : 0.5;
+        }
     }
 
     int lp_idx = -1, gain_idx = -1;
@@ -1311,6 +1377,18 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
     double fil_lfo_depth_cents = 0.0;
     int    fil_lfo_freq_cc = -1, fil_lfo_depth_cc = -1;
     double fil_lfo_freq_delta = 0.0, fil_lfo_depth_delta = 0.0;
+    /* Phase 11: pan LFO. Depth in percent (-100..100). */
+    double pan_lfo_freq = 0.0;
+    double pan_lfo_depth_pct = 0.0;
+    int    pan_lfo_freq_cc = -1, pan_lfo_depth_cc = -1;
+    double pan_lfo_freq_delta = 0.0, pan_lfo_depth_delta = 0.0;
+    /* Phase 11: filter envelope (autowah). Cents at peak. */
+    double fileg_attack_s = 0.0, fileg_decay_s = 0.0;
+    double fileg_sustain  = 1.0, fileg_release_s = 0.0;
+    double fileg_depth_cents = 0.0;
+    /* Phase 11: pitch LFO (vibrato). Cents at peak. */
+    double pitch_lfo_freq = 0.0;
+    double pitch_lfo_depth_cents = 0.0;
     {
         const char *mp = strstr(src, "<modulators");
         const char *me = mp ? strstr(mp, "</modulators>") : NULL;
@@ -1359,10 +1437,21 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
                     if (btl > 511) btl = 511;
                     memcpy(btag, bt, btl);
                     btag[btl] = '\0';
-                    char param[64], omin[32], omax[32];
+                    char param[64], omin[32], omax[32], blevel[16];
                     xml_get_attr(btag, "parameter", param, sizeof(param));
                     xml_get_attr(btag, "translationOutputMin", omin, sizeof(omin));
                     xml_get_attr(btag, "translationOutputMax", omax, sizeof(omax));
+                    xml_get_attr(btag, "level", blevel, sizeof(blevel));
+                    /* MVP: only honor instrument-level modulator bindings.
+                     * `level="group"` bindings target a specific group
+                     * (often gated by a tab/button) and need per-group
+                     * modulator support we don't have yet. Applying them
+                     * globally would modulate groups the author wanted
+                     * left alone (01 WörliTzer's autowah/vibrato are
+                     * bound to a group disabled in the default tab). */
+                    if (blevel[0] && strcmp(blevel, "instrument") != 0) {
+                        bp = bte + 1; continue;
+                    }
                     if (strcmp(param, "FX_FILTER_FREQUENCY") == 0
                             && fil_lfo_freq == 0.0 && fil_lfo_freq_cc < 0) {
                         double output_min = omin[0] ? atof(omin) : 0.0;
@@ -1457,6 +1546,35 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
                             kwi++;
                             kp2 = self_closed ? cte + 1 : (ctrl_close ? ctrl_close + 1 : cte + 1);
                         }
+                    }
+                    if ((strcmp(param, "PITCH") == 0 ||
+                         strcmp(param, "GROUP_TUNING") == 0)
+                            && pitch_lfo_freq == 0.0) {
+                        double output_min = omin[0] ? atof(omin) : -1.0;
+                        double output_max = omax[0] ? atof(omax) :  1.0;
+                        double full_swing = (output_max - output_min) * 0.5;
+                        if (full_swing < 0) full_swing = -full_swing;
+                        /* DS PITCH binding output unit = semitones for
+                         * GROUP_TUNING, fractional cents for PITCH. Treat
+                         * full_swing as semitones — depth_cents = swing * 100.
+                         * Cap ±1200 cents (one octave). */
+                        double depth_cents = full_swing * 100.0 * mod_amount;
+                        if (depth_cents > 1200.0) depth_cents = 1200.0;
+                        pitch_lfo_freq = freq;
+                        pitch_lfo_depth_cents = depth_cents;
+                    }
+                    if (strcmp(param, "PAN") == 0
+                            && pan_lfo_freq == 0.0 && pan_lfo_freq_cc < 0) {
+                        double output_min = omin[0] ? atof(omin) : -1.0;
+                        double output_max = omax[0] ? atof(omax) :  1.0;
+                        double full_swing = (output_max - output_min) * 0.5;
+                        if (full_swing < 0) full_swing = -full_swing;
+                        /* DS pan is -1..1; SFZ pan_lfo depth is in
+                         * percent (-100..100). Full swing of 1 → 100%. */
+                        double max_depth_pct = full_swing * 100.0;
+                        if (max_depth_pct > 100.0) max_depth_pct = 100.0;
+                        pan_lfo_freq = freq;
+                        pan_lfo_depth_pct = max_depth_pct * mod_amount;
                     }
                     if ((strcmp(param, "LEVEL") == 0 || strcmp(param, "AMP_VOLUME") == 0)
                             && amp_lfo_freq == 0.0 && amp_lfo_freq_cc < 0) {
@@ -1567,6 +1685,104 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
                             knob_walk_idx++;
                             kp = self_closed ? ctrl_tag_end + 1
                                               : (ctrl_close ? ctrl_close + 1 : ctrl_tag_end + 1);
+                        }
+                    }
+                    bp = bte + 1;
+                }
+            }
+            if (!is_lfo) {
+                /* Phase 11: envelope binding to FX_FILTER_FREQUENCY = autowah. */
+                char env_tag[512];
+                int el = (int)(tag_end - next);
+                if (el > 511) el = 511;
+                memcpy(env_tag, next, el);
+                env_tag[el] = '\0';
+                char a[32]={0}, d[32]={0}, s[32]={0}, rl[32]={0};
+                xml_get_attr(env_tag, "attack",  a,  sizeof(a));
+                xml_get_attr(env_tag, "decay",   d,  sizeof(d));
+                xml_get_attr(env_tag, "sustain", s,  sizeof(s));
+                xml_get_attr(env_tag, "release", rl, sizeof(rl));
+                const char *bp = tag_end + 1;
+                while (bp && bp < close) {
+                    const char *bt = strstr(bp, "<binding");
+                    if (!bt || bt >= close) break;
+                    const char *bte = strchr(bt, '>');
+                    if (!bte) break;
+                    char btag[512];
+                    int btl = (int)(bte - bt);
+                    if (btl > 511) btl = 511;
+                    memcpy(btag, bt, btl);
+                    btag[btl] = '\0';
+                    char param[64], omin[32], omax[32], ttable[256], txform[32], blevel[16];
+                    xml_get_attr(btag, "parameter", param, sizeof(param));
+                    xml_get_attr(btag, "translationOutputMin", omin, sizeof(omin));
+                    xml_get_attr(btag, "translationOutputMax", omax, sizeof(omax));
+                    xml_get_attr(btag, "translationTable", ttable, sizeof(ttable));
+                    xml_get_attr(btag, "translation", txform, sizeof(txform));
+                    xml_get_attr(btag, "level", blevel, sizeof(blevel));
+                    /* Skip group-level envelopes — they target a single
+                     * group (gated by a tab/button) and applying them to
+                     * all voices muffles unrelated groups. Phase 7b will
+                     * route these properly per-group. */
+                    if (blevel[0] && strcmp(blevel, "instrument") != 0) {
+                        bp = bte + 1; continue;
+                    }
+                    if (strcmp(param, "FX_FILTER_FREQUENCY") == 0
+                            && fileg_depth_cents == 0.0) {
+                        double output_min = omin[0] ? atof(omin) : 0.0;
+                        double output_max = omax[0] ? atof(omax) : 1.0;
+                        /* When the binding uses translation="table" with
+                         * an explicit translationTable, the Hz endpoints
+                         * are encoded as the table's first/last `y` values
+                         * (`x,y;x,y;...`). Without this, swing collapses to
+                         * 0..1 default and depth_cents is inaudible
+                         * (WobbliTzer's autowah was emitting depth=1.7
+                         * cents — basically no autowah). */
+                        if (strcmp(txform, "table") == 0 && ttable[0]) {
+                            double tmin = 1e9, tmax = -1e9;
+                            const char *pp = ttable;
+                            while (*pp) {
+                                const char *comma = strchr(pp, ',');
+                                const char *semi  = strchr(pp, ';');
+                                if (!comma) break;
+                                double y = atof(comma + 1);
+                                if (y < tmin) tmin = y;
+                                if (y > tmax) tmax = y;
+                                if (!semi) break;
+                                pp = semi + 1;
+                            }
+                            if (tmax > tmin) {
+                                output_min = tmin;
+                                output_max = tmax;
+                            }
+                        }
+                        double swing_hz = output_max - output_min;
+                        if (swing_hz < 0) swing_hz = -swing_hz;
+                        /* Direct log2 ratio of the table endpoints — at
+                         * env peak, cutoff = output_min * 2^(depth/1200)
+                         * should land at output_max. Cap at 9600 cents
+                         * (~8 octaves) which covers a 33 Hz → 22 kHz
+                         * sweep. base cutoff is overridden to output_min
+                         * below so the envelope swings the full range. */
+                        double max_depth_cents = 1200.0 * log2(output_max / (output_min > 1.0 ? output_min : 1.0));
+                        if (max_depth_cents > 9600.0) max_depth_cents = 9600.0;
+                        if (max_depth_cents < 0.0)    max_depth_cents = 0.0;
+                        fileg_depth_cents = max_depth_cents;
+                        fileg_attack_s  = a[0]  ? atof(a)  : 0.0;
+                        fileg_decay_s   = d[0]  ? atof(d)  : 0.0;
+                        fileg_sustain   = s[0]  ? atof(s)  : 1.0;
+                        fileg_release_s = rl[0] ? atof(rl) : 0.0;
+                        /* Override the static cutoff to the envelope's
+                         * low endpoint so the filter starts CLOSED and
+                         * opens to the high endpoint at envelope peak.
+                         * Without this, the lowpass sits at 22 kHz (wide
+                         * open) and depth_cents adds on top — past
+                         * Nyquist, sanitize clamps, autowah inaudible. */
+                        if (lp_idx >= 0 && output_min > 0.0 &&
+                                output_min < output_max) {
+                            snprintf(fx[lp_idx].freq,
+                                     sizeof(fx[lp_idx].freq),
+                                     "%.2f", output_min);
                         }
                     }
                     bp = bte + 1;
@@ -1704,6 +1920,39 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
                             fil_lfo_depth_cc, fil_lfo_depth_delta);
         }
     }
+    /* Phase 11: pan LFO. */
+    if (pan_lfo_freq > 0.0 || pan_lfo_freq_cc >= 0) {
+        pos += snprintf(sfz + pos, out_cap - pos,
+                        "panlfo_freq=%.4f\n", pan_lfo_freq);
+        if (pan_lfo_freq_cc >= 0) {
+            pos += snprintf(sfz + pos, out_cap - pos,
+                            "panlfo_freq_oncc%d=%.4f\n",
+                            pan_lfo_freq_cc, pan_lfo_freq_delta);
+        }
+    }
+    if (pan_lfo_depth_pct > 0.0 || pan_lfo_depth_cc >= 0) {
+        pos += snprintf(sfz + pos, out_cap - pos,
+                        "panlfo_depth=%.2f\n", pan_lfo_depth_pct);
+        if (pan_lfo_depth_cc >= 0) {
+            pos += snprintf(sfz + pos, out_cap - pos,
+                            "panlfo_depth_oncc%d=%.2f\n",
+                            pan_lfo_depth_cc, pan_lfo_depth_delta);
+        }
+    }
+    /* Phase 11: filter envelope (autowah). */
+    if (fileg_depth_cents > 0.0) {
+        pos += snprintf(sfz + pos, out_cap - pos,
+                        "fileg_attack=%.4f\nfileg_decay=%.4f\nfileg_sustain=%.4f\n"
+                        "fileg_release=%.4f\nfileg_depth=%.2f\n",
+                        fileg_attack_s, fileg_decay_s, fileg_sustain,
+                        fileg_release_s, fileg_depth_cents);
+    }
+    /* Phase 11: pitch LFO (vibrato). */
+    if (pitch_lfo_freq > 0.0 && pitch_lfo_depth_cents > 0.0) {
+        pos += snprintf(sfz + pos, out_cap - pos,
+                        "pitchlfo_freq=%.4f\npitchlfo_depth=%.2f\n",
+                        pitch_lfo_freq, pitch_lfo_depth_cents);
+    }
     if (wrap_loop[0])
         pos += snprintf(sfz + pos, out_cap - pos, "loop_mode=%s\n",
                         strcmp(wrap_loop, "true") == 0 ? "loop_continuous" : "no_loop");
@@ -1739,16 +1988,25 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
          * FX_FILTER_RESONANCE knob bindings. xsynth-core picks up these
          * opcodes via SIMD*VoiceCutoffLive and recomputes biquad
          * coefficients per render block. */
-        for (int i = 0; i < filter_freq_oncc_count; i++) {
-            pos += snprintf(sfz + pos, out_cap - pos,
-                            "cutoff_oncc%d=%.2f\n",
-                            filter_freq_oncc[i].cc_number,
-                            filter_freq_oncc[i].cents_delta);
-            if (filter_freq_oncc[i].curve_id >= 0) {
+        /* When a filter envelope is present (autowah), suppress the
+         * static Filter-knob cutoff_oncc emit — the envelope alone
+         * drives cutoff so its full swing is audible. Otherwise the
+         * knob's default position (e.g. WobbliTzer Filter=0.82) raises
+         * the base cutoff to ~6 kHz before the envelope kicks in,
+         * leaving the env's sweep happening above audible range and
+         * the autowah inaudible. */
+        if (fileg_depth_cents == 0.0) {
+            for (int i = 0; i < filter_freq_oncc_count; i++) {
                 pos += snprintf(sfz + pos, out_cap - pos,
-                                "cutoff_curvecc%d=%d\n",
+                                "cutoff_oncc%d=%.2f\n",
                                 filter_freq_oncc[i].cc_number,
-                                filter_freq_oncc[i].curve_id);
+                                filter_freq_oncc[i].cents_delta);
+                if (filter_freq_oncc[i].curve_id >= 0) {
+                    pos += snprintf(sfz + pos, out_cap - pos,
+                                    "cutoff_curvecc%d=%d\n",
+                                    filter_freq_oncc[i].cc_number,
+                                    filter_freq_oncc[i].curve_id);
+                }
             }
         }
         for (int i = 0; i < filter_res_oncc_count; i++) {

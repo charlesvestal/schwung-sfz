@@ -48,6 +48,11 @@ typedef struct {
     int   chorus_rate;      /* Phase 12: FX_MOD_RATE on chorus effect */
     int   chorus_depth;     /* Phase 12: FX_MOD_DEPTH on chorus effect */
     int   chorus_mix;       /* Phase 12: FX_MIX on chorus effect */
+    int   phaser_rate;      /* Phase 12: FX_MOD_RATE on phaser effect */
+    int   phaser_depth;     /* Phase 12: FX_MOD_DEPTH on phaser effect */
+    int   phaser_feedback;  /* Phase 12: FX_FEEDBACK on phaser effect */
+    int   phaser_mix;       /* Phase 12: FX_MIX on phaser effect */
+    int   widener;          /* Phase 13: FX_STEREO_OFFSET — channel M/S widener */
 } ds_knob_t;
 
 /* Phase 6.5: tab metadata — one entry per `<tab>` element in the
@@ -82,6 +87,15 @@ typedef struct {
     double mix;             /* 0..1 crossfade */
 } ds_chorus_cfg_t;
 
+/* Phase 12: phaser config from `<effect type="phaser">`. */
+typedef struct {
+    int    enabled;
+    double rate;            /* LFO Hz, default 0.4 */
+    double depth;           /* 0..1 */
+    double feedback;        /* 0..0.95 */
+    double mix;             /* 0..1 crossfade */
+} ds_phaser_cfg_t;
+
 /* Convert + populate knob metadata.
  *
  * On success, `out_knobs` is filled with `*out_knob_count` entries (at
@@ -95,7 +109,8 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
                                       int *out_tab_count,
                                       ds_reverb_cfg_t *out_reverb,
                                       ds_delay_cfg_t  *out_delay,
-                                      ds_chorus_cfg_t *out_chorus);
+                                      ds_chorus_cfg_t *out_chorus,
+                                      ds_phaser_cfg_t *out_phaser);
 
 #ifdef __cplusplus
 }

@@ -82,6 +82,13 @@ extern void          xshim_set_chorus(XSynthHandle*, uint32_t enable,
 extern void          xshim_set_chorus_rate(XSynthHandle*, float rate);
 extern void          xshim_set_chorus_depth(XSynthHandle*, float depth);
 extern void          xshim_set_chorus_mix(XSynthHandle*, float mix);
+extern void          xshim_set_phaser(XSynthHandle*, uint32_t enable,
+                                        float rate, float depth, float feedback);
+extern void          xshim_set_phaser_rate(XSynthHandle*, float rate);
+extern void          xshim_set_phaser_depth(XSynthHandle*, float depth);
+extern void          xshim_set_phaser_feedback(XSynthHandle*, float fb);
+extern void          xshim_set_phaser_mix(XSynthHandle*, float mix);
+extern void          xshim_set_widener(XSynthHandle*, float width);
 extern uint32_t      xshim_take_noteon_count(XSynthHandle*);
 extern void          xshim_take_render_breakdown(XSynthHandle*, uint32_t *out4);
 extern size_t        xshim_last_error(char *out_buf, size_t out_len);
@@ -401,6 +408,9 @@ static int load_sfz_file(xsynth_instance_t *inst, const char *path) {
         xshim_set_delay_mix(inst->synth, 0.0f);
         xshim_set_chorus(inst->synth, 0, 0.0f, 0.0f);
         xshim_set_chorus_mix(inst->synth, 0.0f);
+        xshim_set_phaser(inst->synth, 0, 0.0f, 0.0f, 0.0f);
+        xshim_set_phaser_mix(inst->synth, 0.0f);
+        xshim_set_widener(inst->synth, 1.0f);
     }
 
     /* .dspreset → convert to .converted.sfz next to source, load that. */
@@ -416,6 +426,7 @@ static int load_sfz_file(xsynth_instance_t *inst, const char *path) {
         ds_reverb_cfg_t reverb_cfg = {0};
         ds_delay_cfg_t  delay_cfg  = {0};
         ds_chorus_cfg_t chorus_cfg = {0};
+        ds_phaser_cfg_t phaser_cfg = {0};
         converted = convert_dspreset_to_xsynth_sfz(path,
                                                     inst->knobs,
                                                     &inst->knob_count,
@@ -423,7 +434,8 @@ static int load_sfz_file(xsynth_instance_t *inst, const char *path) {
                                                     &inst->tab_count,
                                                     &reverb_cfg,
                                                     &delay_cfg,
-                                                    &chorus_cfg);
+                                                    &chorus_cfg,
+                                                    &phaser_cfg);
         /* Phase 10: install reverb from dspreset config (or remove
          * when not present). roomSize 0..1 maps to fundsp room param
          * (×30 to expand to seconds-of-prop-time). damping 0..1 →
@@ -481,6 +493,19 @@ static int load_sfz_file(xsynth_instance_t *inst, const char *path) {
             } else {
                 xshim_set_delay(inst->synth, 0, 0.0f, 0.0f);
                 xshim_set_delay_mix(inst->synth, 0.0f);
+            }
+            /* Phase 12: install/remove phaser per dspreset. Same
+             * mix-at-0 install policy as chorus — author opts in via
+             * the dspreset's FX_MIX knob movement. */
+            if (phaser_cfg.enabled) {
+                xshim_set_phaser(inst->synth, 1,
+                                 (float)phaser_cfg.rate,
+                                 (float)phaser_cfg.depth,
+                                 (float)phaser_cfg.feedback);
+                xshim_set_phaser_mix(inst->synth, 0.0f);
+            } else {
+                xshim_set_phaser(inst->synth, 0, 0.0f, 0.0f, 0.0f);
+                xshim_set_phaser_mix(inst->synth, 0.0f);
             }
         }
         for (int i = 0; i < inst->knob_count; i++) {
@@ -829,6 +854,25 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
                     if (k->chorus_depth) xshim_set_chorus_depth(inst->synth, (float)abs_v);
                     if (k->chorus_mix)   xshim_set_chorus_mix(inst->synth, (float)abs_v);
                 }
+                /* Phase 12: route phaser knob bindings. */
+                if (inst->synth && (k->phaser_rate || k->phaser_depth ||
+                                    k->phaser_feedback || k->phaser_mix)) {
+                    double abs_v = inst->knob_current[idx];
+                    if (k->phaser_rate)     xshim_set_phaser_rate(inst->synth, (float)abs_v);
+                    if (k->phaser_depth)    xshim_set_phaser_depth(inst->synth, (float)abs_v);
+                    if (k->phaser_feedback) xshim_set_phaser_feedback(inst->synth, (float)abs_v);
+                    if (k->phaser_mix)      xshim_set_phaser_mix(inst->synth, (float)abs_v);
+                }
+                /* Phase 13: stereo widener (FX_STEREO_OFFSET). 0..1 →
+                 * width 1..1.5 (default = neutral, full = subtle wider). */
+                if (inst->synth && k->widener) {
+                    double t = (k->max_value != k->min_value)
+                        ? (inst->knob_current[idx] - k->min_value)
+                          / (k->max_value - k->min_value)
+                        : 0.0;
+                    if (t < 0.0) t = 0.0; if (t > 1.0) t = 1.0;
+                    xshim_set_widener(inst->synth, (float)(1.0 + 1.0 * t));
+                }
             }
         }
     } else if (strcmp(key, "all_notes_off") == 0 || strcmp(key, "panic") == 0) {
@@ -901,6 +945,14 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
     if (strcmp(key, "load_error") == 0) {
         if (inst->load_error[0]) return snprintf(buf, buf_len, "%s", inst->load_error);
         return 0;
+    }
+    /* Host polls this to re-fetch ui_hierarchy/chain_params after an
+     * async preset switch finishes — set_preset_index defers the
+     * actual SFZ convert + load by DEBOUNCE_BLOCKS audio blocks, so a
+     * naive refetch right after setSlotParam() observes the previous
+     * preset's knob list. */
+    else if (strcmp(key, "is_loading") == 0) {
+        return snprintf(buf, buf_len, "%d", (inst->is_loading || inst->pending_load) ? 1 : 0);
     }
     else if (strcmp(key, "preset") == 0 || strcmp(key, "current_patch") == 0)
         return snprintf(buf, buf_len, "%d", inst->current_preset);
@@ -1129,10 +1181,17 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
          * the current preset disappear automatically. Result:
          * preset switches show the right knob set without
          * re-querying the hierarchy. */
-        for (int i = 0; i < DS_MAX_KNOBS; i++) {
+        /* Per-preset dynamic hierarchy. Host's changeHierPreset
+         * re-fetches ui_hierarchy + reloads the level when preset
+         * changes within the menu (added 2026-05-15) so emitting only
+         * the knobs that exist in the current preset/tab keeps the
+         * menu clean. */
+        for (int i = 0; i < inst->knob_count; i++) {
+            ds_knob_t *k = &inst->knobs[i];
+            if (inst->tab_count > 1 && k->tab_idx != inst->current_tab) continue;
             written += snprintf(buf + written, buf_len - written,
-                ",{\"key\":\"knob_%d\",\"label\":\"Knob %d\"}",
-                i, i + 1);
+                ",{\"key\":\"%s\",\"label\":\"%s\"}",
+                k->key, k->label);
         }
         written += snprintf(buf + written, buf_len - written,
             ",{\"level\":\"jump\",\"label\":\"Jump To Library\"}"
@@ -1216,6 +1275,11 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
             if (k->chorus_rate)    xshim_set_chorus_rate(inst->synth, (float)abs_v);
             if (k->chorus_depth)   xshim_set_chorus_depth(inst->synth, (float)abs_v);
             if (k->chorus_mix)     xshim_set_chorus_mix(inst->synth, (float)abs_v);
+            if (k->phaser_rate)    xshim_set_phaser_rate(inst->synth, (float)abs_v);
+            if (k->phaser_depth)   xshim_set_phaser_depth(inst->synth, (float)abs_v);
+            if (k->phaser_feedback) xshim_set_phaser_feedback(inst->synth, (float)abs_v);
+            if (k->phaser_mix)     xshim_set_phaser_mix(inst->synth, (float)abs_v);
+            if (k->widener)        xshim_set_widener(inst->synth, (float)(1.0 + 0.5 * t));
         }
         plugin_log("xsynth: async SFZ ready and applied");
     } else if (load_st == XSHIM_LOAD_ERROR) {

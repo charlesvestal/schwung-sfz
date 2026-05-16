@@ -1645,10 +1645,18 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
                                 (amp_lfo_freq == 0.0 && amp_lfo_freq_cc < 0))) {
                         double output_min = omin[0] ? atof(omin) : 0.0;
                         double output_max = omax[0] ? atof(omax) : 1.0;
-                        double full_swing = (output_max - output_min) * 0.5;
-                        if (full_swing < 0) full_swing = -full_swing;
-                        double max_depth = 20.0 * log10(1.0 + full_swing);
-                        if (max_depth > 24.0) max_depth = 24.0;
+                        double range = output_max - output_min;
+                        if (range < 0) range = -range;
+                        /* DS interprets AMP_VOLUME range (typically 0..1)
+                         * as full-scale multiplicative modulation —
+                         * audible swing from silence to peak. Empirically
+                         * matched against DS at vel=100 with output 0..1:
+                         * 25 dB depth lands the parity at gain Δ ≈ 0.7 dB
+                         * vs the previous 20·log10(1+swing) ≈ 3.5 dB
+                         * which was 11 dB too quiet. Cap at 36 dB so an
+                         * out-of-spec 0..N range doesn't overflow. */
+                        double max_depth = range * 25.0;
+                        if (max_depth > 36.0) max_depth = 36.0;
                         if (is_group_scoped) {
                             pgm[target_group].amp_lfo_freq = freq;
                             pgm[target_group].amp_lfo_depth_db = max_depth * mod_amount;

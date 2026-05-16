@@ -2189,10 +2189,29 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
         else if (strcmp(src_type, "peak") == 0) fil_type = "bpf_2p";
         /* default lpf_2p covers DS "lowpass" */
         const char *cutoff = fx[lp_idx].freq[0]      ? fx[lp_idx].freq      : "22000";
-        const char *q      = fx[lp_idx].resonance[0] ? fx[lp_idx].resonance : "0.7";
+        /* MOVE FORK / 2026-05-16: DS `resonance` is a Q-like multiplier
+         * (1.0 ≈ Butterworth, >1 peaks, → self-oscillation as it grows).
+         * SFZ `resonance` is in dB of peak gain. xsynth-core computes
+         * the biquad Q as `db_to_amp(resonance_dB) * Q_BUTTERWORTH`,
+         * where Q_BUTTERWORTH = 0.7071. To get a final Q matching DS's
+         * Q, solve: ds_res = 0.7071 · 10^(dB/20)
+         *           → dB    = 20·log10(ds_res / 0.7071)
+         *                   = 20·log10(ds_res) + 3.01
+         * Pre-fix we passed the raw value as dB, which underresonated
+         * by ~10 dB at DS res=3 (25_resonance_high band Δ 4.86 dB).
+         * Default 0.7 maps to ~0 dB → unchanged behavior at Butterworth. */
+        char q_buf[32];
+        if (fx[lp_idx].resonance[0]) {
+            double ds_res = atof(fx[lp_idx].resonance);
+            if (ds_res < 1e-3) ds_res = 1e-3;
+            double q_db = 20.0 * log10(ds_res) + 3.01;
+            snprintf(q_buf, sizeof(q_buf), "%.4f", q_db);
+        } else {
+            snprintf(q_buf, sizeof(q_buf), "0");  /* Butterworth */
+        }
         pos += snprintf(sfz + pos, out_cap - pos,
                         "fil_type=%s\ncutoff=%s\nresonance=%s\n",
-                        fil_type, cutoff, q);
+                        fil_type, cutoff, q_buf);
         /* Phase 5: live filter sweep from FX_FILTER_FREQUENCY /
          * FX_FILTER_RESONANCE knob bindings. xsynth-core picks up these
          * opcodes via SIMD*VoiceCutoffLive and recomputes biquad

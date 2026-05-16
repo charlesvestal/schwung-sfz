@@ -1242,7 +1242,15 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
         }
     }
 
-    long out_cap = size * 2;
+    /* Pre-Phase 6 the SFZ output was roughly the same size as the
+     * dspreset XML — 2× was plenty. After Phase 6 each knob with a
+     * non-linear translation emits a 128-row <curve> block (~1.8 KB
+     * each). Small parity-test dspresets are only a few hundred bytes
+     * but generate KB of curves; the old `size * 2` cap overflowed
+     * and corrupted the heap. Use a generous floor so the cap always
+     * exceeds the worst-case curve + per-region emit. */
+    long out_cap = size * 4;
+    if (out_cap < 1024 * 1024) out_cap = 1024 * 1024;
     char *sfz = malloc(out_cap);
     if (!sfz) { free(src); return NULL; }
     int pos = 0;

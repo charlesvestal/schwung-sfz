@@ -5,3 +5,8 @@ dist/
 *.tar.gz
 .DS_Store
 .claude/
+
+# xsynth sample cache files generated at convert time
+*.x44c
+# parity converter intermediates
+tools/parity/presets/*.converted.sfz

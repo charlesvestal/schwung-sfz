@@ -193,10 +193,19 @@ def main():
     print()
     print(f"{'band':16s}  {'REF':>10s}  {'OURS':>10s}  {'Δ':>10s}")
     worst = 0.0
-    for (rname, rb), (oname, ob) in zip(rm['bands'], om['bands']):
+    # Bands where both signals are near silence (RMS < 80) get a [n/a]
+    # mark — the dB ratio is dominated by BlackHole's capture floor
+    # rather than any audible difference, so we don't fold those into
+    # the worst-case parity score.
+    SILENCE_FLOOR = 50.0
+    for (rname, rb), (_, ob) in zip(rm['bands'], om['bands']):
         d = db(ob) - db(rb)
-        worst = max(worst, abs(d))
-        print(f"{rname:16s}  {rb:10.1f}  {ob:10.1f}  {d:+8.2f} dB")
+        if rb < SILENCE_FLOOR and ob < SILENCE_FLOOR:
+            tag = " [silent]"
+        else:
+            worst = max(worst, abs(d))
+            tag = ""
+        print(f"{rname:16s}  {rb:10.1f}  {ob:10.1f}  {d:+8.2f} dB{tag}")
     print()
     # Combined parity: pass if every axis is within thresholds.
     gain_db   = abs(db(om['rms']) - db(rm['rms']))

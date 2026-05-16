@@ -1,0 +1,14 @@
+<global>
+ampeg_attack=0
+ampeg_decay=0
+ampeg_sustain=100.0
+ampeg_release=0
+<group>
+amp_veltrack=90.0
+<region>
+pitch_keycenter=60
+sample=../samples/sine_long.wav
+lokey=0
+hikey=127
+lovel=0
+hivel=127

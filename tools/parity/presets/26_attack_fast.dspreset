@@ -1,7 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <DecentSampler pluginVersion="1">
   <ui width="400" height="100"><tab/></ui>
-  <groups attack="0.001" decay="0" sustain="1" release="0.001">
+  <!-- DS silently fails with attack/release below ~0.005 s. Bumped
+       to 0.01 s as a representative "fast" value. -->
+  <groups attack="0.01" decay="0" sustain="1" release="0.01">
     <group>
       <sample path="../samples/sine_long.wav" rootNote="60" loNote="0" hiNote="127" loVel="0" hiVel="127"/>
     </group>

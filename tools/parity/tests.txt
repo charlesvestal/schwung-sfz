@@ -18,7 +18,17 @@
 11_filter_lfo                11_filter_lfo               60  100  2.0  0.5
 12_pitch_lfo                 12_pitch_lfo                60  100  2.0  0.5
 13_pan_lfo                   13_pan_lfo                  60  100  2.0  0.5
-14_filter_env                14_filter_env               60  100  1.5  1.0
+# 14_filter_env REMOVED 2026-05-16: empirically verified that DS
+# standalone does NOT actually sweep FX_FILTER_FREQUENCY from
+# <modulators><envelope> bindings — across level=instrument/voice,
+# with/without translation="linear", every trMax in {1000,4000,
+# 8000,16000,22000} produced rms -42 dB and centroid that didn't
+# track the cutoff. Static lowpass at 200 Hz gave the same -42 dB.
+# So DS just doesn't implement filter envelopes via modulator XML.
+# Our converter still emits `fileg_attack/decay/sustain/release/
+# depth/curve` opcodes (verified through xsynth) so the pipeline is
+# ready when DS fixes the bug — or for hand-written SFZ. Filter LFO
+# (11_filter_lfo, passes) is the working dynamic-cutoff path today.
 
 # === per-group routing ===
 15_per_group_mod             15_per_group_mod            60  100  2.0  0.5

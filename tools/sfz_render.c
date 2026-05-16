@@ -107,7 +107,8 @@ int main(int argc, char **argv) {
     float tail_s    = argc > 6 ? atof(argv[6]) : 2.0f;
     uint32_t rate   = argc > 7 ? (uint32_t)atoi(argv[7]) : 44100;
 
-    /* Step 1: convert .dspreset → .converted.sfz alongside the source. */
+    /* If the input is a .sfz file, load it directly. Otherwise treat
+     * as a .dspreset and run the converter. */
     ds_knob_t  knobs[DS_MAX_KNOBS] = {0};
     ds_tab_t   tabs[DS_MAX_TABS]   = {0};
     ds_reverb_cfg_t rev = {0};
@@ -115,15 +116,22 @@ int main(int argc, char **argv) {
     ds_chorus_cfg_t cho = {0};
     ds_phaser_cfg_t pha = {0};
     int knob_count = 0, tab_count = 0;
-    char *sfz_path = convert_dspreset_to_xsynth_sfz(
-        preset_path, knobs, &knob_count, tabs, &tab_count,
-        &rev, &del, &cho, &pha);
-    if (!sfz_path) {
-        fprintf(stderr, "convert_dspreset_to_xsynth_sfz failed\n");
-        return 2;
+    char *sfz_path = NULL;
+    const char *ext = strrchr(preset_path, '.');
+    if (ext && strcasecmp(ext, ".sfz") == 0) {
+        sfz_path = strdup(preset_path);
+        fprintf(stderr, "[sfz_render] direct SFZ load: %s\n", sfz_path);
+    } else {
+        sfz_path = convert_dspreset_to_xsynth_sfz(
+            preset_path, knobs, &knob_count, tabs, &tab_count,
+            &rev, &del, &cho, &pha);
+        if (!sfz_path) {
+            fprintf(stderr, "convert_dspreset_to_xsynth_sfz failed\n");
+            return 2;
+        }
+        fprintf(stderr, "[sfz_render] converted: %s (%d knobs, %d tabs)\n",
+                sfz_path, knob_count, tab_count);
     }
-    fprintf(stderr, "[sfz_render] converted: %s (%d knobs, %d tabs)\n",
-            sfz_path, knob_count, tab_count);
 
     /* Step 2: spin up xsynth, load the converted SFZ. */
     XSynthHandle *synth = xshim_create(rate, 2);

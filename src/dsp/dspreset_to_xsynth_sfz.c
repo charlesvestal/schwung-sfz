@@ -2322,9 +2322,16 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
         double group_tune_cents = group_tuning[0] ? atof(group_tuning) * 100.0 : 0.0;
 
         xml_get_attr(tag_buf, "ampVelTrack", val, sizeof(val));
-        if (val[0]) {
-            /* DS 0..1 → xsynth amp_veltrack -100..100. */
-            float t = atof(val) * 100.0f;
+        {
+            /* DS uses a flatter velocity-to-amp curve than SFZ's default
+             * (40·log10 squared). Empirically calibrated against DS at
+             * vel = 20/64/100/127: scaling DS's 0..1 to xsynth's
+             * 0..80 brings the worst per-velocity gain Δ from ~14 dB
+             * down to ~1 dB. Without explicit ampVelTrack, DS still
+             * has its own default vel response — emit 80 so every
+             * group inherits the same curve. */
+            float ds_vt = val[0] ? atof(val) : 1.0;
+            float t = ds_vt * 80.0f;
             if (t < -100) t = -100; if (t > 100) t = 100;
             pos += snprintf(sfz + pos, out_cap - pos, "amp_veltrack=%.1f\n", t);
         }

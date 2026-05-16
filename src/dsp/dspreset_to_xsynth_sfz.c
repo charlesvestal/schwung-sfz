@@ -1358,6 +1358,35 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
         if (gain_idx < 0 && strcmp(fx[i].type, "gain") == 0) gain_idx = i;
     }
 
+    /* Phase 7b / 2026-05-16: per-group modulator state. `level="group"`
+     * <lfo>/<envelope> bindings target a specific group via `groupIndex`
+     * or `position`; we collect their parameters here and emit them on
+     * the matching `<group>` SFZ block during the group walk below.
+     * Groups with no group-scoped modulators leave these zero (treated
+     * as inactive by xsynth). */
+    typedef struct {
+        double amp_lfo_freq;
+        double amp_lfo_depth_db;
+        double fil_lfo_freq;
+        double fil_lfo_depth_cents;
+        double pan_lfo_freq;
+        double pan_lfo_depth_pct;
+        double pitch_lfo_freq;
+        double pitch_lfo_depth_cents;
+        double fileg_attack_s;
+        double fileg_decay_s;
+        double fileg_sustain;
+        double fileg_release_s;
+        double fileg_depth_cents;
+        /* When fileg targets this group, override the static cutoff
+         * to the env's low endpoint so the envelope swing is audible
+         * (mirrors the global case in apply_ui_overrides). */
+        double fileg_cutoff_floor;
+    } per_group_mod_t;
+    per_group_mod_t pgm[DS_MAX_GROUPS];
+    memset(pgm, 0, sizeof(pgm));
+    for (int i = 0; i < DS_MAX_GROUPS; i++) pgm[i].fileg_sustain = 1.0;
+
     /* === Phase 11: parse <modulators><lfo> blocks ===
      * MVP: amp LFO (tremolo). Look for any <lfo> whose first <binding>
      * targets LEVEL or AMP_VOLUME and emit `amplfo_freq` /
@@ -1437,23 +1466,34 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
                     if (btl > 511) btl = 511;
                     memcpy(btag, bt, btl);
                     btag[btl] = '\0';
-                    char param[64], omin[32], omax[32], blevel[16];
+                    char param[64], omin[32], omax[32], blevel[16],
+                         bgrp[16], bpos[16];
                     xml_get_attr(btag, "parameter", param, sizeof(param));
                     xml_get_attr(btag, "translationOutputMin", omin, sizeof(omin));
                     xml_get_attr(btag, "translationOutputMax", omax, sizeof(omax));
                     xml_get_attr(btag, "level", blevel, sizeof(blevel));
-                    /* MVP: only honor instrument-level modulator bindings.
-                     * `level="group"` bindings target a specific group
-                     * (often gated by a tab/button) and need per-group
-                     * modulator support we don't have yet. Applying them
-                     * globally would modulate groups the author wanted
-                     * left alone (01 WörliTzer's autowah/vibrato are
-                     * bound to a group disabled in the default tab). */
-                    if (blevel[0] && strcmp(blevel, "instrument") != 0) {
+                    xml_get_attr(btag, "groupIndex", bgrp, sizeof(bgrp));
+                    xml_get_attr(btag, "position", bpos, sizeof(bpos));
+                    /* Phase 7b: route level="group" modulator bindings
+                     * to per-group state. `groupIndex` (newer DS) and
+                     * `position` (older DS) both name the target
+                     * group's 0-based index in the <groups> list. */
+                    int target_group = -1;
+                    int is_group_scoped = (blevel[0] &&
+                                           strcmp(blevel, "group") == 0);
+                    if (is_group_scoped) {
+                        if (bgrp[0]) target_group = atoi(bgrp);
+                        else if (bpos[0]) target_group = atoi(bpos);
+                        if (target_group < 0 || target_group >= DS_MAX_GROUPS) {
+                            bp = bte + 1; continue;
+                        }
+                    } else if (blevel[0] && strcmp(blevel, "instrument") != 0) {
+                        /* Unknown scope (e.g. tag) — skip. */
                         bp = bte + 1; continue;
                     }
                     if (strcmp(param, "FX_FILTER_FREQUENCY") == 0
-                            && fil_lfo_freq == 0.0 && fil_lfo_freq_cc < 0) {
+                            && (is_group_scoped ||
+                                (fil_lfo_freq == 0.0 && fil_lfo_freq_cc < 0))) {
                         double output_min = omin[0] ? atof(omin) : 0.0;
                         double output_max = omax[0] ? atof(omax) : 1.0;
                         double full_swing_hz = (output_max - output_min) * 0.5;
@@ -1466,6 +1506,11 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
                         double swing_ratio = full_swing_hz / 1000.0;
                         double max_depth_cents = 1200.0 * log2(1.0 + swing_ratio);
                         if (max_depth_cents > 2400.0) max_depth_cents = 2400.0;
+                        if (is_group_scoped) {
+                            pgm[target_group].fil_lfo_freq = freq;
+                            pgm[target_group].fil_lfo_depth_cents = max_depth_cents * mod_amount;
+                            bp = bte + 1; continue;
+                        }
                         fil_lfo_freq = freq;
                         fil_lfo_depth_cents = max_depth_cents * mod_amount;
 
@@ -1549,7 +1594,7 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
                     }
                     if ((strcmp(param, "PITCH") == 0 ||
                          strcmp(param, "GROUP_TUNING") == 0)
-                            && pitch_lfo_freq == 0.0) {
+                            && (is_group_scoped || pitch_lfo_freq == 0.0)) {
                         double output_min = omin[0] ? atof(omin) : -1.0;
                         double output_max = omax[0] ? atof(omax) :  1.0;
                         double full_swing = (output_max - output_min) * 0.5;
@@ -1560,11 +1605,17 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
                          * Cap ±1200 cents (one octave). */
                         double depth_cents = full_swing * 100.0 * mod_amount;
                         if (depth_cents > 1200.0) depth_cents = 1200.0;
+                        if (is_group_scoped) {
+                            pgm[target_group].pitch_lfo_freq = freq;
+                            pgm[target_group].pitch_lfo_depth_cents = depth_cents;
+                            bp = bte + 1; continue;
+                        }
                         pitch_lfo_freq = freq;
                         pitch_lfo_depth_cents = depth_cents;
                     }
                     if (strcmp(param, "PAN") == 0
-                            && pan_lfo_freq == 0.0 && pan_lfo_freq_cc < 0) {
+                            && (is_group_scoped ||
+                                (pan_lfo_freq == 0.0 && pan_lfo_freq_cc < 0))) {
                         double output_min = omin[0] ? atof(omin) : -1.0;
                         double output_max = omax[0] ? atof(omax) :  1.0;
                         double full_swing = (output_max - output_min) * 0.5;
@@ -1573,17 +1624,28 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
                          * percent (-100..100). Full swing of 1 → 100%. */
                         double max_depth_pct = full_swing * 100.0;
                         if (max_depth_pct > 100.0) max_depth_pct = 100.0;
+                        if (is_group_scoped) {
+                            pgm[target_group].pan_lfo_freq = freq;
+                            pgm[target_group].pan_lfo_depth_pct = max_depth_pct * mod_amount;
+                            bp = bte + 1; continue;
+                        }
                         pan_lfo_freq = freq;
                         pan_lfo_depth_pct = max_depth_pct * mod_amount;
                     }
                     if ((strcmp(param, "LEVEL") == 0 || strcmp(param, "AMP_VOLUME") == 0)
-                            && amp_lfo_freq == 0.0 && amp_lfo_freq_cc < 0) {
+                            && (is_group_scoped ||
+                                (amp_lfo_freq == 0.0 && amp_lfo_freq_cc < 0))) {
                         double output_min = omin[0] ? atof(omin) : 0.0;
                         double output_max = omax[0] ? atof(omax) : 1.0;
                         double full_swing = (output_max - output_min) * 0.5;
                         if (full_swing < 0) full_swing = -full_swing;
                         double max_depth = 20.0 * log10(1.0 + full_swing);
                         if (max_depth > 24.0) max_depth = 24.0;
+                        if (is_group_scoped) {
+                            pgm[target_group].amp_lfo_freq = freq;
+                            pgm[target_group].amp_lfo_depth_db = max_depth * mod_amount;
+                            bp = bte + 1; continue;
+                        }
                         /* Default static: scale by XML modAmount. */
                         amp_lfo_freq = freq;
                         amp_lfo_depth_db = max_depth * mod_amount;
@@ -1713,22 +1775,32 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
                     if (btl > 511) btl = 511;
                     memcpy(btag, bt, btl);
                     btag[btl] = '\0';
-                    char param[64], omin[32], omax[32], ttable[256], txform[32], blevel[16];
+                    char param[64], omin[32], omax[32], ttable[256], txform[32],
+                         blevel[16], bgrp[16], bpos[16];
                     xml_get_attr(btag, "parameter", param, sizeof(param));
                     xml_get_attr(btag, "translationOutputMin", omin, sizeof(omin));
                     xml_get_attr(btag, "translationOutputMax", omax, sizeof(omax));
                     xml_get_attr(btag, "translationTable", ttable, sizeof(ttable));
                     xml_get_attr(btag, "translation", txform, sizeof(txform));
                     xml_get_attr(btag, "level", blevel, sizeof(blevel));
-                    /* Skip group-level envelopes — they target a single
-                     * group (gated by a tab/button) and applying them to
-                     * all voices muffles unrelated groups. Phase 7b will
-                     * route these properly per-group. */
-                    if (blevel[0] && strcmp(blevel, "instrument") != 0) {
+                    xml_get_attr(btag, "groupIndex", bgrp, sizeof(bgrp));
+                    xml_get_attr(btag, "position", bpos, sizeof(bpos));
+                    /* Phase 7b: route level="group" envelope bindings to
+                     * per-group fileg state. */
+                    int target_group = -1;
+                    int is_group_scoped = (blevel[0] &&
+                                           strcmp(blevel, "group") == 0);
+                    if (is_group_scoped) {
+                        if (bgrp[0]) target_group = atoi(bgrp);
+                        else if (bpos[0]) target_group = atoi(bpos);
+                        if (target_group < 0 || target_group >= DS_MAX_GROUPS) {
+                            bp = bte + 1; continue;
+                        }
+                    } else if (blevel[0] && strcmp(blevel, "instrument") != 0) {
                         bp = bte + 1; continue;
                     }
                     if (strcmp(param, "FX_FILTER_FREQUENCY") == 0
-                            && fileg_depth_cents == 0.0) {
+                            && (is_group_scoped || fileg_depth_cents == 0.0)) {
                         double output_min = omin[0] ? atof(omin) : 0.0;
                         double output_max = omax[0] ? atof(omax) : 1.0;
                         /* When the binding uses translation="table" with
@@ -1767,6 +1839,21 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
                         double max_depth_cents = 1200.0 * log2(output_max / (output_min > 1.0 ? output_min : 1.0));
                         if (max_depth_cents > 9600.0) max_depth_cents = 9600.0;
                         if (max_depth_cents < 0.0)    max_depth_cents = 0.0;
+                        if (is_group_scoped) {
+                            pgm[target_group].fileg_depth_cents = max_depth_cents;
+                            pgm[target_group].fileg_attack_s  = a[0]  ? atof(a)  : 0.0;
+                            pgm[target_group].fileg_decay_s   = d[0]  ? atof(d)  : 0.0;
+                            pgm[target_group].fileg_sustain   = s[0]  ? atof(s)  : 1.0;
+                            pgm[target_group].fileg_release_s = rl[0] ? atof(rl) : 0.0;
+                            /* Group-scoped fileg needs its OWN cutoff
+                             * floor (per-region cutoff= on this group's
+                             * regions). The global lowpass stays at its
+                             * authored cutoff for other groups. */
+                            if (output_min > 0.0 && output_min < output_max) {
+                                pgm[target_group].fileg_cutoff_floor = output_min;
+                            }
+                            bp = bte + 1; continue;
+                        }
                         fileg_depth_cents = max_depth_cents;
                         fileg_attack_s  = a[0]  ? atof(a)  : 0.0;
                         fileg_decay_s   = d[0]  ? atof(d)  : 0.0;
@@ -2051,6 +2138,51 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
         tag_buf[tlen] = '\0';
 
         pos += snprintf(sfz + pos, out_cap - pos, "<group>\n");
+
+        /* Phase 7b: per-group modulators from level="group" <lfo> /
+         * <envelope> bindings. SFZ inheritance carries these to every
+         * region in the group, so groups the author left modulator-
+         * free play unmodulated even when other groups have autowah
+         * or vibrato active (the 01 WörliTzer vs WobbliTzer story). */
+        if (group_idx >= 0 && group_idx < DS_MAX_GROUPS) {
+            const per_group_mod_t *m = &pgm[group_idx];
+            if (m->amp_lfo_freq > 0.0 || m->amp_lfo_depth_db > 0.0) {
+                pos += snprintf(sfz + pos, out_cap - pos,
+                                "amplfo_freq=%.4f\namplfo_depth=%.2f\n",
+                                m->amp_lfo_freq, m->amp_lfo_depth_db);
+            }
+            if (m->fil_lfo_freq > 0.0 || m->fil_lfo_depth_cents > 0.0) {
+                pos += snprintf(sfz + pos, out_cap - pos,
+                                "fillfo_freq=%.4f\nfillfo_depth=%.2f\n",
+                                m->fil_lfo_freq, m->fil_lfo_depth_cents);
+            }
+            if (m->pan_lfo_freq > 0.0 && m->pan_lfo_depth_pct > 0.0) {
+                pos += snprintf(sfz + pos, out_cap - pos,
+                                "panlfo_freq=%.4f\npanlfo_depth=%.2f\n",
+                                m->pan_lfo_freq, m->pan_lfo_depth_pct);
+            }
+            if (m->pitch_lfo_freq > 0.0 && m->pitch_lfo_depth_cents > 0.0) {
+                pos += snprintf(sfz + pos, out_cap - pos,
+                                "pitchlfo_freq=%.4f\npitchlfo_depth=%.2f\n",
+                                m->pitch_lfo_freq, m->pitch_lfo_depth_cents);
+            }
+            if (m->fileg_depth_cents > 0.0) {
+                pos += snprintf(sfz + pos, out_cap - pos,
+                                "fileg_attack=%.4f\nfileg_decay=%.4f\n"
+                                "fileg_sustain=%.4f\nfileg_release=%.4f\n"
+                                "fileg_depth=%.2f\n",
+                                m->fileg_attack_s, m->fileg_decay_s,
+                                m->fileg_sustain, m->fileg_release_s,
+                                m->fileg_depth_cents);
+                /* Per-group cutoff floor so the autowah swings the
+                 * full table range on THIS group only. */
+                if (m->fileg_cutoff_floor > 0.0) {
+                    pos += snprintf(sfz + pos, out_cap - pos,
+                                    "cutoff=%.2f\n",
+                                    m->fileg_cutoff_floor);
+                }
+            }
+        }
 
         /* trigger="release" → emit `trigger=release` so xsynth fires these
          * regions on NoteOff (release sample / key-up thump) and NOT on

@@ -2023,10 +2023,35 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
             gp = gt + 1;
         }
     }
+    /* MOVE FORK / 2026-05-16: detect round-robin so we don't penalize
+     * RR groups (only one fires per note) with the multi-group
+     * headroom intended for overlapping layers. */
+    int groups_is_rr_for_scale = 0;
+    {
+        const char *gp = strstr(src, "<groups");
+        if (gp) {
+            const char *ge = strchr(gp, '>');
+            if (ge) {
+                char gb[1024];
+                int gl = ge - gp; if (gl > 1023) gl = 1023;
+                memcpy(gb, gp, gl); gb[gl] = '\0';
+                char gm[32];
+                xml_get_attr(gb, "seqMode", gm, sizeof(gm));
+                if (strcmp(gm, "round_robin") == 0) groups_is_rr_for_scale = 1;
+            }
+        }
+    }
     double mix_headroom_db = 0.0;
-    if (active_group_count > 1) {
-        /* -10·log10(N): power-preserving for correlated signals. */
-        mix_headroom_db = -10.0 *
+    if (active_group_count > 1 && !groups_is_rr_for_scale) {
+        /* MOVE FORK / 2026-05-16: switched -10·log10(N) (power-
+         * preserving, correct for uncorrelated layers) to
+         * -20·log10(N) (avg-preserving, correct for correlated
+         * sample layers — the dominant case in real DS libraries
+         * like Cosmos / K4-Acoustic where the same source plays
+         * across multiple groups). Brings 15_per_group_mod from
+         * 5.4 dB → ~2 dB band Δ. RR (where only one group fires
+         * per note) skips this entirely via groups_is_rr_for_scale. */
+        mix_headroom_db = -20.0 *
                           (log(active_group_count) / log(10.0));
     }
 

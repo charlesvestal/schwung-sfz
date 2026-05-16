@@ -1423,6 +1423,21 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
     double fileg_attack_s = 0.0, fileg_decay_s = 0.0;
     double fileg_sustain  = 1.0, fileg_release_s = 0.0;
     double fileg_depth_cents = 0.0;
+    /* MOVE FORK / 2026-05-16: when DS's envelope binding declares
+     * translation="linear" with explicit min/max Hz, the captured sweep
+     * is linear-in-Hz. SFZ-spec fileg adds level·depth cents, which is
+     * exponential — endpoints match but the midpoint differs by ~one
+     * octave. We work around it by emitting a `<curve>` table that maps
+     * [0,1] envelope level → [0,1] fraction of total exp-cents depth
+     * such that the resulting Hz traces the linear-Hz line. xsynth-core
+     * picks up the curve via the `fileg_curve=<id>` opcode we emit
+     * alongside fileg_depth. linear_hz_lo/hi are the binding's
+     * translationOutputMin/Max; depth_cents stays
+     * 1200*log2(hi/lo). */
+    int    fileg_linear_hz = 0;
+    double fileg_linear_hz_lo = 0.0;
+    double fileg_linear_hz_hi = 0.0;
+    int    fileg_curve_id    = -1;
     /* Phase 11: pitch LFO (vibrato). Cents at peak. */
     double pitch_lfo_freq = 0.0;
     double pitch_lfo_depth_cents = 0.0;
@@ -1875,6 +1890,28 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
                         fileg_decay_s   = d[0]  ? atof(d)  : 0.0;
                         fileg_sustain   = s[0]  ? atof(s)  : 1.0;
                         fileg_release_s = rl[0] ? atof(rl) : 0.0;
+                        /* MOVE FORK / 2026-05-16: linear-Hz sweep
+                         * needs a curve table to match DS's
+                         * midpoint. See the fileg_linear_hz_* decl
+                         * above. Only meaningful with explicit
+                         * Min/Max attrs (range > 0). */
+                        if ((!txform[0] || strcmp(txform, "linear") == 0)
+                                && output_min > 0.0 && output_max > output_min
+                                && curves_count < DS_MAX_CURVES) {
+                            fileg_linear_hz    = 1;
+                            fileg_linear_hz_lo = output_min;
+                            fileg_linear_hz_hi = output_max;
+                            fileg_curve_id     = 100 + curves_count;
+                            ds_curve_t *cv     = &curves[curves_count++];
+                            cv->id = fileg_curve_id;
+                            double denom = log2(output_max / output_min);
+                            for (int ci = 0; ci < 128; ci++) {
+                                double t = (double)ci / 127.0;
+                                double f = output_min +
+                                           (output_max - output_min) * t;
+                                cv->v[ci] = log2(f / output_min) / denom;
+                            }
+                        }
                         /* Override the static cutoff to the envelope's
                          * low endpoint so the filter starts CLOSED and
                          * opens to the high endpoint at envelope peak.
@@ -2084,6 +2121,14 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
                         "fileg_release=%.4f\nfileg_depth=%.2f\n",
                         fileg_attack_s, fileg_decay_s, fileg_sustain,
                         fileg_release_s, fileg_depth_cents);
+        /* MOVE FORK / 2026-05-16: bake DS's linear-Hz envelope sweep
+         * into a curve table so xsynth (SFZ exp-cents domain) lands on
+         * DS's midpoint. Without the curve our endpoints match (200 /
+         * 8000 Hz) but the half-attack point sits an octave high. */
+        if (fileg_linear_hz && fileg_curve_id >= 0) {
+            pos += snprintf(sfz + pos, out_cap - pos,
+                            "fileg_curve=%d\n", fileg_curve_id);
+        }
     }
     /* Phase 11: pitch LFO (vibrato). */
     if (pitch_lfo_freq > 0.0 && pitch_lfo_depth_cents > 0.0) {
@@ -2511,6 +2556,20 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
                 int p = atoi(val);
                 if (p < -100) p = -100; if (p > 100) p = 100;
                 pos += snprintf(sfz + pos, out_cap - pos, "pan=%d\n", p);
+            }
+            /* Per-sample <sample volume="..."> (DS supports it for
+             * velocity-layer balancing). Accepts "-6dB" or a raw dB
+             * value. SFZ region-level volume in dB. */
+            xml_get_attr(stag, "volume", val, sizeof(val));
+            if (val[0]) {
+                double v_db = atof(val);
+                /* Strip trailing "dB" / "DB" by truncation — atof already
+                 * stopped at the suffix so we just pass the number. */
+                int vi = (int)(v_db >= 0 ? v_db + 0.5 : v_db - 0.5);
+                if (vi < -144) vi = -144;
+                if (vi >    6) vi =    6;
+                if (vi != 0)
+                    pos += snprintf(sfz + pos, out_cap - pos, "volume=%d\n", vi);
             }
             xml_get_attr(stag, "loopEnabled", val, sizeof(val));
             if (val[0])

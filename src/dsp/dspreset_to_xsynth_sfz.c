@@ -2852,16 +2852,18 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
                 if (vi != 0)
                     pos += snprintf(sfz + pos, out_cap - pos, "volume=%d\n", vi);
             }
-            /* MOVE FORK / 2026-05-16: each <sample> opts in to looping
-             * via its own `loopEnabled`. DS accepts "true"/"1"/"yes"
-             * as truthy. When the sample omits the attribute, default
-             * to one-shot — DON'T inherit from the <groups> parent;
-             * that was the old behavior and caused unexpected looping
-             * for sibling samples after one author opted in. */
+            /* MOVE FORK / 2026-05-16: match DS spec — loopEnabled
+             * inherits from the <groups> parent unless the <sample>
+             * explicitly overrides it. Per-sample emit (rather than
+             * one global opcode) so a single `<sample loopEnabled="false">`
+             * inside a looped group still plays one-shot. DS accepts
+             * "true"/"1"/"yes" as truthy on either level. Default
+             * (neither set) is one-shot, the SFZ standard. */
             xml_get_attr(stag, "loopEnabled", val, sizeof(val));
-            int loop_on = (val[0] && (strcmp(val, "true") == 0
-                                   || strcmp(val, "1")    == 0
-                                   || strcmp(val, "yes")  == 0));
+            const char *loop_attr = val[0] ? val : wrap_loop;
+            int loop_on = (loop_attr[0] && (strcmp(loop_attr, "true") == 0
+                                         || strcmp(loop_attr, "1")    == 0
+                                         || strcmp(loop_attr, "yes")  == 0));
             pos += snprintf(sfz + pos, out_cap - pos, "loop_mode=%s\n",
                             loop_on ? "loop_continuous" : "no_loop");
             xml_get_attr(stag, "loopStart", val, sizeof(val));

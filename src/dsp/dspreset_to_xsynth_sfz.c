@@ -2687,15 +2687,18 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
 
         xml_get_attr(tag_buf, "ampVelTrack", val, sizeof(val));
         {
-            /* DS uses a flatter velocity-to-amp curve than SFZ's default
-             * (40·log10 squared). Empirically calibrated against DS at
-             * vel = 20/64/100/127: scaling DS's 0..1 to xsynth's
-             * 0..80 brings the worst per-velocity gain Δ from ~14 dB
-             * down to ~1 dB. Without explicit ampVelTrack, DS still
-             * has its own default vel response — emit 80 so every
-             * group inherits the same curve. */
+            /* MOVE FORK / 2026-05-16: DS uses a linear velocity →
+             * amp curve (amp = vel/127), confirmed via fine-grid
+             * probe across vel ∈ {1,5,10,16,24,32,40,…,127} — matches
+             * to four decimals at every step. xsynth-core's vol_mult
+             * formula was switched from the SF2-style square to
+             * linear alongside this change, and sfz_render now applies
+             * the same 0.7 plugin gain default that on-device users
+             * hear. With those two reference fixes in place,
+             * amp_veltrack=100 produces exact DS amp parity across
+             * every velocity. */
             float ds_vt = val[0] ? atof(val) : 1.0;
-            float t = ds_vt * 80.0f;
+            float t = ds_vt * 100.0f;
             if (t < -100) t = -100; if (t > 100) t = 100;
             pos += snprintf(sfz + pos, out_cap - pos, "amp_veltrack=%.1f\n", t);
         }

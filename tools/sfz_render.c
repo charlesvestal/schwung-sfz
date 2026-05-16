@@ -236,7 +236,13 @@ int main(int argc, char **argv) {
         uint32_t want = total_frames - rendered;
         if (want > BLOCK_FRAMES) want = BLOCK_FRAMES;
         xshim_render(synth, buf_f, BLOCK_FRAMES * 2);
-        for (uint32_t i = 0; i < want * 2; i++) buf_i[i] = to_i16(buf_f[i]);
+        /* MOVE FORK / 2026-05-16: mirror the on-device plugin's
+         * `gain` default (xsynth_plugin.c sets inst->gain = 0.7 at
+         * preset load) so parity captures align with what the user
+         * actually hears on Move. Without this scale, sfz_render is
+         * +3 dB hotter than the plugin, biasing every gain Δ in the
+         * parity suite and masking velocity-curve mismatches. */
+        for (uint32_t i = 0; i < want * 2; i++) buf_i[i] = to_i16(buf_f[i] * 0.7f);
         fwrite(buf_i, 2, want * 2, wf);
         rendered += want;
     }

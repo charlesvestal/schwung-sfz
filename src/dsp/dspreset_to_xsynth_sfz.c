@@ -2400,8 +2400,16 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
 
             pos += snprintf(sfz + pos, out_cap - pos, "<region>\n");
 
-            xml_get_attr(stag, "rootNote", val, sizeof(val));
-            if (val[0]) pos += snprintf(sfz + pos, out_cap - pos, "pitch_keycenter=%s\n", val);
+            /* Stash the rootNote for later — we may bump it by an
+             * integer-semitone tuning offset since xsynth has no
+             * `transpose=` opcode and `tune=` only covers ±100 cents.
+             * Shifting pitch_keycenter up by N semitones makes the
+             * sample render N semitones lower when played at the
+             * same MIDI note. */
+            int root_note = 60;
+            char root_str[16] = "";
+            xml_get_attr(stag, "rootNote", root_str, sizeof(root_str));
+            if (root_str[0]) root_note = atoi(root_str);
             xml_get_attr(stag, "path", val, sizeof(val));
             if (val[0]) {
                 /* Windows backslash → forward slash. */
@@ -2434,14 +2442,35 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
             xml_get_attr(stag, "tuning", val, sizeof(val));
             double total_cents = group_tune_cents;
             if (val[0]) total_cents += atof(val) * 100.0;
+            int semis = 0;
+            int cents = 0;
             if (total_cents != 0.0) {
-                int cents = (int)(total_cents >= 0 ? total_cents + 0.5
-                                                   : total_cents - 0.5);
-                if (cents < -2400) cents = -2400;
-                if (cents >  2400) cents =  2400;
-                if (cents != 0)
-                    pos += snprintf(sfz + pos, out_cap - pos, "tune=%d\n", cents);
+                /* Split into integer-semitones (folded into
+                 * pitch_keycenter) and the fractional remainder (tune).
+                 * xsynth has no `transpose=` opcode and `tune=` is
+                 * bounded to ±100 cents. DS-style tunings like -50
+                 * semitones need to come from shifting pitch_keycenter:
+                 * raising root_note by N st makes the sample render N
+                 * st lower at the same MIDI note. */
+                double rem = total_cents;
+                if (rem >= 100.0 || rem <= -100.0) {
+                    semis = (int)(rem / 100.0);
+                    rem -= semis * 100.0;
+                }
+                cents = (int)(rem >= 0 ? rem + 0.5 : rem - 0.5);
+                if (cents < -100) cents = -100;
+                if (cents >  100) cents =  100;
             }
+            /* Negative DS tuning lowers pitch → raise root_note.
+             * Clamp to MIDI 0..127 (so a wildly large tuning falls
+             * off the playable range, which is the DS behavior too). */
+            int adjusted_root = root_note - semis;
+            if (adjusted_root < 0)   adjusted_root = 0;
+            if (adjusted_root > 127) adjusted_root = 127;
+            pos += snprintf(sfz + pos, out_cap - pos,
+                            "pitch_keycenter=%d\n", adjusted_root);
+            if (cents != 0)
+                pos += snprintf(sfz + pos, out_cap - pos, "tune=%d\n", cents);
             xml_get_attr(stag, "pan", val, sizeof(val));
             if (val[0]) {
                 int p = atoi(val);

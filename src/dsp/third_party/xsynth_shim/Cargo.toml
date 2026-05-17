@@ -1,0 +1,26 @@
+[package]
+name = "xsynth-shim"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "xsynth_shim"
+crate-type = ["staticlib"]
+
+[dependencies]
+xsynth-core = { path = "../xsynth/core" }
+# Cargo merges features across the dep tree: enabling `aiff` here turns it on
+# inside xsynth-core's symphonia probe too. Required for the AIFF samples
+# many DecentSampler libraries ship (WörliTzer, etc.). symphonia's `wav`
+# feature is pulled implicitly by xsynth-core; we only need to add aiff.
+symphonia = { version = "0.5.4", default-features = false, features = ["aiff"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+# `unwind` (not `abort`) so catch_unwind in the shim can intercept symphonia /
+# xsynth panics and surface them as a normal load error instead of killing the
+# whole schwung process.
+panic = "unwind"

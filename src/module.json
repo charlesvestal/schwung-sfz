@@ -1,11 +1,11 @@
 {
   "id": "sfz",
-  "name": "SFZ Player",
-  "abbrev": "SZ",
-  "version": "0.4.0",
-  "description": "SFZ and DecentSampler (.dspreset) player using sfizz engine",
-  "author": "sfizz by sfztools (port: charlesvestal)",
-  "license": "BSD-2-Clause",
+  "name": "Multisampler",
+  "abbrev": "MSP",
+  "version": "0.5.0",
+  "description": "Multisample instrument player for SFZ and DecentSampler libraries — pianos, keys, drums, orchestral, and more.",
+  "author": "charlesvestal",
+  "license": "LGPL-3.0",
   "ui": "ui.js",
   "dsp": "dsp.so",
   "api_version": 2,
@@ -20,7 +20,7 @@
     "ui_hierarchy": {
       "levels": {
         "root": {
-          "name": "SFZ",
+          "name": "Multisample",
           "params": [
             {
               "key": "preset",
@@ -44,7 +44,15 @@
               "type": "float",
               "min": 0,
               "max": 2,
-              "default": 1.0
+              "default": 0.7
+            },
+            {
+              "key": "funverb",
+              "label": "Funverb",
+              "type": "float",
+              "min": 0,
+              "max": 1,
+              "default": 0.0
             },
             {
               "key": "voices",
@@ -52,7 +60,15 @@
               "type": "int",
               "min": 4,
               "max": 128,
-              "default": 24
+              "default": 14
+            },
+            {
+              "key": "knob_preset",
+              "label": "Knob Preset",
+              "type": "int",
+              "min": 0,
+              "max": 7,
+              "default": 0
             }
           ],
           "knobs": [
@@ -71,13 +87,13 @@
   },
   "assets": {
     "path": "instruments",
-    "label": "SFZ Instruments",
+    "label": "Sample Libraries",
     "extensions": [
       ".sfz",
       ".dspreset"
     ],
-    "description": "Upload SFZ or DecentSampler instruments. Either folders containing .sfz/.dspreset and sample files, or loose .sfz files with samples in adjacent folders.",
-    "hint": "Find SFZ instruments at",
+    "description": "Upload SFZ or DecentSampler sample libraries. Either folders containing .sfz/.dspreset files plus sample audio, or loose .sfz files with samples in an adjacent folder.",
+    "hint": "Find free sample libraries at",
     "hint_url": "https://sfzinstruments.github.io/",
     "hint_url_label": "SFZ Instruments"
   },

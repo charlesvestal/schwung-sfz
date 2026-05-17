@@ -1,157 +1,97 @@
 #!/usr/bin/env bash
-# Build SFZ module for Move Anything (ARM64)
+# Build Multisampler module for Schwung (ARM64).
 #
-# Builds sfizz from source via CMake, then compiles the plugin.
-# Automatically uses Docker for cross-compilation if needed.
+# Module id stays "sfz" for seamless upgrades from the previous SFZ Player
+# (the build paths, tarball name, and on-device install dir keep that name
+# too). User-facing name is "Multisampler"; see module.json.
+#
+# Uses xsynth as the engine. Cross-compile via Docker, which carries both
+# aarch64-linux-gnu-gcc and a Rust nightly + the aarch64-unknown-linux-gnu
+# target.
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 IMAGE_NAME="move-anything-sfz-builder"
 
-# Check if we need Docker
 if [ -z "$CROSS_PREFIX" ] && [ ! -f "/.dockerenv" ]; then
-    echo "=== SFZ Module Build (via Docker) ==="
-    echo ""
-
-    # Build Docker image if needed
+    echo "=== Multisampler Build (via Docker) ==="
     if ! docker image inspect "$IMAGE_NAME" &>/dev/null; then
         echo "Building Docker image (first time only)..."
         docker build -t "$IMAGE_NAME" -f "$SCRIPT_DIR/Dockerfile" "$REPO_ROOT"
-        echo ""
     fi
-
-    # Run build inside container
-    echo "Running build..."
     docker run --rm \
         -v "$REPO_ROOT:/build" \
         -u "$(id -u):$(id -g)" \
         -w /build \
         "$IMAGE_NAME" \
         ./scripts/build.sh
-
     echo ""
     echo "=== Done ==="
     exit 0
 fi
 
-# === Actual build (runs in Docker or with cross-compiler) ===
 CROSS_PREFIX="${CROSS_PREFIX:-aarch64-linux-gnu-}"
-
 cd "$REPO_ROOT"
 
-echo "=== Building SFZ Module ==="
+echo "=== Building Multisampler (xsynth) ==="
 echo "Cross prefix: $CROSS_PREFIX"
 
-# Create build directories
-mkdir -p build/sfizz-build
-mkdir -p dist/sfz
+mkdir -p build dist/sfz
 
-# --- Step 1: Build sfizz as a static library ---
-SFIZZ_DIR="src/dsp/third_party/sfizz"
-
-if [ ! -f "build/sfizz-build/library/lib/libsfizz.a" ]; then
-    echo ""
-    echo "=== Building sfizz library ==="
-
-    # Ensure submodule is initialized
-    if [ ! -f "$SFIZZ_DIR/CMakeLists.txt" ]; then
-        echo "Error: sfizz submodule not initialized."
-        echo "Run: git submodule update --init --recursive"
-        exit 1
-    fi
-
-    # Create CMake toolchain file for ARM64 cross-compilation
-    cat > build/aarch64-toolchain.cmake << 'TOOLCHAIN_EOF'
-set(CMAKE_SYSTEM_NAME Linux)
-set(CMAKE_SYSTEM_PROCESSOR aarch64)
-set(CMAKE_C_COMPILER aarch64-linux-gnu-gcc)
-set(CMAKE_CXX_COMPILER aarch64-linux-gnu-g++)
-set(CMAKE_FIND_ROOT_PATH /usr/aarch64-linux-gnu)
-set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
-set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
-set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
-set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=armv8-a -mtune=cortex-a72")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=armv8-a -mtune=cortex-a72")
-TOOLCHAIN_EOF
-
-    cd build/sfizz-build
-
-    cmake "../../$SFIZZ_DIR" \
-        -DCMAKE_TOOLCHAIN_FILE=../aarch64-toolchain.cmake \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DSFIZZ_JACK=OFF \
-        -DSFIZZ_RENDER=OFF \
-        -DSFIZZ_BENCHMARKS=OFF \
-        -DSFIZZ_TESTS=OFF \
-        -DSFIZZ_DEMOS=OFF \
-        -DSFIZZ_DEVTOOLS=OFF \
-        -DPLUGIN_LV2=OFF \
-        -DPLUGIN_LV2_UI=OFF \
-        -DPLUGIN_VST3=OFF \
-        -DPLUGIN_AU=OFF \
-        -DPLUGIN_PUREDATA=OFF \
-        -DSFIZZ_SHARED=OFF \
-        -DBUILD_SHARED_LIBS=OFF
-
-    cmake --build . -j$(nproc)
-
-    cd "$REPO_ROOT"
-    echo "sfizz library built successfully"
+# --- Step 1: Build xsynth_shim (Rust staticlib) ---
+echo ""
+echo "=== Building xsynth shim ==="
+SHIM_DIR="src/dsp/third_party/xsynth_shim"
+if [ ! -f "$SHIM_DIR/Cargo.toml" ]; then
+    echo "Error: xsynth_shim crate missing. Did you run 'git submodule update --init'?"
+    exit 1
 fi
-
-# All sfizz static libraries are in library/lib/
-SFIZZ_LIB_DIR="build/sfizz-build/library/lib"
-
-if [ ! -f "$SFIZZ_LIB_DIR/libsfizz.a" ]; then
-    echo "Error: Could not find libsfizz.a in $SFIZZ_LIB_DIR"
-    find build/sfizz-build -name "*.a" 2>/dev/null | head -20
+( cd "$SHIM_DIR" && cargo +nightly build --release --target aarch64-unknown-linux-gnu )
+XSHIM_A="$SHIM_DIR/target/aarch64-unknown-linux-gnu/release/libxsynth_shim.a"
+if [ ! -f "$XSHIM_A" ]; then
+    echo "Error: shim staticlib missing at $XSHIM_A"
     exit 1
 fi
 
-echo "Found sfizz libraries in: $SFIZZ_LIB_DIR"
-
-# --- Step 2: Compile DSP plugin and link with sfizz ---
+# --- Step 2: Compile and link the plugin ---
 echo ""
 echo "=== Compiling DSP plugin ==="
+for src in src/dsp/xsynth_plugin.c src/dsp/dspreset_to_xsynth_sfz.c; do
+    obj="build/$(basename "$src" .c).o"
+    ${CROSS_PREFIX}gcc -O3 -fPIC \
+        -march=armv8-a -mtune=cortex-a72 \
+        -DNDEBUG \
+        -c "$src" \
+        -o "$obj" \
+        -Isrc/dsp
+done
 
-# Compile plugin as C, then link with C++ (sfizz is C++)
-${CROSS_PREFIX}gcc -O3 -fPIC \
+# Link the plugin as a shared lib. The shim staticlib pulls in xsynth-core,
+# symphonia (audio decoders), rayon, and the rest of the Rust runtime. C++
+# stdlib isn't needed anymore (sfizz dropped). libdl, libpthread, libm, librt
+# all required by Rust's std and rayon.
+echo "=== Linking dsp.so ==="
+${CROSS_PREFIX}gcc -O3 -shared -fPIC \
     -march=armv8-a -mtune=cortex-a72 \
-    -DNDEBUG \
-    -c src/dsp/sfz_plugin.c \
-    -o build/sfz_plugin.o \
-    -Isrc/dsp \
-    -I"$SFIZZ_DIR/src"
-
-# Link everything into dsp.so - whole-archive all static libs to resolve interdeps
-${CROSS_PREFIX}g++ -O3 -shared -fPIC \
-    -march=armv8-a -mtune=cortex-a72 \
-    build/sfz_plugin.o \
-    -Wl,--whole-archive \
-    "$SFIZZ_LIB_DIR"/lib*.a \
-    -Wl,--no-whole-archive \
+    build/xsynth_plugin.o \
+    build/dspreset_to_xsynth_sfz.o \
+    "$XSHIM_A" \
     -o build/dsp.so \
-    -lm -lpthread -ldl -lstdc++ -latomic
+    -lm -lpthread -ldl -lrt
 
-echo "DSP plugin compiled"
+echo "DSP plugin linked"
 
 # --- Step 3: Package ---
 echo ""
 echo "=== Packaging ==="
-
-# Copy files to dist (use cat to avoid ExtFS deallocation issues with Docker)
 cat src/module.json > dist/sfz/module.json
 cat src/ui.js > dist/sfz/ui.js
 cat build/dsp.so > dist/sfz/dsp.so
 [ -f src/help.json ] && cat src/help.json > dist/sfz/help.json
 chmod +x dist/sfz/dsp.so
-
-# Create instruments directory for user SFZ instruments
 mkdir -p dist/sfz/instruments
 
-# Create tarball for release
 cd dist
 tar -czvf sfz-module.tar.gz sfz/
 cd ..
@@ -161,5 +101,4 @@ echo "=== Build Complete ==="
 echo "Output: dist/sfz/"
 echo "Tarball: dist/sfz-module.tar.gz"
 echo ""
-echo "To install on Move:"
-echo "  ./scripts/install.sh"
+echo "To install on Move:  ./scripts/install.sh"

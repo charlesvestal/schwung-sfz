@@ -92,6 +92,7 @@ extern void          xshim_set_widener(XSynthHandle*, float width);
 extern uint32_t      xshim_take_noteon_count(XSynthHandle*);
 extern void          xshim_take_render_breakdown(XSynthHandle*, uint32_t *out4);
 extern uint32_t      xshim_take_underrun_count(XSynthHandle*);
+extern void          xshim_take_underrun_breakdown(XSynthHandle*, uint32_t *out3);
 extern float         xshim_estimated_voice_peak(const XSynthHandle*);
 extern size_t        xshim_last_error(char *out_buf, size_t out_len);
 extern int           xshim_load_sfz_async(XSynthHandle*, const char *path);
@@ -1482,26 +1483,43 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
      * note-on activity vs steady idle. */
     static int log_throttle = 0;
     long total_us = render_us + silence_us + clip_us;
-    int is_outlier = (total_us > 5000);
+    /* MOVE FORK / 2026-05-17: lowered outlier dump threshold from 5 ms
+     * to 2 ms so we catch the host-reported 2-5 ms residual spikes
+     * with full voice-state context. */
+    int is_outlier = (total_us > 2000);
     /* MOVE FORK / 2026-05-16: ring-underrun count for this render block.
      * Sampled (and reset) every block so per-block counts are exact.
      * Non-zero means voices read past head into an unfilled ring slot
      * — audible discontinuity. */
     uint32_t underruns = xshim_take_underrun_count(inst->synth);
-    if (is_outlier || render_us > 800 || noteons_this_block > 0 ||
-            underruns > 0 || ++log_throttle >= 256) {
+    uint32_t ubd[3] = {0};
+    xshim_take_underrun_breakdown(inst->synth, ubd);
+    /* MOVE FORK / 2026-05-17: tightened log trigger to keep SD-card
+     * file I/O off the render thread during steady playback. The host
+     * uses its own SPI frame counter for overrun detection; our log
+     * only needs to fire when something interesting happens.
+     *   - outlier: render exceeded 5 ms (real spike)
+     *   - underruns > 0: ring starvation (audible glitch)
+     *   - render > 2500 µs: ~85% of 2902 µs frame budget (near miss)
+     *   - log_throttle every 2048 blocks (~6 s): baseline heartbeat
+     * Dropped the per-noteon and render>800 µs triggers — those were
+     * firing constantly during active play and adding ~600 µs of file
+     * I/O per block. */
+    if (is_outlier || underruns > 0 || render_us > 2500 ||
+            ++log_throttle >= 2048) {
         log_throttle = 0;
         uint64_t voices_after = xshim_voice_count(inst->synth);
         uint32_t bd[4] = {0};
         xshim_take_render_breakdown(inst->synth, bd);
-        char msg[256];
+        char msg[320];
         snprintf(msg, sizeof(msg),
                  "perf: tot=%ld render=%ld sil=%ld clip=%ld silent=%d "
-                 "vb=%llu va=%llu noteon=%u underrun=%u par=%u sum=%u fx=%u tot_in=%u",
+                 "vb=%llu va=%llu noteon=%u underrun=%u(ahead=%u,behind=%u,beforehead=%u) par=%u sum=%u fx=%u tot_in=%u",
                  total_us, render_us, silence_us, clip_us, silent_path,
                  (unsigned long long)voices_before,
                  (unsigned long long)voices_after,
                  (unsigned)noteons_this_block, (unsigned)underruns,
+                 ubd[0], ubd[1], ubd[2],
                  bd[0], bd[1], bd[2], bd[3]);
         plugin_log(msg);
         if (is_outlier) {

@@ -256,20 +256,13 @@ pub unsafe extern "C" fn xshim_load_sfz(handle: *mut XSynthHandle, path: *const 
 /// is acceptable for this diagnostic build (a few hundred µs per write
 /// shouldn't drop audio at the user's typical play rate).
 #[cfg(unix)]
-fn log_note_event(tag: &str, ch: u8, key: u8, vel: u8) {
-    use std::io::Write;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let line = format!("[xshim] {tag} t={now}ms ch={ch} key={key} vel={vel}\n");
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/data/UserData/schwung/tmp/xsynth_debug.log")
-    {
-        let _ = f.write_all(line.as_bytes());
-    }
+fn log_note_event(_tag: &str, _ch: u8, _key: u8, _vel: u8) {
+    // MOVE FORK / 2026-05-17: was doing fopen/fprintf/fclose per
+    // note event on the audio thread (xshim_note_on/note_off are
+    // called by the host inside its slot timer). Each SD-card write
+    // added hundreds of µs to the host-measured slot render and
+    // contributed to SPI frame overruns. Disabled — re-enable
+    // behind a runtime flag if needed for stuck-note debugging.
 }
 #[cfg(not(unix))]
 fn log_note_event(_tag: &str, _ch: u8, _key: u8, _vel: u8) {}
@@ -325,6 +318,19 @@ pub unsafe extern "C" fn xshim_take_render_breakdown(_handle: *mut XSynthHandle,
 #[no_mangle]
 pub unsafe extern "C" fn xshim_take_underrun_count(_handle: *mut XSynthHandle) -> u32 {
     xsynth_core::soundfont::take_underrun_count()
+}
+
+/// MOVE FORK / 2026-05-17 diag: split underrun by category — `ahead`
+/// (ring not yet filled past head), `behind` (voice fell out of ring
+/// window, typically loop wrap), `before_head` (voice read pre-head
+/// frame — pathological). Writes 3 u32 into `out[0..3]`.
+#[cfg(unix)]
+#[no_mangle]
+pub unsafe extern "C" fn xshim_take_underrun_breakdown(_handle: *mut XSynthHandle, out: *mut u32) {
+    if out.is_null() { return; }
+    let (a, b, c) = xsynth_core::soundfont::take_underrun_breakdown();
+    let slot = std::slice::from_raw_parts_mut(out, 3);
+    slot[0] = a; slot[1] = b; slot[2] = c;
 }
 
 /// MOVE FORK / 2026-05-17: read the estimated worst-case single-voice
@@ -396,6 +402,25 @@ pub unsafe extern "C" fn xshim_all_notes_off(handle: *mut XSynthHandle) {
 #[no_mangle]
 pub unsafe extern "C" fn xshim_render(handle: *mut XSynthHandle, out: *mut f32, num_samples: usize) {
     if handle.is_null() || out.is_null() || num_samples == 0 { return; }
+    // MOVE FORK / 2026-05-17: enable flush-to-zero + denormals-are-zero
+    // on this render call. Long-tail voice envelopes go subnormal as
+    // they decay below ~1e-38; on ARM64 without FZ/DAZ the FPU traps
+    // each subnormal multiply for ~20× the nominal cost, pushing
+    // sustain-heavy blocks past the frame budget. Set the FPCR bits
+    // (FZ=24, DN=25) for the duration of the render. The mask covers
+    // both because we always want both set.
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    {
+        let mut fpcr: u64;
+        std::arch::asm!("mrs {0}, fpcr", out(reg) fpcr, options(nomem, nostack));
+        // Bit 24 = FZ (flush-to-zero), bit 25 = DN (default NaN, optional).
+        // Setting FZ alone gives the FTZ behavior we want; we leave DN
+        // untouched so NaN diagnostics aren't suppressed.
+        let new_fpcr = fpcr | (1u64 << 24);
+        if new_fpcr != fpcr {
+            std::arch::asm!("msr fpcr, {0}", in(reg) new_fpcr, options(nomem, nostack));
+        }
+    }
     let _ = catch_unwind(AssertUnwindSafe(|| {
         let h = &mut *handle;
         let slc = std::slice::from_raw_parts_mut(out, num_samples);

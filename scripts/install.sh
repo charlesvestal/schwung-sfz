@@ -1,5 +1,6 @@
 #!/bin/bash
-# Install SFZ module to Move
+# Install Multisampler module to Move.
+# Module id "sfz" preserved for seamless upgrades from previous SFZ Player.
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -12,7 +13,7 @@ if [ ! -d "dist/sfz" ]; then
     exit 1
 fi
 
-echo "=== Installing SFZ Module ==="
+echo "=== Installing Multisampler ==="
 
 # Deploy to Move - sound_generators subdirectory
 echo "Copying module to Move..."
@@ -25,7 +26,7 @@ if [ -d "src/chain_patches" ]; then
     scp src/chain_patches/*.json ableton@move.local:/data/UserData/schwung/patches/
 fi
 
-# Create instruments directory for user SFZ instruments
+# Create instruments directory for user sample libraries
 echo "Creating instruments directory..."
 ssh ableton@move.local "mkdir -p /data/UserData/schwung/modules/sound_generators/sfz/instruments"
 
@@ -37,5 +38,5 @@ echo ""
 echo "=== Install Complete ==="
 echo "Module installed to: /data/UserData/schwung/modules/sound_generators/sfz/"
 echo ""
-echo "Upload SFZ instrument folders to the instruments/ subdirectory."
-echo "Restart Move Anything to load the new module."
+echo "Upload SFZ or DecentSampler library folders to the instruments/ subdirectory."
+echo "Restart Schwung to load the new module."

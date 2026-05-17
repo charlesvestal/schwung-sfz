@@ -1,88 +1,92 @@
 {
-  "title": "SFZ Player",
+  "title": "Multisampler",
   "children": [
     {
       "title": "Overview",
       "lines": [
-        "SFZ sample player",
-        "using the sfizz",
-        "engine.",
+        "Plays multisample",
+        "instruments from SFZ",
+        "and DecentSampler",
+        "sample libraries.",
         "",
-        "Plays SFZ format",
-        "instruments with",
-        "full velocity layers,",
-        "round robin, and",
-        "key switching.",
+        "Pianos, keys, drums,",
+        "strings, brass — any",
+        "recorded instrument",
+        "shipped as an SFZ or",
+        ".dspreset library.",
         "",
-        "Upload SFZ instrument",
-        "folders to add more",
-        "sounds."
+        "Velocity layers, round",
+        "robin, key switching,",
+        "loops, release samples",
+        "all supported.",
+        "",
+        "Upload library folders",
+        "to add more sounds."
       ]
     },
     {
-      "title": "Setup",
+      "title": "Getting Started",
       "children": [
         {
-          "title": "Getting Instruments",
+          "title": "Finding Libraries",
           "lines": [
-            "Upload SFZ instrument",
-            "folders using the ME",
-            "Installer's asset",
-            "copy feature.",
+            "Free SFZ libraries:",
             "",
-            "Find free instruments:",
             "sfzinstruments.",
             "  github.io",
             "",
-            "drolez.com/blog/",
-            "  music/ has free",
-            "  synth sample packs",
+            "Free synth packs:",
             "",
-            "Each instrument is a",
-            "folder with .sfz and",
-            "WAV files, or a loose",
-            ".sfz with samples in",
-            "an adjacent folder."
+            "drolez.com /blog/",
+            "  music",
+            "",
+            "DecentSampler libs:",
+            "",
+            "pianobook.co.uk",
+            "",
+            "decentsamples.com"
           ]
         },
         {
-          "title": "Browsing",
+          "title": "Uploading",
           "lines": [
-            "Jog wheel scrolls",
-            "through instrument",
-            "folders (presets).",
+            "Use the Move web",
+            "uploader to copy",
+            "library folders to",
+            "the Multisample slot.",
             "",
-            "If an instrument has",
-            "multiple .sfz files,",
-            "use the menu to pick",
-            "a variant.",
+            "Each folder you upload",
+            "appears as one",
+            "instrument in the",
+            "preset browser.",
             "",
-            "Last-used variant is",
-            "remembered per",
-            "instrument."
+            "Libraries can be very",
+            "large (GB-scale).",
+            "Loading is streamed",
+            "so they fit on Move."
           ]
         },
         {
-          "title": "File Location",
+          "title": "Library Layout",
           "lines": [
             "On-device path:",
             "",
-            " instruments/",
+            " instruments /",
             "",
             "Two layouts work:",
             "",
-            "1) Folder per instrument:",
-            "  MyPiano/",
+            "1) Folder per library:",
+            "  MyPiano /",
             "   piano.sfz",
-            "   samples/*.wav",
+            "   Samples /*.wav",
             "",
             "  Multiple .sfz files",
             "  in a folder become",
-            "  variants.",
+            "  variants (presets).",
             "",
             "2) Loose .sfz files:",
-            "  Be Careful.sfz",
-            "  Be Careful Samples/",
+            "  Bell.sfz",
+            "  Bell Samples /",
             "   *.wav",
             "",
             "  Each .sfz file is",
@@ -92,47 +96,171 @@
       ]
     },
     {
-      "title": "Controls",
+      "title": "Playing",
       "children": [
         {
-          "title": "Knobs",
+          "title": "Browsing",
           "lines": [
-            "Knob 1: Octave",
-            " Transpose -4 to +4",
-            " octaves up or down",
+            "Jog wheel scrolls",
+            "the flat preset list",
+            "across all libraries.",
             "",
-            "Knob 2: Gain",
-            " Output level",
-            " 0.0 (silent) to",
-            " 2.0 (double volume)",
-            " Default: 1.0"
+            "Shift + L / R jumps",
+            "to the next or",
+            "previous library's",
+            "first preset.",
+            "",
+            "Pads play notes with",
+            "full velocity",
+            "sensitivity."
           ]
         },
         {
-          "title": "MIDI Support",
+          "title": "Knobs (Live Row)",
           "lines": [
-            "Notes:",
-            " Full velocity",
-            " sensitivity with",
-            " velocity layers",
+            "Octave:",
+            " Shift all notes",
+            " up or down by",
+            " octaves.",
+            " Range -4 to +4.",
             "",
-            "Pitch Bend:",
-            " Range per SFZ",
-            " definition",
+            "Gain:",
+            " Master output level.",
+            " 0 to 2 (double).",
+            " Default 0.7.",
             "",
-            "Aftertouch:",
-            " Channel and poly",
-            " aftertouch",
+            "Knobs 3-8:",
+            " Per-library macros",
+            " (DecentSampler",
+            " knob bindings).",
+            " Vary per preset."
+          ]
+        },
+        {
+          "title": "Voice Count",
+          "lines": [
+            "Voices:",
+            " Polyphony cap.",
+            " 4 to 128 notes.",
+            " Default 14.",
             "",
-            "All CCs forwarded",
-            "for expression,",
-            "sustain pedal, etc.",
+            "Higher = more notes",
+            "at once, more CPU.",
             "",
-            "Program Change:",
-            " Switches instrument",
-            " folder"
+            "Sustain-pedal-held",
+            "passages need more",
+            "voices than the",
+            "chord size suggests."
           ]
         }
+      ]
+    },
+    {
+      "title": "MIDI",
+      "lines": [
+        "Notes:",
+        " Velocity-sensitive,",
+        " 0 to 127.",
+        "",
+        "Pitch bend:",
+        " Range per SFZ",
+        " library definition.",
+        "",
+        "Aftertouch:",
+        " Channel and poly.",
+        "",
+        "All CCs forwarded",
+        "to library mappings",
+        "(volume, sustain,",
+        "expression, etc.).",
+        "",
+        "Program change:",
+        " Switches preset."
+      ]
+    },
+    {
+      "title": "Troubleshooting",
+      "children": [
+        {
+          "title": "No Sound",
+          "lines": [
+            "Check the library",
+            "folder contains both",
+            ".sfz / .dspreset",
+            "and sample audio",
+            "(WAV or FLAC).",
+            "",
+            "Error text in the",
+            "preset browser shows",
+            "load problems.",
+            "",
+            "'Sample not found'",
+            "means audio files",
+            "are missing from the",
+            "folder.",
+            "",
+            "'0 regions' means",
+            "the library parsed",
+            "but no samples were",
+            "mapped to keys."
+          ]
+        },
+        {
+          "title": "Missing Library",
+          "lines": [
+            "Folder must be",
+            "inside the",
+            "instruments / path.",
+            "",
+            "Folder must contain",
+            "at least one",
+            ".sfz or .dspreset",
+            "file (can be in a",
+            "subfolder up to",
+            "5 levels deep)."
+          ]
+        },
+        {
+          "title": "Audio Glitches",
+          "lines": [
+            "First note after",
+            "loading may have a",
+            "brief delay as",
+            "samples page in.",
+            "Self-resolves.",
+            "",
+            "Very large chord",
+            "bursts on heavy",
+            "libraries can",
+            "exceed CPU. Reduce",
+            "voice count or",
+            "polyphony.",
+            "",
+            "Long sample tails",
+            "with non-zero",
+            "endings get an",
+            "automatic edge",
+            "fade to suppress",
+            "click."
+          ]
+        }
+      ]
+    },
+    {
+      "title": "About",
+      "lines": [
+        "Multisampler",
+        "for Schwung.",
+        "",
+        "Uses the xsynth core",
+        "engine with disk",
+        "streaming, voice-side",
+        "sample rate",
+        "conversion, and",
+        "anti-alias playback.",
+        "",
+        "Free and open source.",
+        "LGPL-3.0 license."
       ]
     }
   ]

@@ -1017,7 +1017,7 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
         return strlen(buf);
     }
     else if (strcmp(key, "name") == 0)
-        return snprintf(buf, buf_len, "SFZ");
+        return snprintf(buf, buf_len, "Multisample");
     else if (strcmp(key, "bank_name") == 0 || strcmp(key, "instrument_name") == 0) {
         strncpy(buf, inst->instrument_name, buf_len - 1);
         buf[buf_len - 1] = '\0';

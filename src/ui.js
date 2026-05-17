@@ -1,17 +1,18 @@
 /*
- * SFZ Player Module UI
+ * Multisampler Module UI
  *
+ * Loads SFZ and DecentSampler (.dspreset) sample libraries.
  * Uses shared sound generator UI base.
- * Preset browser (jog wheel) navigates instrument folders.
+ * Preset browser (jog wheel) navigates sample library folders.
  * Variants (.sfz files within a folder) selected from menu.
  */
 
 /* Shared utilities - absolute path for module location independence */
 import { createSoundGeneratorUI } from '/data/UserData/schwung/shared/sound_generator_ui.mjs';
 
-/* Create the UI - no bank switching, preset browser handles instrument folders */
+/* Create the UI - no bank switching, preset browser handles library folders */
 const ui = createSoundGeneratorUI({
-    moduleName: 'SFZ',
+    moduleName: 'Multisample',
     showPolyphony: true,
     showOctave: true,
 });

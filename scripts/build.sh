@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
-# Build SFZ module for Move Anything (ARM64) using xsynth as the engine.
+# Build Multisampler module for Schwung (ARM64).
 #
-# Phase 1: xsynth-backed plugin. sfizz is no longer built. Cross-compile via
-# Docker, which carries both aarch64-linux-gnu-gcc and a Rust nightly + the
-# aarch64-unknown-linux-gnu target.
+# Module id stays "sfz" for seamless upgrades from the previous SFZ Player
+# (the build paths, tarball name, and on-device install dir keep that name
+# too). User-facing name is "Multisampler"; see module.json.
+#
+# Uses xsynth as the engine. Cross-compile via Docker, which carries both
+# aarch64-linux-gnu-gcc and a Rust nightly + the aarch64-unknown-linux-gnu
+# target.
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -11,7 +15,7 @@ REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 IMAGE_NAME="move-anything-sfz-builder"
 
 if [ -z "$CROSS_PREFIX" ] && [ ! -f "/.dockerenv" ]; then
-    echo "=== SFZ Module Build (via Docker) ==="
+    echo "=== Multisampler Build (via Docker) ==="
     if ! docker image inspect "$IMAGE_NAME" &>/dev/null; then
         echo "Building Docker image (first time only)..."
         docker build -t "$IMAGE_NAME" -f "$SCRIPT_DIR/Dockerfile" "$REPO_ROOT"
@@ -30,7 +34,7 @@ fi
 CROSS_PREFIX="${CROSS_PREFIX:-aarch64-linux-gnu-}"
 cd "$REPO_ROOT"
 
-echo "=== Building SFZ Module (xsynth) ==="
+echo "=== Building Multisampler (xsynth) ==="
 echo "Cross prefix: $CROSS_PREFIX"
 
 mkdir -p build dist/sfz

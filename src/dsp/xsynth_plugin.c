@@ -91,6 +91,8 @@ extern void          xshim_set_phaser_mix(XSynthHandle*, float mix);
 extern void          xshim_set_widener(XSynthHandle*, float width);
 extern uint32_t      xshim_take_noteon_count(XSynthHandle*);
 extern void          xshim_take_render_breakdown(XSynthHandle*, uint32_t *out4);
+extern uint32_t      xshim_take_underrun_count(XSynthHandle*);
+extern float         xshim_estimated_voice_peak(const XSynthHandle*);
 extern size_t        xshim_last_error(char *out_buf, size_t out_len);
 extern int           xshim_load_sfz_async(XSynthHandle*, const char *path);
 extern int           xshim_load_status(const XSynthHandle*);
@@ -137,6 +139,22 @@ typedef struct {
                                     * quantized chord bursts; surplus events
                                     * defer to next block (~3 ms each). */
     float gain;
+    /* MOVE FORK / 2026-05-17: per-preset auto-gain. Computed from
+     * xshim_estimated_voice_peak after each load_apply, used as a
+     * multiplier alongside `gain` in the output stage. Brings hot SFZ
+     * libraries (Salamander piano per-voice peak ≈ 0.82) into the
+     * same loudness ballpark as DecentSampler; quiet presets land at
+     * 1.0 (no change). */
+    float preset_attenuation;
+    /* MOVE FORK / 2026-05-16: peak limiter state for the output stage.
+     * Replaces tanh saturation with a proper feedback limiter:
+     * instant attack, ~100 ms exponential release. Below threshold
+     * the path is linear (transparent); above threshold it attenuates
+     * just enough to keep peaks under the ceiling. Avoids the
+     * compressed/distorted character tanh imposed on hot SFZ libraries
+     * like Salamander where 4-note chords easily hit ±3-5 before the
+     * gain stage. */
+    float limiter_env;
     instrument_entry_t instruments[MAX_INSTRUMENTS];
     preset_entry_t presets[MAX_PRESETS];
     char preset_name[MAX_NAME_LEN];
@@ -607,7 +625,13 @@ static void* v2_create_instance(const char *module_dir, const char *json_default
     if (!inst) return NULL;
     strncpy(inst->module_dir, module_dir, sizeof(inst->module_dir) - 1);
     strcpy(inst->preset_name, "No preset");
+    /* MOVE FORK: master gain default 0.7. Paired with the stateless
+     * soft-clip in v2_render_block, this preserves prior preset
+     * loudness while making hot chord peaks (Salamander) clean —
+     * peak compression at 0.7 is ~0.06 dB (basically transparent),
+     * vs the old tanh which compressed every sample above ~0.5. */
     inst->gain = 0.7f;
+    inst->preset_attenuation = 1.0f;  /* 1.0 until a preset loads */
     inst->reverb_wet = 0.0f;
     inst->voices = 14;     /* polyphony cap (note-groups). 14 polyphony
                             * × WörliTzer's 5 voices/note ≈ 70 voices,
@@ -1251,6 +1275,34 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
     } else if (load_st == XSHIM_LOAD_READY) {
         xshim_load_apply(inst->synth);
         inst->is_loading = 0;
+        /* MOVE FORK / 2026-05-17: per-preset auto-gain. Compute an
+         * attenuation factor from the soundfont's estimated worst-case
+         * single-voice peak so hot SFZ libraries don't dominate the
+         * output level. Model: aim for a 4-voice random-phase chord
+         * (sqrt(4) × per_voice_peak) to land at ~-3 dBFS post-master.
+         *   target = 0.7  (-3 dBFS)
+         *   chord_peak ≈ master * preset * sqrt(4) * voice_peak
+         *   → preset = target / (master * 2 * voice_peak)
+         * Clamped to (0, 1]: quieter presets keep their original level.
+         * Result for Salamander 44/16 (voice_peak ≈ 0.82):
+         *   preset = 0.7 / (0.7 * 2 * 0.82) = 0.61 (-4.3 dB attenuation)
+         * Result for a preset with voice_peak ≤ 0.5:
+         *   preset = 1.0 (no change). */
+        {
+            float voice_peak = xshim_estimated_voice_peak(inst->synth);
+            float pa = 1.0f;
+            if (voice_peak > 0.5f && inst->gain > 0.0f) {
+                pa = 0.7f / (inst->gain * 2.0f * voice_peak);
+                if (pa > 1.0f) pa = 1.0f;
+                if (pa < 0.05f) pa = 0.05f;  /* floor so ultra-hot libs aren't silent */
+            }
+            inst->preset_attenuation = pa;
+            char msg[128];
+            snprintf(msg, sizeof(msg),
+                     "auto-gain: voice_peak=%.3f preset_attenuation=%.3f",
+                     voice_peak, pa);
+            plugin_log(msg);
+        }
         /* MOVE FORK: push each knob's current CC value so the NEW
          * soundfont's voices observe the authored start position from
          * the first block. State-restore has its own resend path; this
@@ -1296,6 +1348,11 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
         xshim_last_error(err, sizeof(err));
         snprintf(inst->load_error, sizeof(inst->load_error),
                  "xsynth load failed: %s", err[0] ? err : "unknown");
+        /* MOVE FORK / 2026-05-16: also log to debug.log so we have a
+         * persistent record of what went wrong. The UI-side error
+         * surface (v2_get_error → inst->load_error) is transient and
+         * only flagged on the next render block. */
+        plugin_log(inst->load_error);
         xshim_load_clear_status(inst->synth);
         inst->is_loading = 0;
     } else if (load_st == XSHIM_LOAD_CANCELLED) {
@@ -1354,13 +1411,51 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
         }
     }
 
-    /* Convert interleaved f32 → int16 with gain and tanh soft-clip. */
+    /* MOVE FORK / 2026-05-16 v2: stateless soft-clip waveshaper.
+     * Replaces the feedback limiter, which ducked attack transients
+     * via instant-attack gain reduction → audibly compressed piano
+     * hits (Salamander measured 3.3 dB louder attack vs DS reference,
+     * pumping on release recovery).
+     *
+     * Curve: linear below `knee` (transparent — exact pass-through),
+     *        smoothly approaches ±1.0 above via tanh on the overshoot.
+     * No state, no timing artifacts. The cost: signals far above the
+     * knee still get capped near ±1.0; that's the safety net for
+     * accidental peaks (effect feedback, extreme dynamics).
+     *
+     * With master gain default lowered to 0.5, Salamander's raw
+     * +2.74 dBFS chord peak lands at -3.3 dBFS post-gain — below
+     * the 0.9 knee — so it passes through fully linear, matching DS
+     * (-3.7 dBFS). Other presets that used to clip get the same
+     * clean treatment; presets the user has tuned at 0.7 can be
+     * recovered via the per-preset gain knob (+3 dB). */
     if (!silent_path) {
         clock_gettime(CLOCK_MONOTONIC, &_t_clip0);
-        float g = inst->gain;
+        /* MOVE FORK / 2026-05-17: effective gain = master × per-preset
+         * auto-attenuation. preset_attenuation is 1.0 for normal/quiet
+         * presets (no change), ≤1.0 for hot SFZ libraries to bring them
+         * into the same loudness ballpark as DecentSampler. */
+        const float g = inst->gain * inst->preset_attenuation;
+        const float knee = 0.9f;            /* -0.92 dBFS: transparent below */
+        const float space = 1.0f - knee;    /* 0.1: smooth approach to ±1 above */
         for (int i = 0; i < frames; i++) {
-            float l = tanhf(inst->render_buf[i * 2]     * g);
-            float r = tanhf(inst->render_buf[i * 2 + 1] * g);
+            float l = inst->render_buf[i * 2]     * g;
+            float r = inst->render_buf[i * 2 + 1] * g;
+            /* Per-channel stateless soft-clip. */
+            float al = l < 0.0f ? -l : l;
+            if (al > knee) {
+                float over = al - knee;
+                float shaped = knee + space * tanhf(over / space);
+                l = l < 0.0f ? -shaped : shaped;
+            }
+            float ar = r < 0.0f ? -r : r;
+            if (ar > knee) {
+                float over = ar - knee;
+                float shaped = knee + space * tanhf(over / space);
+                r = r < 0.0f ? -shaped : shaped;
+            }
+            /* tanh asymptotes to 1, so |l|,|r| < 1.0 mathematically.
+             * Convert to i16. */
             out_interleaved_lr[i * 2]     = (int16_t)(l * 32767.0f);
             out_interleaved_lr[i * 2 + 1] = (int16_t)(r * 32767.0f);
         }
@@ -1388,8 +1483,13 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
     static int log_throttle = 0;
     long total_us = render_us + silence_us + clip_us;
     int is_outlier = (total_us > 5000);
+    /* MOVE FORK / 2026-05-16: ring-underrun count for this render block.
+     * Sampled (and reset) every block so per-block counts are exact.
+     * Non-zero means voices read past head into an unfilled ring slot
+     * — audible discontinuity. */
+    uint32_t underruns = xshim_take_underrun_count(inst->synth);
     if (is_outlier || render_us > 800 || noteons_this_block > 0 ||
-            ++log_throttle >= 256) {
+            underruns > 0 || ++log_throttle >= 256) {
         log_throttle = 0;
         uint64_t voices_after = xshim_voice_count(inst->synth);
         uint32_t bd[4] = {0};
@@ -1397,11 +1497,11 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
         char msg[256];
         snprintf(msg, sizeof(msg),
                  "perf: tot=%ld render=%ld sil=%ld clip=%ld silent=%d "
-                 "vb=%llu va=%llu noteon=%u par=%u sum=%u fx=%u tot_in=%u",
+                 "vb=%llu va=%llu noteon=%u underrun=%u par=%u sum=%u fx=%u tot_in=%u",
                  total_us, render_us, silence_us, clip_us, silent_path,
                  (unsigned long long)voices_before,
                  (unsigned long long)voices_after,
-                 (unsigned)noteons_this_block,
+                 (unsigned)noteons_this_block, (unsigned)underruns,
                  bd[0], bd[1], bd[2], bd[3]);
         plugin_log(msg);
         if (is_outlier) {

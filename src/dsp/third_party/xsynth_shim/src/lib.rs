@@ -96,6 +96,11 @@ pub struct XSynthHandle {
     /// already ringing). Incremented in xshim_note_on, snapshot+reset by
     /// xshim_take_noteon_count just before each render block.
     noteon_count: AtomicU32,
+    /// MOVE FORK / 2026-05-17: estimated worst-case single-voice peak
+    /// amplitude (f32, 0..~1) for the CURRENTLY-LOADED soundfont. Set
+    /// by xshim_load_apply; read by the plugin to compute per-preset
+    /// auto-gain. 0.0 sentinel = no soundfont loaded.
+    estimated_voice_peak: AtomicU32,
 }
 
 /* Install once: panic hook that writes the panic message + a short backtrace
@@ -154,6 +159,7 @@ pub unsafe extern "C" fn xshim_create(sample_rate: u32, channels: u32) -> *mut X
             worker: None,
             drop_sink,
             noteon_count: AtomicU32::new(0),
+            estimated_voice_peak: AtomicU32::new(0),
         }))
     }))
     .unwrap_or(ptr::null_mut())
@@ -243,9 +249,35 @@ pub unsafe extern "C" fn xshim_load_sfz(handle: *mut XSynthHandle, path: *const 
     }
 }
 
+/// MOVE FORK / 2026-05-16: stuck-note diagnostic logging. Appends every
+/// noteon/noteoff to xsynth_debug.log so we can correlate user-reported
+/// stuck notes with the events that actually reached the shim. Cheap-
+/// ish: one fopen-append-close per event. Audio-thread blocking risk
+/// is acceptable for this diagnostic build (a few hundred µs per write
+/// shouldn't drop audio at the user's typical play rate).
+#[cfg(unix)]
+fn log_note_event(tag: &str, ch: u8, key: u8, vel: u8) {
+    use std::io::Write;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let line = format!("[xshim] {tag} t={now}ms ch={ch} key={key} vel={vel}\n");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/data/UserData/schwung/tmp/xsynth_debug.log")
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+#[cfg(not(unix))]
+fn log_note_event(_tag: &str, _ch: u8, _key: u8, _vel: u8) {}
+
 #[no_mangle]
 pub unsafe extern "C" fn xshim_note_on(handle: *mut XSynthHandle, ch: u8, key: u8, vel: u8) {
     if handle.is_null() { return; }
+    log_note_event("noteon ", ch, key, vel);
     let _ = catch_unwind(AssertUnwindSafe(|| {
         let h = &mut *handle;
         h.noteon_count.fetch_add(1, Ordering::Relaxed);
@@ -284,9 +316,39 @@ pub unsafe extern "C" fn xshim_take_render_breakdown(_handle: *mut XSynthHandle,
     slot[3] = xsynth_core::channel::LAST_TOTAL_US.load(Ordering::Relaxed);
 }
 
+/// MOVE / 2026-05-16: snapshot+reset the process-global ring-underrun
+/// counter. Voices that read past their head buffer when the I/O pool
+/// hasn't filled the ring yet return silence and tick this counter.
+/// Non-zero values on chord-burst spawns mean the head/I-O sizing isn't
+/// keeping up. Sampled in the plugin's perf log per render block.
+#[cfg(unix)]
+#[no_mangle]
+pub unsafe extern "C" fn xshim_take_underrun_count(_handle: *mut XSynthHandle) -> u32 {
+    xsynth_core::soundfont::take_underrun_count()
+}
+
+/// MOVE FORK / 2026-05-17: read the estimated worst-case single-voice
+/// peak amplitude (0..~1) for the currently loaded soundfont. The
+/// plugin uses this to compute per-preset auto-gain so hot SFZ
+/// libraries don't clip the headphone amp. Returns 0.0 when no
+/// soundfont has been applied yet.
+#[no_mangle]
+pub unsafe extern "C" fn xshim_estimated_voice_peak(handle: *const XSynthHandle) -> f32 {
+    if handle.is_null() { return 0.0; }
+    let h = &*handle;
+    f32::from_bits(h.estimated_voice_peak.load(Ordering::Acquire))
+}
+
+#[cfg(not(unix))]
+#[no_mangle]
+pub unsafe extern "C" fn xshim_take_underrun_count(_handle: *mut XSynthHandle) -> u32 {
+    0
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn xshim_note_off(handle: *mut XSynthHandle, ch: u8, key: u8) {
     if handle.is_null() { return; }
+    log_note_event("noteoff", ch, key, 0);
     let _ = catch_unwind(AssertUnwindSafe(|| {
         let h = &mut *handle;
         h.group.send_event(SynthEvent::Channel(
@@ -517,6 +579,11 @@ pub unsafe extern "C" fn xshim_load_apply(handle: *mut XSynthHandle) -> c_int {
     if w.status.load(Ordering::Acquire) != STATUS_READY { return -1; }
     let sf_opt = w.result.lock().unwrap().take();
     let Some(sf) = sf_opt else { return -1; };
+    // MOVE FORK / 2026-05-17: capture per-preset peak for auto-gain
+    // before the soundfont gets wrapped in the trait Arc (the trait
+    // doesn't expose estimated_voice_peak).
+    let peak = sf.estimated_voice_peak();
+    h.estimated_voice_peak.store(peak.to_bits(), Ordering::Release);
     let arc: Arc<dyn SoundfontBase> = Arc::new(sf);
     // MOVE FORK: channel 0 only — broadcast forces rebuild_matrix on
     // all 16 idle channels which spikes audio thread to ~94 ms.

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<DecentSampler pluginVersion="1">
+  <ui width="400" height="100" layoutMode="relative" bgColor="ff000000">
+    <tab/>
+  </ui>
+  <!-- Raw playback: explicit envelope set to fully open / no shaping so
+       DS and our converter both pass the sample through unchanged. -->
+  <groups attack="0" decay="0" sustain="1" release="0">
+    <group>
+      <sample path="../samples/sine_440.wav" rootNote="60" loNote="0" hiNote="127"
+              loVel="0" hiVel="127"/>
+    </group>
+  </groups>
+</DecentSampler>

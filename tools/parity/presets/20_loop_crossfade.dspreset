@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<DecentSampler pluginVersion="1">
+  <ui width="400" height="100"><tab/></ui>
+  <groups attack="0" decay="0" sustain="1" release="0">
+    <group>
+      <!-- DS appears to silently fail when loopCrossfade exceeds a
+           small fraction of either loopStart or the sample length; 500
+           frames (~11 ms) is conservative and matches the behavior of
+           the WörliTzer library (loopCrossfade ≈ 15 % of loop). -->
+      <sample path="../samples/sine_loop.wav" rootNote="60" loNote="0" hiNote="127" loVel="0" hiVel="127"
+              loopEnabled="1" loopStart="10000" loopEnd="80000" loopCrossfade="500"/>
+    </group>
+  </groups>
+</DecentSampler>

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<DecentSampler pluginVersion="1">
+  <!-- Per-group PITCH LFO. The first group has no modulation; the
+       second group binds GROUP_TUNING via a level="group" LFO. Both
+       groups play at velocity 100 so the modulator only affects the
+       second group's voices (mirrors WörliTzer's vibrato setup). -->
+  <ui width="400" height="100"><tab/></ui>
+  <groups attack="0" decay="0" sustain="1" release="0">
+    <group name="dry" volume="-6dB">
+      <sample path="../samples/sine_long.wav" rootNote="60" loNote="0" hiNote="127" loVel="0" hiVel="127"/>
+    </group>
+    <group name="vibrato" volume="-6dB">
+      <sample path="../samples/sine_long.wav" rootNote="60" loNote="0" hiNote="127" loVel="0" hiVel="127"/>
+    </group>
+  </groups>
+  <modulators>
+    <lfo shape="sine" frequency="5" modAmount="1">
+      <binding type="amp" level="group" position="1" parameter="GROUP_TUNING"
+               modBehavior="add" translation="linear"
+               translationOutputMin="-0.25" translationOutputMax="0.25"/>
+    </lfo>
+  </modulators>
+</DecentSampler>

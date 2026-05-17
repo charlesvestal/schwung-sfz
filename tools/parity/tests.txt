@@ -1,0 +1,68 @@
+# test_name                preset_base                note vel  dur  tail   [scenario]
+
+# === fundamentals ===
+01_raw                       01_raw                      60  100  1.0  0.5
+02_ampeg                     02_ampeg                    60  100  1.5  1.0
+03_filter_lp                 03_filter_lp                60  100  1.0  0.5
+04_filter_sweep              04_filter_sweep             60  100  1.0  0.5
+
+# === effects ===
+05_reverb                    05_reverb                   60  100  0.05 2.0
+06_delay                     06_delay                    60  100  0.05 2.0
+07_chorus                    07_chorus                   60  100  2.0  0.5
+08_phaser                    08_phaser                   60  100  2.0  0.5
+09_widener                   09_widener                  60  100  2.0  0.5
+
+# === modulators ===
+10_amp_lfo                   10_amp_lfo                  60  100  2.0  0.5
+11_filter_lfo                11_filter_lfo               60  100  2.0  0.5
+12_pitch_lfo                 12_pitch_lfo                60  100  2.0  0.5
+13_pan_lfo                   13_pan_lfo                  60  100  2.0  0.5
+# 14_filter_env REMOVED 2026-05-16: empirically verified that DS
+# standalone does NOT actually sweep FX_FILTER_FREQUENCY from
+# <modulators><envelope> bindings — across level=instrument/voice,
+# with/without translation="linear", every trMax in {1000,4000,
+# 8000,16000,22000} produced rms -42 dB and centroid that didn't
+# track the cutoff. Static lowpass at 200 Hz gave the same -42 dB.
+# So DS just doesn't implement filter envelopes via modulator XML.
+# Our converter still emits `fileg_attack/decay/sustain/release/
+# depth/curve` opcodes (verified through xsynth) so the pipeline is
+# ready when DS fixes the bug — or for hand-written SFZ. Filter LFO
+# (11_filter_lfo, passes) is the working dynamic-cutoff path today.
+
+# === per-group routing ===
+15_per_group_mod             15_per_group_mod            60  100  2.0  0.5
+21_per_group_pitch_lfo       21_per_group_pitch_lfo      60  100  2.0  0.5
+
+# === sample modes ===
+16_layers_lov                16_layers                   60  20   1.0  0.5
+16_layers_hiv                16_layers                   60  120  1.0  0.5
+17_release                   17_release                  60  100  0.5  1.5
+18_round_robin               18_round_robin              60  100  1.0  0.5
+19_loop_continuous           19_loop_continuous          60  100  1.0  0.5
+20_loop_crossfade            20_loop_crossfade           60  100  1.0  0.5
+
+# === parameter ranges ===
+22_vel_20                    22_vel_curve                60   20  1.0  0.5
+22_vel_64                    22_vel_curve                60   64  1.0  0.5
+22_vel_100                   22_vel_curve                60  100  1.0  0.5
+22_vel_127                   22_vel_curve                60  127  1.0  0.5
+23_cutoff_low                23_cutoff_low               60  100  1.0  0.5
+24_cutoff_high               24_cutoff_high              60  100  1.0  0.5
+25_resonance_high            25_resonance_high           60  100  1.0  0.5
+26_attack_fast               26_attack_fast              60  100  0.2  0.2
+27_release_long              27_release_long             60  100  0.5  5.0
+
+# === LFO rate range ===
+28_lfo_slow                  28_lfo_slow                 60  100  3.0  0.5
+29_lfo_fast                  29_lfo_fast                 60  100  2.0  0.5
+
+# === static sample params ===
+30_tune_minus50              30_tune                     60  100  1.0  0.5
+31_pan_left                  31_pan_static               60  100  1.0  0.5
+32_volume_minus12db          32_volume_static            60  100  1.0  0.5
+
+# === keytracking (same preset, different notes) ===
+33_keytrack_C3               01_raw                      48  100  1.0  0.5
+34_keytrack_C5               01_raw                      72  100  1.0  0.5
+35_keytrack_C6               01_raw                      84  100  1.0  0.5

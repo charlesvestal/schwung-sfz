@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<DecentSampler pluginVersion="1">
+  <ui width="400" height="100">
+    <tab>
+      <labeled-knob x="0" y="0" label="Filter" minValue="100" maxValue="10000" value="3000">
+        <binding type="effect" level="instrument" position="0" parameter="FX_FILTER_FREQUENCY"/>
+      </labeled-knob>
+    </tab>
+  </ui>
+  <groups attack="0" decay="0" sustain="1" release="0">
+    <group>
+      <sample path="../samples/noise_long.wav" rootNote="60" loNote="0" hiNote="127" loVel="0" hiVel="127"/>
+    </group>
+  </groups>
+  <effects>
+    <effect type="lowpass" frequency="3000" resonance="0.7"/>
+  </effects>
+</DecentSampler>

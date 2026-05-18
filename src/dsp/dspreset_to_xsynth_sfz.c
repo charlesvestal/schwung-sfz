@@ -97,13 +97,19 @@ typedef struct {
     double db_delta;        /* dB at knob_max minus dB at knob_min */
     int    curve_id;        /* Phase 6 */
 } ds_filter_res_oncc_t;
-/* MOVE FORK / Phase 5: PAN live binding (instrument-level — applied to
- * every region's pan via pan_oncc on <global>). */
+/* MOVE FORK / Phase 5: PAN live binding (per-group — applied to the
+ * matching group's pan via pan_oncc/pan in the group block).
+ * MOVE FORK / 2026-05-18: was instrument-level (emit at <global>). Bug:
+ * each binding emitted its own pan_oncc=delta with no static baseline,
+ * so multiple knobs stacked their deltas, pan blew past +100 and
+ * clamped to hard-right (Spring Chimes "Spring Pads"). Now records the
+ * target group and emits at <group> with proper baseline. */
 typedef struct {
     int    cc_number;
     double base_pct;        /* pan (-100..100) at knob_min */
     double pct_delta;
     int    curve_id;        /* Phase 6 */
+    int    group_idx;       /* -1 = instrument-wide; else specific group */
 } ds_pan_oncc_t;
 
 /* MOVE FORK / Phase 6: SFZv2 curve table. The converter generates one
@@ -750,6 +756,12 @@ static void apply_ui_overrides(const char *src,
                             e->base_pct  = v_at_min;
                             e->pct_delta = v_at_max - v_at_min;
                             e->curve_id  = -1; /* linear ok for pan */
+                            /* level="group" position=N → record group;
+                             * else (instrument-level) record -1 so we
+                             * still emit on <global>. */
+                            e->group_idx = (strcmp(level, "group") == 0 && position_str[0])
+                                ? atoi(position_str)
+                                : -1;
                             (*pan_oncc_count_io)++;
                         }
                     }
@@ -1445,15 +1457,25 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
     }
 
     int lp_idx = -1, gain_idx = -1;
+    /* Pass 1: prefer lowpass / bandpass / notch / peak. Many DS presets
+     * (Felt & Fog, Steinway) ship a rumble-cut highpass at 33 Hz AS WELL
+     * as a lowpass that user knobs sweep. If we grab the highpass first
+     * and a FX_FILTER_FREQUENCY knob (intended for the LPF) overrides
+     * the static cutoff to 22000 Hz, the HPF silences the signal. */
     for (int i = 0; i < fx_count; i++) {
         if (lp_idx < 0 && (strcmp(fx[i].type, "lowpass") == 0 ||
                             strcmp(fx[i].type, "lowpass_1pl") == 0 ||
                             strcmp(fx[i].type, "lowpass_4pl") == 0 ||
-                            strcmp(fx[i].type, "highpass") == 0 ||
                             strcmp(fx[i].type, "bandpass") == 0 ||
                             strcmp(fx[i].type, "notch") == 0 ||
                             strcmp(fx[i].type, "peak") == 0)) lp_idx = i;
         if (gain_idx < 0 && strcmp(fx[i].type, "gain") == 0) gain_idx = i;
+    }
+    /* Pass 2: only consider highpass if no lowpass-family filter exists. */
+    if (lp_idx < 0) {
+        for (int i = 0; i < fx_count; i++) {
+            if (strcmp(fx[i].type, "highpass") == 0) { lp_idx = i; break; }
+        }
     }
 
     /* Phase 7b / 2026-05-16: per-group modulator state. `level="group"`
@@ -2467,9 +2489,24 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
             }
         }
     }
-    /* Phase 5: live pan_oncc from PAN knob bindings. Emitted on
-     * <global> so every region's pan is driven by the knob CC. */
+    /* Phase 5: live pan_oncc from PAN knob bindings.
+     * MOVE FORK / 2026-05-18: only instrument-level bindings (group_idx=-1)
+     * emit at <global>. Group-level bindings emit at the matching <group>
+     * block below — see the group walk. Without per-group emission,
+     * multiple stacked pan knobs were summing their deltas globally and
+     * clamping every region to hard right. */
     for (int i = 0; i < pan_oncc_count; i++) {
+        if (pan_oncc[i].group_idx != -1) continue;  /* deferred to group emit */
+        /* Emit baseline so knob center is pan center (knob at value=0
+         * with range [-100,+100] maps to CC=64 ≈ midpoint of delta). */
+        int base_int = (int)(pan_oncc[i].base_pct >= 0
+            ? pan_oncc[i].base_pct + 0.5
+            : pan_oncc[i].base_pct - 0.5);
+        if (base_int < -100) base_int = -100;
+        if (base_int >  100) base_int =  100;
+        if (base_int != 0) {
+            pos += snprintf(sfz + pos, out_cap - pos, "pan=%d\n", base_int);
+        }
         pos += snprintf(sfz + pos, out_cap - pos,
                         "pan_oncc%d=%.2f\n",
                         pan_oncc[i].cc_number,
@@ -2674,6 +2711,33 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
                                 "volume_curvecc%d=%d\n",
                                 group_bindings[i].cc,
                                 group_bindings[i].curve_id);
+            }
+        }
+
+        /* MOVE FORK / 2026-05-18: per-group pan_oncc. A PAN knob with
+         * level="group" position=N controls just THIS group's pan, not
+         * everyone's. Emit the matching pan= baseline + pan_oncc=delta
+         * here. Without this, multiple pan knobs would stack at <global>
+         * and clamp to hard-right (Spring Chimes "Spring Pads" bug). */
+        for (int pi = 0; pi < pan_oncc_count; pi++) {
+            if (pan_oncc[pi].group_idx != group_idx) continue;
+            int base_int = (int)(pan_oncc[pi].base_pct >= 0
+                ? pan_oncc[pi].base_pct + 0.5
+                : pan_oncc[pi].base_pct - 0.5);
+            if (base_int < -100) base_int = -100;
+            if (base_int >  100) base_int =  100;
+            if (base_int != 0) {
+                pos += snprintf(sfz + pos, out_cap - pos, "pan=%d\n", base_int);
+            }
+            pos += snprintf(sfz + pos, out_cap - pos,
+                            "pan_oncc%d=%.2f\n",
+                            pan_oncc[pi].cc_number,
+                            pan_oncc[pi].pct_delta);
+            if (pan_oncc[pi].curve_id >= 0) {
+                pos += snprintf(sfz + pos, out_cap - pos,
+                                "pan_curvecc%d=%d\n",
+                                pan_oncc[pi].cc_number,
+                                pan_oncc[pi].curve_id);
             }
         }
 

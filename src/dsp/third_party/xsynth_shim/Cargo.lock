@@ -829,6 +829,7 @@ dependencies = [
  "crossbeam-channel",
  "fundsp",
  "lazy_static",
+ "libc",
  "memmap2",
  "proc-macro2",
  "rayon",

@@ -8,10 +8,9 @@ Built on a fork of [xsynth](https://github.com/arduano/xsynth) (LGPL-3.0), with 
 
 - **SFZ v2 + ARIA** opcodes: regions, groups, key/velocity layers, round robin, key switches, loops with crossfade, release samples, filter/cutoff, ADSR, pitch/amp LFOs, filter envelope, knob CC bindings, curve tables.
 - **DecentSampler (.dspreset)** support via on-load conversion to SFZ — covers the common multisampled-instrument subset (envelopes, looping, filter, reverb, group amps, knob bindings).
-- **Disk streaming** — libraries larger than RAM (e.g. Salamander Grand Piano, ~5 GB) play directly off the SD card. Three streaming paths:
-  - `.x44c` cache (prebaked on Mac for maximum first-load speed)
-  - Direct 16-bit PCM WAV
-  - Direct FLAC (no prebake required)
+- **Disk streaming** — libraries larger than RAM (e.g. Salamander Grand Piano, ~5 GB) play directly off the SD card. Two paths, picked per-sample at load:
+  - Direct from `.flac` or 16-bit PCM `.wav` — the default. No prebake needed.
+  - `.x44c` cache (optional) — pre-decoded PCM at 44.1 kHz next to the source audio. Skips per-voice FLAC decode and sample-rate conversion at play time; useful for high-polyphony or release-tail-heavy patches under CPU pressure. Built off-device with the `prebake_cache` binary.
 - **Voice-side SRC** for mismatched sample rates (e.g. 48 kHz FLAC played at 44.1 kHz target).
 - **Loop wrap support** — looped regions extend their always-resident head buffer to cover the whole loop, so wrap reads never fall out of the bounded streaming window.
 - **Per-preset auto-gain** — bright libraries (Salamander, etc.) are automatically attenuated to land in the same loudness ballpark as DecentSampler reference renders.

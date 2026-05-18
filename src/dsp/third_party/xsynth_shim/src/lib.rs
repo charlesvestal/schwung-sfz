@@ -101,6 +101,11 @@ pub struct XSynthHandle {
     /// by xshim_load_apply; read by the plugin to compute per-preset
     /// auto-gain. 0.0 sentinel = no soundfont loaded.
     estimated_voice_peak: AtomicU32,
+    /// MOVE FORK / 2026-05-18: latest loaded soundfont's worst-case
+    /// (key,vel) region stacking. Plugin reads this after a successful
+    /// preset apply and sizes its polyphony default to keep total active
+    /// voices within Move's sustained-load ceiling.
+    max_region_stacking: AtomicU32,
 }
 
 /* Install once: panic hook that writes the panic message + a short backtrace
@@ -160,6 +165,7 @@ pub unsafe extern "C" fn xshim_create(sample_rate: u32, channels: u32) -> *mut X
             drop_sink,
             noteon_count: AtomicU32::new(0),
             estimated_voice_peak: AtomicU32::new(0),
+            max_region_stacking: AtomicU32::new(1),
         }))
     }))
     .unwrap_or(ptr::null_mut())
@@ -343,6 +349,18 @@ pub unsafe extern "C" fn xshim_estimated_voice_peak(handle: *const XSynthHandle)
     if handle.is_null() { return 0.0; }
     let h = &*handle;
     f32::from_bits(h.estimated_voice_peak.load(Ordering::Acquire))
+}
+
+/// MOVE FORK / 2026-05-18: max region stacking across the loaded
+/// soundfont's (key,vel) plane. Returns 1 when no soundfont is loaded
+/// or the loaded soundfont is sf2 (which doesn't yet contribute a real
+/// computation). Plugin divides its target voice ceiling by this to
+/// pick a per-preset polyphony default.
+#[no_mangle]
+pub unsafe extern "C" fn xshim_max_region_stacking(handle: *const XSynthHandle) -> u32 {
+    if handle.is_null() { return 1; }
+    let h = &*handle;
+    h.max_region_stacking.load(Ordering::Acquire).max(1)
 }
 
 #[cfg(not(unix))]
@@ -609,6 +627,7 @@ pub unsafe extern "C" fn xshim_load_apply(handle: *mut XSynthHandle) -> c_int {
     // doesn't expose estimated_voice_peak).
     let peak = sf.estimated_voice_peak();
     h.estimated_voice_peak.store(peak.to_bits(), Ordering::Release);
+    h.max_region_stacking.store(sf.max_region_stacking(), Ordering::Release);
     let arc: Arc<dyn SoundfontBase> = Arc::new(sf);
     // MOVE FORK: channel 0 only — broadcast forces rebuild_matrix on
     // all 16 idle channels which spikes audio thread to ~94 ms.

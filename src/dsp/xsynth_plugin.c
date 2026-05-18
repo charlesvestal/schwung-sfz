@@ -24,6 +24,8 @@
 #include <time.h>
 #include <sched.h>
 #include <stdint.h>
+#include <pthread.h>
+#include <stdatomic.h>
 
 #define MOVE_PLUGIN_API_VERSION_2 2
 #define MOVE_SAMPLE_RATE 44100
@@ -94,6 +96,7 @@ extern void          xshim_take_render_breakdown(XSynthHandle*, uint32_t *out4);
 extern uint32_t      xshim_take_underrun_count(XSynthHandle*);
 extern void          xshim_take_underrun_breakdown(XSynthHandle*, uint32_t *out3);
 extern float         xshim_estimated_voice_peak(const XSynthHandle*);
+extern uint32_t      xshim_max_region_stacking(const XSynthHandle*);
 extern size_t        xshim_last_error(char *out_buf, size_t out_len);
 extern int           xshim_load_sfz_async(XSynthHandle*, const char *path);
 extern int           xshim_load_status(const XSynthHandle*);
@@ -185,15 +188,118 @@ typedef struct {
     /* Phase 9 prototype: fundsp reverb wet level (0..1). */
     float reverb_wet;
     double knob_current[DS_MAX_KNOBS]; /* current logical value in [min,max] */
+    int user_voices_override;      /* set when user has explicitly set "voices"
+                                     * via set_param or json_defaults; pins
+                                     * the value across preset changes. */
     float *render_buf;             /* interleaved L/R/L/R..., 2 * frames */
 } xsynth_instance_t;
 
-static void plugin_log(const char *msg) {
-    if (g_host && g_host->log) {
-        char buf[256];
-        snprintf(buf, sizeof(buf), "[sfz] %s", msg);
-        g_host->log(buf);
+/* MOVE FORK / 2026-05-18: async log SPSC ring. plugin_log() is called
+ * from the audio thread (render_block path) with a 256-byte string;
+ * g_host->log() goes through Move's unified-log path which eventually
+ * does a write() syscall. On busy blocks (clip outliers, CLICK detector,
+ * perf line every 2048 blocks) the audio thread can stack 1-3 log calls
+ * back-to-back — small individually, but each is a syscall on the SCHED_FIFO
+ * 90 SPI thread we're paying ~70% of the frame budget to keep within.
+ *
+ * Replace with a fixed-size SPSC ring (256 slots × 256 bytes = 64 KiB),
+ * drop-on-full so the audio thread never blocks waiting. A background
+ * pthread (created lazily on first log) drains and calls g_host->log.
+ * Single-producer (audio thread), single-consumer (drain thread).
+ *
+ * Ordering: producer atomic_store(write_pos, Release) after filling
+ * the slot; consumer atomic_load(write_pos, Acquire) before reading.
+ * Capacity is power of 2 so we can mask instead of mod.
+ */
+#define LOG_RING_SLOTS  256
+#define LOG_RING_MASK   (LOG_RING_SLOTS - 1)
+#define LOG_MSG_LEN     256
+static char         log_ring[LOG_RING_SLOTS][LOG_MSG_LEN];
+static _Atomic uint64_t log_write_pos = 0;
+static _Atomic uint64_t log_read_pos  = 0;
+static _Atomic uint64_t log_dropped   = 0;
+static pthread_t    log_drain_thread;
+static int          log_drain_thread_started = 0;
+static pthread_mutex_t log_drain_start_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void *log_drain_thread_fn(void *arg) {
+    (void)arg;
+    /* Pin off core 3 (SPI audio core) so the drain thread can't cause
+     * the same cross-core preemption we just fixed for the IO worker. */
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    CPU_SET(0, &mask); CPU_SET(1, &mask); CPU_SET(2, &mask);
+    sched_setaffinity(0, sizeof(mask), &mask);
+
+    char tmp[LOG_MSG_LEN + 32];
+    for (;;) {
+        uint64_t r = atomic_load_explicit(&log_read_pos, memory_order_relaxed);
+        uint64_t w = atomic_load_explicit(&log_write_pos, memory_order_acquire);
+        if (r == w) {
+            /* Empty ring. Sleep ~10 ms — far below human perception of
+             * log latency, far above any sane wake-up overhead. */
+            struct timespec ts = { 0, 10 * 1000 * 1000 };
+            nanosleep(&ts, NULL);
+            continue;
+        }
+        /* Copy out, advance read pos. The producer may overwrite this
+         * slot the instant we advance, so do the copy first. */
+        size_t idx = (size_t)(r & LOG_RING_MASK);
+        strncpy(tmp, log_ring[idx], LOG_MSG_LEN);
+        tmp[LOG_MSG_LEN - 1] = 0;
+        atomic_store_explicit(&log_read_pos, r + 1, memory_order_release);
+        if (g_host && g_host->log) g_host->log(tmp);
+
+        /* Periodically surface drop count so we know if the ring is
+         * undersized for the current logging cadence. */
+        uint64_t drops = atomic_load_explicit(&log_dropped, memory_order_relaxed);
+        static uint64_t last_drops_reported = 0;
+        if (drops > last_drops_reported + 64) {
+            char dm[64];
+            snprintf(dm, sizeof(dm), "[sfz] log: dropped %llu messages",
+                     (unsigned long long)(drops - last_drops_reported));
+            if (g_host && g_host->log) g_host->log(dm);
+            last_drops_reported = drops;
+        }
     }
+    return NULL;
+}
+
+static void plugin_log(const char *msg) {
+    if (!g_host || !g_host->log) return;
+
+    /* Lazy-start the drain thread on first log call. Mutex guards the
+     * one-shot start; never contended after the initial fire. */
+    if (!log_drain_thread_started) {
+        pthread_mutex_lock(&log_drain_start_mu);
+        if (!log_drain_thread_started) {
+            if (pthread_create(&log_drain_thread, NULL,
+                               log_drain_thread_fn, NULL) == 0) {
+                pthread_detach(log_drain_thread);
+                log_drain_thread_started = 1;
+            }
+        }
+        pthread_mutex_unlock(&log_drain_start_mu);
+        /* If creation failed, fall through to the sync path below. */
+        if (!log_drain_thread_started) {
+            char buf[LOG_MSG_LEN];
+            snprintf(buf, sizeof(buf), "[sfz] %s", msg);
+            g_host->log(buf);
+            return;
+        }
+    }
+
+    /* Single producer (audio thread) — no need for CAS. */
+    uint64_t w = atomic_load_explicit(&log_write_pos, memory_order_relaxed);
+    uint64_t r = atomic_load_explicit(&log_read_pos,  memory_order_acquire);
+    if (w - r >= LOG_RING_SLOTS) {
+        /* Ring full — drop. Audio thread never blocks. */
+        atomic_fetch_add_explicit(&log_dropped, 1, memory_order_relaxed);
+        return;
+    }
+    size_t idx = (size_t)(w & LOG_RING_MASK);
+    snprintf(log_ring[idx], LOG_MSG_LEN, "[sfz] %s", msg);
+    atomic_store_explicit(&log_write_pos, w + 1, memory_order_release);
 }
 
 static int json_get_number(const char *json, const char *key, float *out) {
@@ -637,7 +743,12 @@ static void* v2_create_instance(const char *module_dir, const char *json_default
     inst->voices = 14;     /* polyphony cap (note-groups). 14 polyphony
                             * × WörliTzer's 5 voices/note ≈ 70 voices,
                             * which is the safe ceiling at current
-                            * per-voice render cost. */
+                            * per-voice render cost. Per-preset heuristic
+                            * (see apply_polyphony_for_loaded_preset) may
+                            * lower this on layer-heavy libraries. */
+    inst->user_voices_override = 0; /* flips true on set_param("voices") or
+                                     * json_defaults "voices" — that pins
+                                     * the value across preset changes. */
     inst->spawn_burst = 3;  /* hidden — defaults to 3 NoteOn/block.
                              * Quantized chord bursts spread spawn cost
                              * across blocks; 3 keeps burst-block render
@@ -708,6 +819,7 @@ static void* v2_create_instance(const char *module_dir, const char *json_default
             if (v < 4)   v = 4;
             if (v > 128) v = 128;
             inst->voices = v;
+            inst->user_voices_override = 1;
         }
     }
 
@@ -812,6 +924,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         if (v < 4)   v = 4;
         if (v > 128) v = 128;
         inst->voices = v;
+        inst->user_voices_override = 1;
         /* User-facing "Voices" knob = polyphony cap (one unit per note),
          * not per-key layer cap. Multi-layer presets like WörliTzer spend
          * 5 internal voices per polyphony unit; the cap is musically
@@ -1138,22 +1251,94 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
     }
     else if (strcmp(key, "instrument_list") == 0 || strcmp(key, "bank_list") == 0 ||
              strcmp(key, "soundfont_list") == 0) {
-        char saved_preset_name[MAX_NAME_LEN];
-        strncpy(saved_preset_name, inst->preset_name, MAX_NAME_LEN - 1);
-        saved_preset_name[MAX_NAME_LEN - 1] = '\0';
-        scan_instruments(inst, inst->module_dir);
-        int restored = find_preset_by_name(inst, saved_preset_name);
-        if (restored >= 0) inst->current_preset = restored;
-        else if (inst->current_preset >= inst->preset_count)
-            inst->current_preset = inst->preset_count > 0 ? 0 : -1;
-        sync_preset_display(inst);
-        int written = snprintf(buf, buf_len, "[");
-        for (int i = 0; i < inst->instrument_count && written < buf_len - 50; i++) {
-            if (i > 0) written += snprintf(buf + written, buf_len - written, ",");
-            written += snprintf(buf + written, buf_len - written,
-                "{\"label\":\"%s\",\"index\":%d}", inst->instruments[i].name, i);
+        /* MOVE FORK / 2026-05-17: was re-scanning every request, which
+         * walked 56 library dirs (~hundreds of dirs/files each) and
+         * blew the host's 100ms shadow_param timeout — the host gave
+         * up, JS got null, UI showed "No parameters". The instrument
+         * list is established at load time and doesn't change at
+         * runtime, so we just emit the cached list. */
+        {
+            char dmsg[128];
+            snprintf(dmsg, sizeof(dmsg),
+                "instrument_list req: buf_len=%d instruments=%d presets=%d",
+                buf_len, inst->instrument_count, inst->preset_count);
+            plugin_log(dmsg);
         }
-        written += snprintf(buf + written, buf_len - written, "]");
+        /* Format each entry into a local buffer first so we can check
+         * whether it fits before committing. The previous version used
+         * snprintf return values directly, but snprintf returns the size
+         * that WOULD have been written — so `written` could exceed
+         * `buf_len`, leaving truncated JSON (e.g. `[ent1,{"la\0`) that
+         * the host couldn't parse, surfacing as "no parameters" in the
+         * Jump To Library UI once the library count grew past ~30. */
+        int written = snprintf(buf, buf_len, "[");
+        if (written < 0 || written >= buf_len) return -1;
+        char entry[MAX_NAME_LEN + 64];
+        int emitted = 0;
+        for (int i = 0; i < inst->instrument_count; i++) {
+            /* JSON labels go through an HTML/template stage in the host
+             * UI before parsing — raw `&` triggers an entity parse that
+             * truncates the whole response (verified by bisecting:
+             * cap=12 worked, cap=13 with "Fable & Clare" broke). Escape
+             * &, <, >, ', " to their `\uXXXX` forms; JSON parsers
+             * decode them transparently, but the HTML/template pre-pass
+             * sees harmless backslash sequences. */
+            char esc[MAX_NAME_LEN * 6 + 1];
+            int ei = 0;
+            for (int j = 0; inst->instruments[i].name[j] && ei + 6 < (int)sizeof(esc); j++) {
+                unsigned char c = (unsigned char)inst->instruments[i].name[j];
+                switch (c) {
+                    case '"':  ei += snprintf(esc + ei, sizeof(esc) - ei, "\\u0022"); break;
+                    case '\\': ei += snprintf(esc + ei, sizeof(esc) - ei, "\\u005c"); break;
+                    case '&':  ei += snprintf(esc + ei, sizeof(esc) - ei, "\\u0026"); break;
+                    case '<':  ei += snprintf(esc + ei, sizeof(esc) - ei, "\\u003c"); break;
+                    case '>':  ei += snprintf(esc + ei, sizeof(esc) - ei, "\\u003e"); break;
+                    case '\'': ei += snprintf(esc + ei, sizeof(esc) - ei, "\\u0027"); break;
+                    default:
+                        if (c < 0x20) {
+                            ei += snprintf(esc + ei, sizeof(esc) - ei, "\\u%04x", c);
+                        } else {
+                            esc[ei++] = (char)c;
+                        }
+                }
+            }
+            esc[ei] = '\0';
+            int entry_len = snprintf(entry, sizeof(entry),
+                "%s{\"label\":\"%s\",\"index\":%d}",
+                (i > 0) ? "," : "",
+                esc, i);
+            if (entry_len < 0) continue;
+            if (entry_len > (int)sizeof(entry)) entry_len = (int)sizeof(entry) - 1;
+            /* Need room for the entry plus the closing ']'. */
+            if (written + entry_len + 1 >= buf_len) break;
+            memcpy(buf + written, entry, entry_len);
+            written += entry_len;
+            emitted++;
+        }
+        buf[written++] = ']';
+        if (written < buf_len) buf[written] = '\0';
+        {
+            char dmsg[256];
+            snprintf(dmsg, sizeof(dmsg),
+                "instrument_list resp: emitted=%d written=%d",
+                emitted, written);
+            plugin_log(dmsg);
+            /* Dump full response in 200-byte chunks so we can recover
+             * the entire JSON from debug.log. */
+            char chunk[256];
+            for (int off = 0; off < written; off += 200) {
+                int n = written - off;
+                if (n > 200) n = 200;
+                int prefix = snprintf(chunk, sizeof(chunk),
+                    "instrument_list dump[%d..%d]: ", off, off + n);
+                int copy = n;
+                if (prefix + copy + 1 > (int)sizeof(chunk))
+                    copy = (int)sizeof(chunk) - prefix - 1;
+                memcpy(chunk + prefix, buf + off, copy);
+                chunk[prefix + copy] = '\0';
+                plugin_log(chunk);
+            }
+        }
         return written;
     }
     else if (strcmp(key, "state") == 0) {
@@ -1276,6 +1461,45 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
     } else if (load_st == XSHIM_LOAD_READY) {
         xshim_load_apply(inst->synth);
         inst->is_loading = 0;
+        /* MOVE FORK / 2026-05-18: per-preset polyphony default keyed to
+         * region stacking. Move's audio engine sustains ~60 active voices
+         * comfortably before the SCHED_FIFO 90 SPI thread starts missing
+         * its 2902 µs deadline; above that, the host's "audio-dropouts:1"
+         * counter ticks and we hear release-tail clicks even though SFZ's
+         * own render is well under budget.
+         *
+         * The polyphony cap counts note-groups, so total voices ≈ groups
+         * × layers-per-note. We compute layers-per-note from the loaded
+         * soundfont's worst-case (key,vel) region stacking and pick a cap
+         * that keeps total voices under VOICE_TARGET. Floors at 4 so
+         * leads still feel responsive; never exceeds the historical 14
+         * default. Respects user overrides (`set_param("voices", N)`
+         * pins the value across preset changes).
+         *
+         * Reference points:
+         *   Single-layer bass:           stacking=1 → cap=14 (full)
+         *   4-mic piano (Salamander):    stacking=4 → cap=14 (full)
+         *   8-layer pad:                 stacking=8 → cap=8
+         *   16-mic EAP:                  stacking=~7 → cap=8-10 */
+        if (!inst->user_voices_override) {
+            const int VOICE_TARGET = 60;   /* sustained-load ceiling */
+            const int POLY_FLOOR   = 4;
+            const int POLY_CEIL    = 14;
+            uint32_t stacking = xshim_max_region_stacking(inst->synth);
+            if (stacking < 1) stacking = 1;
+            int recommended = VOICE_TARGET / (int)stacking;
+            if (recommended < POLY_FLOOR) recommended = POLY_FLOOR;
+            if (recommended > POLY_CEIL)  recommended = POLY_CEIL;
+            if (recommended != inst->voices) {
+                inst->voices = recommended;
+                xshim_set_polyphony_cap(inst->synth, (uint32_t)inst->voices);
+            }
+            char msg[160];
+            snprintf(msg, sizeof(msg),
+                     "polyphony auto: stacking=%u target=%d -> voices=%d",
+                     stacking, VOICE_TARGET, inst->voices);
+            plugin_log(msg);
+        }
         /* MOVE FORK / 2026-05-17: per-preset auto-gain. Compute an
          * attenuation factor from the soundfont's estimated worst-case
          * single-voice peak so hot SFZ libraries don't dominate the
@@ -1295,7 +1519,13 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
             if (voice_peak > 0.5f && inst->gain > 0.0f) {
                 pa = 0.7f / (inst->gain * 2.0f * voice_peak);
                 if (pa > 1.0f) pa = 1.0f;
-                if (pa < 0.05f) pa = 0.05f;  /* floor so ultra-hot libs aren't silent */
+                /* 2026-05-17: lowered the floor from 0.05 to 0.001 after
+                 * DS libraries like Mickleburgh exposed voice_peaks > 7000
+                 * (author-set +8 dB group volume × +80 dB knob ceiling).
+                 * 0.05 capped the attenuation at -26 dB; we need ~-80 dB
+                 * to bring those peaks below unity. The new floor still
+                 * keeps anything with voice_peak < 700 audible. */
+                if (pa < 1e-4f) pa = 1e-4f;
             }
             inst->preset_attenuation = pa;
             char msg[128];

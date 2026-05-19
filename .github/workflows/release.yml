@@ -43,12 +43,26 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  # MOVE FORK / 2026-05-19: release.json bump runs in a separate job
+  # with `submodules: false`. The previous single-job flow checked
+  # out submodules: recursive for the build, then did `git checkout
+  # main` for the release.json step which retriggered a submodule
+  # fetch — and that fetch chokes when the xsynth fork's remote
+  # doesn't have every SHA the repo's history ever referenced
+  # (typical after a rebase). Splitting the metadata-only commit
+  # into its own job avoids the submodule code path entirely.
+  publish-release-json:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          submodules: false
+
       - name: Commit release.json
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-
-          git fetch origin main
-          git checkout -f main
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 

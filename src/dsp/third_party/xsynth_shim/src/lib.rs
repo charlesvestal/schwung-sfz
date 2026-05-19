@@ -106,6 +106,9 @@ pub struct XSynthHandle {
     /// preset apply and sizes its polyphony default to keep total active
     /// voices within Move's sustained-load ceiling.
     max_region_stacking: AtomicU32,
+    /// MOVE FORK / 2026-05-19: SFZ-declared min `polyphony=N`. 0 when
+    /// no region declared one.
+    declared_polyphony: AtomicU32,
 }
 
 /* Install once: panic hook that writes the panic message + a short backtrace
@@ -166,6 +169,7 @@ pub unsafe extern "C" fn xshim_create(sample_rate: u32, channels: u32) -> *mut X
             noteon_count: AtomicU32::new(0),
             estimated_voice_peak: AtomicU32::new(0),
             max_region_stacking: AtomicU32::new(1),
+            declared_polyphony: AtomicU32::new(0),
         }))
     }))
     .unwrap_or(ptr::null_mut())
@@ -363,6 +367,18 @@ pub unsafe extern "C" fn xshim_max_region_stacking(handle: *const XSynthHandle) 
     h.max_region_stacking.load(Ordering::Acquire).max(1)
 }
 
+/// MOVE FORK / 2026-05-19: SFZ-declared min `polyphony=N`. Returns 0
+/// when no region in the loaded soundfont declared the opcode (plugin
+/// then falls back to its auto-heuristic). Non-zero values are
+/// authoritative — author intent (e.g. polyphony=1 for a monophonic
+/// SFZ) wins over the heuristic.
+#[no_mangle]
+pub unsafe extern "C" fn xshim_declared_polyphony(handle: *const XSynthHandle) -> u32 {
+    if handle.is_null() { return 0; }
+    let h = &*handle;
+    h.declared_polyphony.load(Ordering::Acquire)
+}
+
 #[cfg(not(unix))]
 #[no_mangle]
 pub unsafe extern "C" fn xshim_take_underrun_count(_handle: *mut XSynthHandle) -> u32 {
@@ -402,6 +418,21 @@ pub unsafe extern "C" fn xshim_pitch_bend(handle: *mut XSynthHandle, ch: u8, val
         h.group.send_event(SynthEvent::Channel(
             ch as u32,
             ChannelEvent::Audio(ChannelAudioEvent::Control(ControlEvent::PitchBend(value))),
+        ));
+    }));
+}
+
+/// MOVE FORK / 2026-05-19: live master tune in cents. Composes with
+/// MIDI pitchbend via the channel's process_pitch sum — pitchbend keeps
+/// working independently.
+#[no_mangle]
+pub unsafe extern "C" fn xshim_fine_tune(handle: *mut XSynthHandle, ch: u8, cents: f32) {
+    if handle.is_null() { return; }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let h = &mut *handle;
+        h.group.send_event(SynthEvent::Channel(
+            ch as u32,
+            ChannelEvent::Audio(ChannelAudioEvent::Control(ControlEvent::FineTune(cents))),
         ));
     }));
 }
@@ -628,6 +659,7 @@ pub unsafe extern "C" fn xshim_load_apply(handle: *mut XSynthHandle) -> c_int {
     let peak = sf.estimated_voice_peak();
     h.estimated_voice_peak.store(peak.to_bits(), Ordering::Release);
     h.max_region_stacking.store(sf.max_region_stacking(), Ordering::Release);
+    h.declared_polyphony.store(sf.declared_polyphony(), Ordering::Release);
     let arc: Arc<dyn SoundfontBase> = Arc::new(sf);
     // MOVE FORK: channel 0 only — broadcast forces rebuild_matrix on
     // all 16 idle channels which spikes audio thread to ~94 ms.

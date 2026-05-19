@@ -66,6 +66,28 @@ typedef struct {
     int    curve_id;        /* Phase 6 */
 } ds_global_oncc_t;
 
+/* MOVE FORK / 2026-05-19: per-DS-knob live ADSR. When a `<labeled-knob>`
+ * binds to ENV_ATTACK/DECAY/SUSTAIN/RELEASE, the converter emits both
+ * a static base (the range minimum) and a `ampeg_*_oncc<CC>=<delta>`
+ * binding so xsynth's voice spawner can rebuild the envelope live from
+ * the current CC value. cc_init is the knob's normalized load-time
+ * position; the parser folds `value * cc_init` into the static base so
+ * the load-time effective matches the author's authored knob value. */
+typedef enum {
+    DS_ENV_ATTACK = 0,
+    DS_ENV_DECAY  = 1,
+    DS_ENV_SUSTAIN= 2,
+    DS_ENV_RELEASE= 3,
+} ds_env_kind_t;
+
+typedef struct {
+    ds_env_kind_t kind;
+    int    cc_number;       /* synthetic CC the knob owns */
+    double cc_init_norm;    /* knob's value= normalized 0..1 */
+    double v_at_min;        /* SFZ ampeg_* value at knob_min */
+    double delta;           /* v_at_max - v_at_min */
+} ds_env_oncc_t;
+
 /* MOVE FORK / Phase 4: tag-level AMP_VOLUME binding. Knob drives the
  * volume of every group whose `tags="X"` attribute matches `tag`. The
  * main emit loop resolves these to per-group volume_oncc opcodes by
@@ -394,7 +416,8 @@ static void apply_ui_overrides(const char *src,
                                ds_filter_freq_oncc_t *filter_freq_out, int *filter_freq_count_io,
                                ds_filter_res_oncc_t  *filter_res_out,  int *filter_res_count_io,
                                ds_pan_oncc_t         *pan_oncc_out,    int *pan_oncc_count_io,
-                               ds_curve_t *curves_out, int *curves_count_io) {
+                               ds_curve_t *curves_out, int *curves_count_io,
+                               ds_env_oncc_t *env_oncc_out, int *env_oncc_count_io) {
     int knob_idx = 0;
     const char *p = src;
     while (1) {
@@ -474,14 +497,55 @@ static void apply_ui_overrides(const char *src,
             if (param[0] && compute_binding_value(ctrl_tag, bind_tag,
                                                  effective, sizeof(effective))) {
                 int position = position_str[0] ? atoi(position_str) : 0;
-                if (strcmp(param, "ENV_ATTACK") == 0) {
-                    strncpy(env_attack, effective, 31); env_attack[31] = '\0';
-                } else if (strcmp(param, "ENV_DECAY") == 0) {
-                    strncpy(env_decay, effective, 31); env_decay[31] = '\0';
-                } else if (strcmp(param, "ENV_SUSTAIN") == 0) {
-                    strncpy(env_sustain, effective, 31); env_sustain[31] = '\0';
-                } else if (strcmp(param, "ENV_RELEASE") == 0) {
-                    strncpy(env_release, effective, 31); env_release[31] = '\0';
+                ds_env_kind_t env_kind = -1;
+                if      (strcmp(param, "ENV_ATTACK")  == 0) env_kind = DS_ENV_ATTACK;
+                else if (strcmp(param, "ENV_DECAY")   == 0) env_kind = DS_ENV_DECAY;
+                else if (strcmp(param, "ENV_SUSTAIN") == 0) env_kind = DS_ENV_SUSTAIN;
+                else if (strcmp(param, "ENV_RELEASE") == 0) env_kind = DS_ENV_RELEASE;
+                if ((int)env_kind >= 0) {
+                    /* Common path for all four ENV_* targets. When the knob
+                     * has a CC (the normal case for a UI knob), record a
+                     * live oncc entry — voice spawn rebuilds the envelope
+                     * from base + sum(value * (cc/127 - cc_init)) so the
+                     * knob is fully live, not baked at load.
+                     *
+                     * The static base in env_<param> becomes v_at_min so
+                     * xsynth's parser fold (base += value * cc_init) lands
+                     * at the load-time effective the knob was authored
+                     * with. With no CC (shouldn't happen for a knob), we
+                     * still bake the effective value statically. */
+                    char *dst = (env_kind == DS_ENV_ATTACK)  ? env_attack
+                              : (env_kind == DS_ENV_DECAY)   ? env_decay
+                              : (env_kind == DS_ENV_SUSTAIN) ? env_sustain
+                              :                                 env_release;
+                    if (knob_cc >= 0 && env_oncc_out && env_oncc_count_io
+                            && *env_oncc_count_io < DS_MAX_KNOBS * 4) {
+                        double v_at_min = apply_binding_xform(bind_tag, knob_min,
+                                                              knob_max, knob_min);
+                        double v_at_max = apply_binding_xform(bind_tag, knob_min,
+                                                              knob_max, knob_max);
+                        double delta = v_at_max - v_at_min;
+                        /* Knob's authored value= for cc_init normalization. */
+                        char ckval[64];
+                        xml_get_attr(ctrl_tag, "value", ckval, sizeof(ckval));
+                        double knob_pos = ckval[0] ? atof(ckval)
+                                                   : (knob_min + knob_max) * 0.5;
+                        double cc_init = (knob_max > knob_min)
+                            ? (knob_pos - knob_min) / (knob_max - knob_min)
+                            : 0.5;
+                        if (cc_init < 0.0) cc_init = 0.0;
+                        if (cc_init > 1.0) cc_init = 1.0;
+                        ds_env_oncc_t *e = &env_oncc_out[*env_oncc_count_io];
+                        e->kind         = env_kind;
+                        e->cc_number    = knob_cc;
+                        e->cc_init_norm = cc_init;
+                        e->v_at_min     = v_at_min;
+                        e->delta        = delta;
+                        (*env_oncc_count_io)++;
+                        snprintf(dst, 32, "%.4f", v_at_min);
+                    } else {
+                        strncpy(dst, effective, 31); dst[31] = '\0';
+                    }
                 } else if ((strcmp(param, "AMP_VOLUME") == 0 ||
                             strcmp(param, "TAG_VOLUME") == 0) &&
                            strcmp(level, "instrument") == 0 &&
@@ -1420,6 +1484,9 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
     /* Phase 6: curve tables pre-baked from DS knob translations. */
     ds_curve_t curves[DS_MAX_CURVES];
     int curves_count = 0;
+    /* MOVE FORK / 2026-05-19: live ADSR for DS knobs bound to ENV_*. */
+    ds_env_oncc_t env_oncc[DS_MAX_KNOBS * 4];
+    int env_oncc_count = 0;
     apply_ui_overrides(src, fx, fx_count, env_attack, env_decay,
                        env_sustain, env_release, group_amp_db,
                        use_knobs, knob_count_local,
@@ -1429,7 +1496,8 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
                        filter_freq_oncc, &filter_freq_oncc_count,
                        filter_res_oncc, &filter_res_oncc_count,
                        pan_oncc, &pan_oncc_count,
-                       curves, &curves_count);
+                       curves, &curves_count,
+                       env_oncc, &env_oncc_count);
 
     int rr_total = count_rr_groups(src);
 
@@ -2329,7 +2397,48 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
     }
     if (use_release[0]) {
         pos += snprintf(sfz + pos, out_cap - pos, "ampeg_release=%s\n", use_release);
-    } else {
+    }
+    /* MOVE FORK / 2026-05-19: live ADSR oncc. Emit set_hdcc<N>=<init>
+     * once per unique CC (multiple ENV_* bindings on the same knob
+     * share the CC), then one ampeg_<param>_oncc<N>=<delta> per
+     * binding. xsynth's parser folds delta*cc_init into the static
+     * ampeg_*=v_at_min we already emitted above, so load-time
+     * effective matches what the knob value= authored. Subsequent
+     * knob moves drive the voice envelope live via the per-region
+     * ampeg_*_oncc list. */
+    {
+        int emitted_cc[DS_MAX_KNOBS] = {0};
+        int n_emitted = 0;
+        for (int i = 0; i < env_oncc_count; i++) {
+            int cc = env_oncc[i].cc_number;
+            int already = 0;
+            for (int j = 0; j < n_emitted; j++)
+                if (emitted_cc[j] == cc) { already = 1; break; }
+            if (!already && n_emitted < DS_MAX_KNOBS) {
+                pos += snprintf(sfz + pos, out_cap - pos,
+                                "set_hdcc%d=%.4f\n",
+                                cc, env_oncc[i].cc_init_norm);
+                emitted_cc[n_emitted++] = cc;
+            }
+            const char *base;
+            switch (env_oncc[i].kind) {
+                case DS_ENV_ATTACK:  base = "ampeg_attack";  break;
+                case DS_ENV_DECAY:   base = "ampeg_decay";   break;
+                case DS_ENV_SUSTAIN: base = "ampeg_sustain"; break;
+                case DS_ENV_RELEASE: base = "ampeg_release"; break;
+                default: continue;
+            }
+            /* Sustain delta is in fraction (0..1); xsynth expects
+             * percentage 0..100 for ampeg_sustain. Other ADSR fields
+             * are seconds — pass through unchanged. */
+            double delta = env_oncc[i].delta;
+            if (env_oncc[i].kind == DS_ENV_SUSTAIN) delta *= 100.0;
+            pos += snprintf(sfz + pos, out_cap - pos,
+                            "%s_oncc%d=%.4f\n",
+                            base, cc, delta);
+        }
+    }
+    if (!use_release[0]) {
         /* Same fallback as the sfizz converter — many DS presets omit release
          * but xsynth's default is too short; 0.5 s keeps piano tails alive. */
         pos += snprintf(sfz + pos, out_cap - pos, "ampeg_release=0.5\n");
@@ -2440,7 +2549,12 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
         else if (strcmp(src_type, "lowpass_4pl") == 0) fil_type = "lpf_4p";
         else if (strcmp(src_type, "highpass") == 0) fil_type = "hpf_2p";
         else if (strcmp(src_type, "bandpass") == 0) fil_type = "bpf_2p";
-        else if (strcmp(src_type, "notch") == 0) fil_type = "bpf_2p";
+        /* MOVE FORK / 2026-05-19: notch maps to xsynth's brf_2p (real
+         * band-reject biquad). peak still falls back to bpf_2p since
+         * xsynth has no peaking-EQ filter yet — strictly wrong, but
+         * presets that ask for "peak" usually want SOME boost which a
+         * bpf approximates better than no filter at all. */
+        else if (strcmp(src_type, "notch") == 0) fil_type = "brf_2p";
         else if (strcmp(src_type, "peak") == 0) fil_type = "bpf_2p";
         /* default lpf_2p covers DS "lowpass" */
         const char *cutoff = fx[lp_idx].freq[0]      ? fx[lp_idx].freq      : "22000";
@@ -2627,6 +2741,159 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
          * multi via comma but no installed preset uses it). */
         char group_tag[DS_MAX_TAG_NAME] = "";
         xml_get_attr(tag_buf, "tags", group_tag, sizeof(group_tag));
+
+        /* MOVE FORK / 2026-05-19: DS choke groups
+         * (silencedByTags / tags). DS uses `tags=` for TWO unrelated
+         * things:
+         *   1. Choke routing — pairs with `silencedByTags=`. Typical
+         *      hi-hat pattern: closed + open both `tags="hat"
+         *      silencedByTags="hat"` → mutual choke.
+         *   2. Tag-level knob bindings — `<binding identifier="pad"
+         *      parameter="AMP_VOLUME"/>` routes one knob to every group
+         *      tagged "pad". No choke semantics; tags are just labels.
+         *
+         * Most installed presets (Spring Pads, ASIMOV, etc.) use (2)
+         * only. If we emit `group=`/`off_by=` from `tags=` alone, every
+         * region inherits an exclusive_class and they mutually choke —
+         * the preset goes effectively monophonic. So: only emit choke
+         * opcodes when the dspreset has at least one `silencedByTags=`
+         * somewhere (signals the author actually wants chokes). */
+        static int ds_chokes_enabled = 0;
+        static char ds_choke_map[32][DS_MAX_TAG_NAME];
+        static int  ds_choke_count = 0;
+        /* MOVE FORK / 2026-05-19: which tag names are actually CHOKE
+         * TARGETS — i.e., appear in someone's silencedByTags. A group's
+         * `tags="sustain"` only becomes a SFZ `group=N` if some other
+         * group has `silencedByTags` referencing "sustain". Otherwise
+         * the tag is just a label (volume-binding identifier, etc.).
+         *
+         * Without this filter, sustain regions in libraries like RJS
+         * Classic Electric (asymmetric pattern: sustain
+         * `tags="sustain" silencedByTags="legato"`) collapse to a
+         * single exclusive_class via off_by precedence — they end up
+         * mutually killing each other = mono. */
+        static char ds_choke_targets[32][DS_MAX_TAG_NAME];
+        static int  ds_choke_target_count = 0;
+        if (group_idx == 0) {
+            ds_choke_count = 0;
+            ds_chokes_enabled = (strstr(src, "silencedByTags") != NULL);
+            ds_choke_target_count = 0;
+            if (ds_chokes_enabled) {
+                /* Pre-scan: collect every tag name that appears as a
+                 * choke target in any group's silencedByTags. */
+                const char *scan = src;
+                while ((scan = strstr(scan, "silencedByTags")) != NULL) {
+                    scan = strchr(scan, '"');
+                    if (!scan) break;
+                    scan++;
+                    const char *end_q = strchr(scan, '"');
+                    if (!end_q) break;
+                    /* Split comma list. */
+                    const char *cur = scan;
+                    while (cur < end_q) {
+                        const char *comma = memchr(cur, ',', end_q - cur);
+                        const char *tend = comma ? comma : end_q;
+                        char tag[DS_MAX_TAG_NAME] = "";
+                        int tlen = (int)(tend - cur);
+                        if (tlen > DS_MAX_TAG_NAME - 1) tlen = DS_MAX_TAG_NAME - 1;
+                        memcpy(tag, cur, tlen);
+                        tag[tlen] = '\0';
+                        /* Skip leading whitespace. */
+                        char *t0 = tag;
+                        while (*t0 == ' ' || *t0 == '\t') t0++;
+                        if (*t0) {
+                            int already = 0;
+                            for (int k = 0; k < ds_choke_target_count; k++) {
+                                if (strcmp(ds_choke_targets[k], t0) == 0) {
+                                    already = 1; break;
+                                }
+                            }
+                            if (!already && ds_choke_target_count < 32) {
+                                strncpy(ds_choke_targets[ds_choke_target_count],
+                                        t0, DS_MAX_TAG_NAME - 1);
+                                ds_choke_targets[ds_choke_target_count]
+                                    [DS_MAX_TAG_NAME - 1] = '\0';
+                                ds_choke_target_count++;
+                            }
+                        }
+                        cur = comma ? comma + 1 : end_q;
+                    }
+                    scan = end_q + 1;
+                }
+            }
+        }
+        int ds_choke_group_id = 0;
+        int ds_choke_off_by   = 0;
+        /* Only register this group's `tags=` as a SFZ `group=N` when
+         * the tag is referenced by at least one `silencedByTags=`
+         * somewhere — i.e. it's actually a choke TARGET. Otherwise
+         * the tag is purely a label (volume-binding identifier etc.)
+         * and we must not emit group= or we'll trigger spurious chokes
+         * via xsynth's symmetric exclusive_class. */
+        int tag_is_target = 0;
+        if (ds_chokes_enabled && group_tag[0]) {
+            char first[DS_MAX_TAG_NAME];
+            int ti = 0;
+            for (; group_tag[ti] && group_tag[ti] != ',' && ti < (int)sizeof(first) - 1; ti++)
+                first[ti] = group_tag[ti];
+            first[ti] = '\0';
+            for (int k = 0; k < ds_choke_target_count; k++) {
+                if (strcmp(ds_choke_targets[k], first) == 0) {
+                    tag_is_target = 1; break;
+                }
+            }
+        }
+        if (ds_chokes_enabled && tag_is_target && group_tag[0]) {
+            /* Strip after first comma (single-tag form). */
+            char first_tag[DS_MAX_TAG_NAME];
+            int ti = 0;
+            for (; group_tag[ti] && group_tag[ti] != ',' && ti < (int)sizeof(first_tag) - 1; ti++)
+                first_tag[ti] = group_tag[ti];
+            first_tag[ti] = '\0';
+            if (first_tag[0]) {
+                int found = -1;
+                for (int t = 0; t < ds_choke_count; t++) {
+                    if (strcmp(ds_choke_map[t], first_tag) == 0) { found = t; break; }
+                }
+                if (found < 0 && ds_choke_count < 32) {
+                    strncpy(ds_choke_map[ds_choke_count], first_tag,
+                            DS_MAX_TAG_NAME - 1);
+                    ds_choke_map[ds_choke_count][DS_MAX_TAG_NAME - 1] = '\0';
+                    found = ds_choke_count++;
+                }
+                if (found >= 0) ds_choke_group_id = found + 1;  /* group=0 = none */
+            }
+        }
+        char silenced_by[DS_MAX_TAG_NAME] = "";
+        xml_get_attr(tag_buf, "silencedByTags", silenced_by, sizeof(silenced_by));
+        if (ds_chokes_enabled && silenced_by[0]) {
+            char first_tag[DS_MAX_TAG_NAME];
+            int ti = 0;
+            for (; silenced_by[ti] && silenced_by[ti] != ',' && ti < (int)sizeof(first_tag) - 1; ti++)
+                first_tag[ti] = silenced_by[ti];
+            first_tag[ti] = '\0';
+            if (first_tag[0]) {
+                int found = -1;
+                for (int t = 0; t < ds_choke_count; t++) {
+                    if (strcmp(ds_choke_map[t], first_tag) == 0) { found = t; break; }
+                }
+                if (found < 0 && ds_choke_count < 32) {
+                    strncpy(ds_choke_map[ds_choke_count], first_tag,
+                            DS_MAX_TAG_NAME - 1);
+                    ds_choke_map[ds_choke_count][DS_MAX_TAG_NAME - 1] = '\0';
+                    found = ds_choke_count++;
+                }
+                if (found >= 0) ds_choke_off_by = found + 1;
+            }
+        }
+        if (ds_choke_group_id) {
+            pos += snprintf(sfz + pos, out_cap - pos,
+                            "group=%d\n", ds_choke_group_id);
+        }
+        if (ds_choke_off_by) {
+            pos += snprintf(sfz + pos, out_cap - pos,
+                            "off_by=%d\n", ds_choke_off_by);
+        }
 
         /* Group base static volume (NO oncc-related shifts yet). */
         double base_db = 0.0; int has_base = 0;

@@ -838,10 +838,20 @@ static int resolve_sample_path_ci(const char *base, const char *rel,
     return 1;
 }
 
+/* True for DS seqMode values that map to xsynth's deterministic
+ * seq_length/seq_position rotation. xsynth has no lorand/hirand, so
+ * "random" collapses to deterministic RR — better than firing every
+ * slot in parallel. */
+static int seq_mode_is_rr(const char *mode) {
+    return strcmp(mode, "round_robin") == 0 || strcmp(mode, "random") == 0;
+}
+
 static int count_rr_groups(const char *src) {
     /* MOVE FORK / 2026-05-16: also honor `seqMode="round_robin"` on the
      * `<groups>` parent — each child `<group>` then inherits RR mode and
-     * uses its own seqPosition for slot membership. */
+     * uses its own seqPosition for slot membership.
+     * 2026-05-19: extended to also recognize `seqMode="random"` (see
+     * seq_mode_is_rr). */
     int groups_rr = 0;
     const char *gp = strstr(src, "<groups");
     if (gp) {
@@ -852,7 +862,7 @@ static int count_rr_groups(const char *src) {
             memcpy(gbuf, gp, gl); gbuf[gl] = '\0';
             char gm[32];
             xml_get_attr(gbuf, "seqMode", gm, sizeof(gm));
-            if (strcmp(gm, "round_robin") == 0) groups_rr = 1;
+            if (seq_mode_is_rr(gm)) groups_rr = 1;
         }
     }
     int count = 0;
@@ -868,8 +878,16 @@ static int count_rr_groups(const char *src) {
         char mode[32];
         xml_get_attr(tag, "seqMode", mode, sizeof(mode));
         /* A group counts toward the RR rotation when either it
-         * declares seqMode itself or it inherits one from <groups>. */
-        if (strcmp(mode, "round_robin") == 0 || groups_rr) count++;
+         * declares seqMode itself or it inherits one from <groups>.
+         * Per-group seqPosition is required: presets like Fake Dulcimer
+         * have seqMode on <groups> but put seqPosition on <sample>s
+         * instead — those use the per-sample RR path below, not this
+         * group-level rotation, so don't count them here. */
+        if (seq_mode_is_rr(mode) || groups_rr) {
+            char rrp[16];
+            xml_get_attr(tag, "seqPosition", rrp, sizeof(rrp));
+            if (rrp[0]) count++;
+        }
         p = tag_end + 1;
     }
     return count;
@@ -2249,7 +2267,7 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
                 memcpy(gb, gp, gl); gb[gl] = '\0';
                 char gm[32];
                 xml_get_attr(gb, "seqMode", gm, sizeof(gm));
-                if (strcmp(gm, "round_robin") == 0) groups_is_rr_for_scale = 1;
+                if (seq_mode_is_rr(gm)) groups_is_rr_for_scale = 1;
             }
         }
     }
@@ -2782,10 +2800,11 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
          * (RrState in soundfont/mod.rs). Inherit `seqMode` from the
          * <groups> parent so presets that hoist it (18_round_robin and
          * most real-world DS RR libs) emit per-group seq opcodes
-         * correctly instead of all firing simultaneously. */
+         * correctly instead of all firing simultaneously.
+         * MOVE FORK / 2026-05-19: also treat `seqMode="random"` as
+         * deterministic RR (xsynth has no lorand/hirand). */
         xml_get_attr(tag_buf, "seqMode", val, sizeof(val));
-        int group_is_rr = (strcmp(val, "round_robin") == 0)
-                       || (strcmp(wrap_seqmode, "round_robin") == 0);
+        int group_is_rr = seq_mode_is_rr(val) || seq_mode_is_rr(wrap_seqmode);
         if (group_is_rr && rr_total > 0) {
             char rr_pos[16];
             xml_get_attr(tag_buf, "seqPosition", rr_pos, sizeof(rr_pos));
@@ -2793,6 +2812,38 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
                 pos += snprintf(sfz + pos, out_cap - pos,
                                 "seq_length=%d\nseq_position=%s\n",
                                 rr_total, rr_pos);
+            }
+        }
+
+        /* MOVE FORK / 2026-05-19: per-sample seqPosition rotation.
+         * Pianobook's "Fake Dulcimer" sets seqMode on <groups> and
+         * stamps seqPosition on each <sample> instead of the <group>
+         * (3 velocity-layer takes per note). Without this path every
+         * sample at a given note/velocity fires in parallel — phase-
+         * comb-y and ~3× louder than authored. Compute the max
+         * seqPosition across this group's samples; the per-sample
+         * emit loop below writes seq_length/seq_position per region. */
+        int per_sample_seq_total = 0;
+        if (group_is_rr) {
+            char *scan_ss = tag_end;
+            char *end_ss  = strstr(tag_end, "</group>");
+            while (scan_ss && (!end_ss || scan_ss < end_ss) &&
+                   (scan_ss = strstr(scan_ss, "<sample")) != NULL &&
+                   (!end_ss || scan_ss < end_ss)) {
+                char *se = strchr(scan_ss, '>');
+                if (!se) break;
+                char sb[256];
+                int sblen = (int)(se - scan_ss);
+                if (sblen >= (int)sizeof(sb)) sblen = sizeof(sb) - 1;
+                memcpy(sb, scan_ss, sblen);
+                sb[sblen] = '\0';
+                char sp[16];
+                xml_get_attr(sb, "seqPosition", sp, sizeof(sp));
+                if (sp[0]) {
+                    int v = atoi(sp);
+                    if (v > per_sample_seq_total) per_sample_seq_total = v;
+                }
+                scan_ss = se + 1;
             }
         }
 
@@ -2824,6 +2875,23 @@ char *convert_dspreset_to_xsynth_sfz(const char *path,
             stag[slen] = '\0';
 
             pos += snprintf(sfz + pos, out_cap - pos, "<region>\n");
+
+            /* MOVE FORK / 2026-05-19: per-sample RR slot. When the
+             * <groups> seqMode is round_robin/random AND seqPosition
+             * was stamped on each <sample> (rather than the group),
+             * emit seq_length/seq_position at the region so xsynth
+             * cycles through samples deterministically instead of
+             * firing them all in parallel. See per_sample_seq_total
+             * computation a few dozen lines up. */
+            if (per_sample_seq_total > 1) {
+                char ssp[16];
+                xml_get_attr(stag, "seqPosition", ssp, sizeof(ssp));
+                if (ssp[0]) {
+                    pos += snprintf(sfz + pos, out_cap - pos,
+                                    "seq_length=%d\nseq_position=%s\n",
+                                    per_sample_seq_total, ssp);
+                }
+            }
 
             /* Stash the rootNote for later — we may bump it by an
              * integer-semitone tuning offset since xsynth has no

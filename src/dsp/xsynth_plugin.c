@@ -93,10 +93,12 @@ extern void          xshim_set_phaser_mix(XSynthHandle*, float mix);
 extern void          xshim_set_widener(XSynthHandle*, float width);
 extern uint32_t      xshim_take_noteon_count(XSynthHandle*);
 extern void          xshim_take_render_breakdown(XSynthHandle*, uint32_t *out4);
+extern void          xshim_fine_tune(XSynthHandle*, uint8_t ch, float cents);
 extern uint32_t      xshim_take_underrun_count(XSynthHandle*);
 extern void          xshim_take_underrun_breakdown(XSynthHandle*, uint32_t *out3);
 extern float         xshim_estimated_voice_peak(const XSynthHandle*);
 extern uint32_t      xshim_max_region_stacking(const XSynthHandle*);
+extern uint32_t      xshim_declared_polyphony(const XSynthHandle*);
 extern size_t        xshim_last_error(char *out_buf, size_t out_len);
 extern int           xshim_load_sfz_async(XSynthHandle*, const char *path);
 extern int           xshim_load_status(const XSynthHandle*);
@@ -191,6 +193,27 @@ typedef struct {
     int user_voices_override;      /* set when user has explicitly set "voices"
                                      * via set_param or json_defaults; pins
                                      * the value across preset changes. */
+    /* MOVE FORK / 2026-05-19: global ADSR knob positions, normalized
+     * 0..1. Default 0.5 = unity multiplier (no change from preset's
+     * authored envelope). At every preset load we re-push these via the
+     * existing CC dispatch so the new soundfont's voices start at the
+     * current knob positions. */
+    float adsr_attack;
+    float adsr_decay;
+    float adsr_sustain;
+    float adsr_release;
+    /* MOVE FORK / 2026-05-19: master fine tune in cents, range ±100.
+     * Composes with MIDI pitchbend via xsynth's process_pitch sum so
+     * external pitchbend keeps working. UI exposes as 0..1 mapped to
+     * -100..+100 cents, default 0.5 = 0 cents. */
+    float fine_tune;
+    /* MOVE FORK / 2026-05-19: global filter shaping. cutoff drives the
+     * standard CC74 (channel filter freq); reso drives CC71 (channel
+     * filter Q). Stored normalized 0..1; UI shows -50..+50. The
+     * channel-level filter exists independently of per-region cutoffs
+     * so this works on every preset, even SFZs that don't declare one. */
+    float filter_cutoff;
+    float filter_reso;
     float *render_buf;             /* interleaved L/R/L/R..., 2 * frames */
 } xsynth_instance_t;
 
@@ -749,6 +772,13 @@ static void* v2_create_instance(const char *module_dir, const char *json_default
     inst->user_voices_override = 0; /* flips true on set_param("voices") or
                                      * json_defaults "voices" — that pins
                                      * the value across preset changes. */
+    inst->adsr_attack  = 0.5f;     /* 0.5 maps to CC=64 = unity multiplier */
+    inst->adsr_decay   = 0.5f;
+    inst->adsr_sustain = 0.5f;
+    inst->adsr_release = 0.5f;
+    inst->fine_tune    = 0.5f;     /* 0.5 = 0 cents (unity) */
+    inst->filter_cutoff = 0.5f;    /* 0.5 = CC=64 = open (no extra filter) */
+    inst->filter_reso   = 0.5f;    /* 0.5 = CC=64 = Q at Butterworth */
     inst->spawn_burst = 3;  /* hidden — defaults to 3 NoteOn/block.
                              * Quantized chord bursts spread spawn cost
                              * across blocks; 3 keeps burst-block render
@@ -816,11 +846,26 @@ static void* v2_create_instance(const char *module_dir, const char *json_default
         }
         if (json_get_number(json_defaults, "voices", &f) == 0) {
             int v = (int)f;
-            if (v < 4)   v = 4;
+            if (v < 1)   v = 1;
             if (v > 128) v = 128;
             inst->voices = v;
             inst->user_voices_override = 1;
         }
+        /* MOVE FORK / 2026-05-19: restore saved ADSR knob positions. */
+        if (json_get_number(json_defaults, "attack",  &f) == 0)
+            inst->adsr_attack  = f < 0 ? 0 : (f > 1 ? 1 : f);
+        if (json_get_number(json_defaults, "decay",   &f) == 0)
+            inst->adsr_decay   = f < 0 ? 0 : (f > 1 ? 1 : f);
+        if (json_get_number(json_defaults, "sustain", &f) == 0)
+            inst->adsr_sustain = f < 0 ? 0 : (f > 1 ? 1 : f);
+        if (json_get_number(json_defaults, "release", &f) == 0)
+            inst->adsr_release = f < 0 ? 0 : (f > 1 ? 1 : f);
+        if (json_get_number(json_defaults, "tune", &f) == 0)
+            inst->fine_tune = f < 0 ? 0 : (f > 1 ? 1 : f);
+        if (json_get_number(json_defaults, "cutoff", &f) == 0)
+            inst->filter_cutoff = f < 0 ? 0 : (f > 1 ? 1 : f);
+        if (json_get_number(json_defaults, "reso", &f) == 0)
+            inst->filter_reso = f < 0 ? 0 : (f > 1 ? 1 : f);
     }
 
     /* Polyphony cap applies at the channel level, dropping oldest releasing
@@ -921,7 +966,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         if (inst->gain > 2.0f) inst->gain = 2.0f;
     } else if (strcmp(key, "voices") == 0) {
         int v = atoi(val);
-        if (v < 4)   v = 4;
+        if (v < 1)   v = 1;
         if (v > 128) v = 128;
         inst->voices = v;
         inst->user_voices_override = 1;
@@ -936,6 +981,65 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         if (v > 64) v = 64;
         inst->spawn_burst = v;
         if (inst->synth) xshim_set_spawn_burst_limit(inst->synth, (uint32_t)v);
+    } else if (strcmp(key, "cutoff") == 0 || strcmp(key, "reso") == 0) {
+        /* MOVE FORK / 2026-05-19: global filter shaping via channel CCs.
+         * UI -50..+50 maps to CC 0..127. cutoff → CC74, reso → CC71.
+         * xsynth's channel control updates control_event_data.cutoff /
+         * resonance; apply_channel_effects runs a biquad once per block
+         * on the channel mix. Works on every preset, no per-region
+         * cutoff= required. */
+        float v = (float)atof(val);
+        if (v < -50.0f) v = -50.0f;
+        if (v >  50.0f) v =  50.0f;
+        float t = (v + 50.0f) / 100.0f;
+        uint8_t cc_num;
+        if (strcmp(key, "cutoff") == 0) { cc_num = 74; inst->filter_cutoff = t; }
+        else                            { cc_num = 71; inst->filter_reso   = t; }
+        if (inst->synth) {
+            uint8_t cc_val = (uint8_t)(t * 127.0f + 0.5f);
+            xshim_cc(inst->synth, 0, cc_num, cc_val);
+        }
+    } else if (strcmp(key, "tune") == 0) {
+        /* MOVE FORK / 2026-05-19: master fine tune. UI value is cents
+         * directly (-100..+100, default 0). xsynth composes with MIDI
+         * pitchbend in channel.process_pitch so external pitchbend
+         * keeps working. */
+        float cents = (float)atof(val);
+        if (cents < -100.0f) cents = -100.0f;
+        if (cents >  100.0f) cents =  100.0f;
+        inst->fine_tune = (cents + 100.0f) / 200.0f;  /* keep 0..1 normalized
+                                                         storage so re-push at
+                                                         preset load uses one
+                                                         formula */
+        if (inst->synth) xshim_fine_tune(inst->synth, 0, cents);
+    } else if (strcmp(key, "attack") == 0 || strcmp(key, "decay") == 0 ||
+               strcmp(key, "sustain") == 0 || strcmp(key, "release") == 0) {
+        /* MOVE FORK / 2026-05-19: global ADSR knobs. UI value is
+         * -50..+50 with 0 = no change (preset's authored value).
+         * Internally remapped to 0..1 → MIDI CC 0..127:
+         *   attack  → CC73
+         *   decay   → CC75
+         *   sustain → CC79  (no standard CC for sustain; we claim 79)
+         *   release → CC72
+         * xsynth dispatches these to voice_control_data.envelope.* and
+         * calls propagate_voice_controls → each held voice's
+         * SIMDVoiceEnvelope.modify_envelope rebuilds its EnvelopeParameters.
+         * Result: live ADSR on every preset, SFZ or DS, without
+         * requiring author-defined knobs. CC=64 is the curve's identity
+         * point — value 0 maps there exactly. */
+        float v = (float)atof(val);
+        if (v < -50.0f) v = -50.0f;
+        if (v >  50.0f) v =  50.0f;
+        float t = (v + 50.0f) / 100.0f;
+        uint8_t cc_num;
+        if      (strcmp(key, "attack")  == 0) { cc_num = 73; inst->adsr_attack  = t; }
+        else if (strcmp(key, "decay")   == 0) { cc_num = 75; inst->adsr_decay   = t; }
+        else if (strcmp(key, "sustain") == 0) { cc_num = 79; inst->adsr_sustain = t; }
+        else                                  { cc_num = 72; inst->adsr_release = t; }
+        if (inst->synth) {
+            uint8_t cc_val = (uint8_t)(t * 127.0f + 0.5f);
+            xshim_cc(inst->synth, 0, cc_num, cc_val);
+        }
     } else if (strcmp(key, "funverb") == 0 || strcmp(key, "reverb") == 0) {
         /* Phase 9 prototype: fundsp reverb wet level (0..1). */
         float w = (float)atof(val);
@@ -1052,7 +1156,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         }
         if (json_get_number(val, "voices", &f) == 0) {
             int v = (int)f;
-            if (v < 4)   v = 4;
+            if (v < 1)   v = 1;
             if (v > 128) v = 128;
             inst->voices = v;
             if (inst->synth) xshim_set_polyphony_cap(inst->synth, (uint32_t)v);
@@ -1158,6 +1262,20 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
         return snprintf(buf, buf_len, "%.2f", inst->gain);
     else if (strcmp(key, "voices") == 0)
         return snprintf(buf, buf_len, "%d", inst->voices);
+    else if (strcmp(key, "attack")  == 0)
+        return snprintf(buf, buf_len, "%.1f", inst->adsr_attack  * 100.0f - 50.0f);
+    else if (strcmp(key, "decay")   == 0)
+        return snprintf(buf, buf_len, "%.1f", inst->adsr_decay   * 100.0f - 50.0f);
+    else if (strcmp(key, "sustain") == 0)
+        return snprintf(buf, buf_len, "%.1f", inst->adsr_sustain * 100.0f - 50.0f);
+    else if (strcmp(key, "release") == 0)
+        return snprintf(buf, buf_len, "%.1f", inst->adsr_release * 100.0f - 50.0f);
+    else if (strcmp(key, "tune") == 0)
+        return snprintf(buf, buf_len, "%.1f", inst->fine_tune * 200.0f - 100.0f);
+    else if (strcmp(key, "cutoff") == 0)
+        return snprintf(buf, buf_len, "%.1f", inst->filter_cutoff * 100.0f - 50.0f);
+    else if (strcmp(key, "reso") == 0)
+        return snprintf(buf, buf_len, "%.1f", inst->filter_reso   * 100.0f - 50.0f);
     else if (strcmp(key, "knob_preset") == 0)
         return snprintf(buf, buf_len, "%d", inst->current_tab);
     else if (strcmp(key, "funverb") == 0 || strcmp(key, "reverb") == 0)
@@ -1207,7 +1325,21 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
              "{\"key\":\"gain\",\"name\":\"Gain\","
              "\"type\":\"float\",\"min\":0,\"max\":2,\"default\":0.7,\"step\":0.02},"
              "{\"key\":\"voices\",\"name\":\"Polyphony\","
-             "\"type\":\"int\",\"min\":4,\"max\":128,\"default\":14},"
+             "\"type\":\"int\",\"min\":1,\"max\":128,\"default\":14},"
+             "{\"key\":\"attack\",\"name\":\"Atk +/-\","
+             "\"type\":\"float\",\"min\":-50,\"max\":50,\"default\":0,\"step\":1},"
+             "{\"key\":\"decay\",\"name\":\"Dec +/-\","
+             "\"type\":\"float\",\"min\":-50,\"max\":50,\"default\":0,\"step\":1},"
+             "{\"key\":\"sustain\",\"name\":\"Sus +/-\","
+             "\"type\":\"float\",\"min\":-50,\"max\":50,\"default\":0,\"step\":1},"
+             "{\"key\":\"release\",\"name\":\"Rel +/-\","
+             "\"type\":\"float\",\"min\":-50,\"max\":50,\"default\":0,\"step\":1},"
+             "{\"key\":\"tune\",\"name\":\"Tune +/-\","
+             "\"type\":\"float\",\"min\":-100,\"max\":100,\"default\":0,\"step\":1,\"unit\":\"\\u00a2\"},"
+             "{\"key\":\"cutoff\",\"name\":\"Cutoff +/-\","
+             "\"type\":\"float\",\"min\":-50,\"max\":50,\"default\":0,\"step\":1},"
+             "{\"key\":\"reso\",\"name\":\"Reso +/-\","
+             "\"type\":\"float\",\"min\":-50,\"max\":50,\"default\":0,\"step\":1},"
              "{\"key\":\"knob_preset\",\"name\":\"Knob Preset\","
              "\"type\":\"int\",\"min\":0,\"max\":%d,\"default\":0}",
              tab_max);
@@ -1390,6 +1522,13 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
                 "{\"key\":\"octave_transpose\",\"label\":\"Octave\"},"
                 "{\"key\":\"gain\",\"label\":\"Gain\"},"
                 "{\"key\":\"voices\",\"label\":\"Polyphony\"},"
+                "{\"key\":\"attack\",\"label\":\"Atk +/-\"},"
+                "{\"key\":\"decay\",\"label\":\"Dec +/-\"},"
+                "{\"key\":\"sustain\",\"label\":\"Sus +/-\"},"
+                "{\"key\":\"release\",\"label\":\"Rel +/-\"},"
+                "{\"key\":\"tune\",\"label\":\"Tune +/-\"},"
+                "{\"key\":\"cutoff\",\"label\":\"Cutoff +/-\"},"
+                "{\"key\":\"reso\",\"label\":\"Reso +/-\"},"
                 "{\"key\":\"knob_preset\",\"label\":\"Knob Preset\"}");
         /* The host caches ui_hierarchy at module-load and never
          * re-queries it across preset switches, while chain_params
@@ -1482,23 +1621,58 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr, int fra
          *   8-layer pad:                 stacking=8 → cap=8
          *   16-mic EAP:                  stacking=~7 → cap=8-10 */
         if (!inst->user_voices_override) {
-            const int VOICE_TARGET = 60;   /* sustained-load ceiling */
-            const int POLY_FLOOR   = 4;
-            const int POLY_CEIL    = 14;
-            uint32_t stacking = xshim_max_region_stacking(inst->synth);
-            if (stacking < 1) stacking = 1;
-            int recommended = VOICE_TARGET / (int)stacking;
-            if (recommended < POLY_FLOOR) recommended = POLY_FLOOR;
-            if (recommended > POLY_CEIL)  recommended = POLY_CEIL;
-            if (recommended != inst->voices) {
-                inst->voices = recommended;
-                xshim_set_polyphony_cap(inst->synth, (uint32_t)inst->voices);
+            /* MOVE FORK / 2026-05-19: if the SFZ author explicitly
+             * declared `polyphony=N` in the file, honor it as the cap
+             * (community report: monophonic SFZs ignored after the
+             * heuristic landed). Author intent overrides the auto-
+             * sizing — they know what their preset needs. */
+            uint32_t declared = xshim_declared_polyphony(inst->synth);
+            if (declared > 0) {
+                int cap = (int)declared;
+                if (cap < 1)   cap = 1;
+                if (cap > 128) cap = 128;
+                if (cap != inst->voices) {
+                    inst->voices = cap;
+                    xshim_set_polyphony_cap(inst->synth, (uint32_t)inst->voices);
+                }
+                char msg[160];
+                snprintf(msg, sizeof(msg),
+                         "polyphony: SFZ-declared polyphony=%u honored", declared);
+                plugin_log(msg);
+            } else {
+                const int VOICE_TARGET = 60;   /* sustained-load ceiling */
+                const int POLY_FLOOR   = 1;
+                const int POLY_CEIL    = 14;
+                uint32_t stacking = xshim_max_region_stacking(inst->synth);
+                if (stacking < 1) stacking = 1;
+                int recommended = VOICE_TARGET / (int)stacking;
+                if (recommended < POLY_FLOOR) recommended = POLY_FLOOR;
+                if (recommended > POLY_CEIL)  recommended = POLY_CEIL;
+                if (recommended != inst->voices) {
+                    inst->voices = recommended;
+                    xshim_set_polyphony_cap(inst->synth, (uint32_t)inst->voices);
+                }
+                char msg[160];
+                snprintf(msg, sizeof(msg),
+                         "polyphony auto: stacking=%u target=%d -> voices=%d",
+                         stacking, VOICE_TARGET, inst->voices);
+                plugin_log(msg);
             }
-            char msg[160];
-            snprintf(msg, sizeof(msg),
-                     "polyphony auto: stacking=%u target=%d -> voices=%d",
-                     stacking, VOICE_TARGET, inst->voices);
-            plugin_log(msg);
+        }
+        /* MOVE FORK / 2026-05-19: re-push the current ADSR knob CCs
+         * after the new soundfont applies. New voices spawned on this
+         * preset should reflect the user's current knob positions, not
+         * fall back to the engine's CC=0 default (= 0 ms attack & near-
+         * zero release). Channel CC dispatch routes 73/75/79/72 into
+         * voice_control_data.envelope.*. */
+        if (inst->synth) {
+            xshim_cc(inst->synth, 0, 73, (uint8_t)(inst->adsr_attack  * 127.0f + 0.5f));
+            xshim_cc(inst->synth, 0, 75, (uint8_t)(inst->adsr_decay   * 127.0f + 0.5f));
+            xshim_cc(inst->synth, 0, 79, (uint8_t)(inst->adsr_sustain * 127.0f + 0.5f));
+            xshim_cc(inst->synth, 0, 72, (uint8_t)(inst->adsr_release * 127.0f + 0.5f));
+            xshim_fine_tune(inst->synth, 0, (inst->fine_tune - 0.5f) * 200.0f);
+            xshim_cc(inst->synth, 0, 74, (uint8_t)(inst->filter_cutoff * 127.0f + 0.5f));
+            xshim_cc(inst->synth, 0, 71, (uint8_t)(inst->filter_reso   * 127.0f + 0.5f));
         }
         /* MOVE FORK / 2026-05-17: per-preset auto-gain. Compute an
          * attenuation factor from the soundfont's estimated worst-case

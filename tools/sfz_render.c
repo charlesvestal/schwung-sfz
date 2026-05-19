@@ -32,6 +32,7 @@ extern void          xshim_note_on(XSynthHandle*, uint8_t ch, uint8_t key, uint8
 extern void          xshim_note_off(XSynthHandle*, uint8_t ch, uint8_t key);
 extern void          xshim_cc(XSynthHandle*, uint8_t ch, uint8_t cc, uint8_t val);
 extern void          xshim_render(XSynthHandle*, float *out, size_t num_samples);
+extern float         xshim_estimated_voice_peak(const XSynthHandle*);
 extern size_t        xshim_last_error(char *out, size_t len);
 extern void          xshim_set_polyphony_cap(XSynthHandle*, uint32_t cap);
 extern uint64_t      xshim_voice_count(const XSynthHandle*);
@@ -227,6 +228,25 @@ int main(int argc, char **argv) {
     float  buf_f[BLOCK_FRAMES * 2];
     int16_t buf_i[BLOCK_FRAMES * 2];
     uint32_t rendered = 0;
+    /* MOVE FORK / 2026-05-17: mirror the on-device plugin's per-preset
+     * auto-gain. xsynth_plugin.c computes:
+     *   preset_attenuation = clamp(0.7 / (gain * 2 * voice_peak), 0.05..1.0)
+     * with gain=0.7 (default). The render multiplier is `gain *
+     * preset_attenuation`. Without this, sfz_render misses gain
+     * regressions that affect hot DS presets (Mickleburgh, Sol's). */
+    float voice_peak = xshim_estimated_voice_peak(synth);
+    float gain = 0.7f;
+    float preset_attenuation = 1.0f;
+    if (voice_peak > 0.5f && gain > 0.0f) {
+        preset_attenuation = 0.7f / (gain * 2.0f * voice_peak);
+        if (preset_attenuation > 1.0f) preset_attenuation = 1.0f;
+        if (preset_attenuation < 1e-4f) preset_attenuation = 1e-4f;
+    }
+    float render_scale = gain * preset_attenuation;
+    fprintf(stderr,
+        "[sfz_render] voice_peak=%.3f preset_attenuation=%.3f scale=%.3f\n",
+        voice_peak, preset_attenuation, render_scale);
+
     int note_released = 0;
     while (rendered < total_frames) {
         if (!note_released && rendered >= note_frames) {
@@ -236,13 +256,7 @@ int main(int argc, char **argv) {
         uint32_t want = total_frames - rendered;
         if (want > BLOCK_FRAMES) want = BLOCK_FRAMES;
         xshim_render(synth, buf_f, BLOCK_FRAMES * 2);
-        /* MOVE FORK / 2026-05-16: mirror the on-device plugin's
-         * `gain` default (xsynth_plugin.c sets inst->gain = 0.7 at
-         * preset load) so parity captures align with what the user
-         * actually hears on Move. Without this scale, sfz_render is
-         * +3 dB hotter than the plugin, biasing every gain Δ in the
-         * parity suite and masking velocity-curve mismatches. */
-        for (uint32_t i = 0; i < want * 2; i++) buf_i[i] = to_i16(buf_f[i] * 0.7f);
+        for (uint32_t i = 0; i < want * 2; i++) buf_i[i] = to_i16(buf_f[i] * render_scale);
         fwrite(buf_i, 2, want * 2, wf);
         rendered += want;
     }

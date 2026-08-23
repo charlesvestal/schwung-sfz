@@ -1159,6 +1159,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             if (v < 1)   v = 1;
             if (v > 128) v = 128;
             inst->voices = v;
+            inst->user_voices_override = 1;
             if (inst->synth) xshim_set_polyphony_cap(inst->synth, (uint32_t)v);
         }
         if (json_get_number(val, "spawn_burst", &f) == 0) {
@@ -1476,14 +1477,27 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
     else if (strcmp(key, "state") == 0) {
         /* Knob positions saved as normalized 0..1 fractions so they
          * restore cleanly even if a future build changes a knob's
-         * underlying DS range. */
+         * underlying DS range.
+         *
+         * `voices` is only written when the user has explicitly pinned it
+         * (user_voices_override). Otherwise the per-preset auto-heuristic
+         * (see XSHIM_LOAD_READY in render_block) owns the value, and it
+         * must stay free to recompute on every load — a preset with heavy
+         * layer stacking legitimately gets a low cap, and if we always
+         * serialized inst->voices, THAT computed value would round-trip
+         * back in as if the user had chosen it, permanently pinning the
+         * heuristic off at whatever it last floored to. */
         int written = snprintf(buf, buf_len,
             "{\"preset_name\":\"%s\",\"instrument_name\":\"%s\","
             "\"preset\":%d,\"octave_transpose\":%d,\"gain\":%.2f,"
-            "\"voices\":%d,\"spawn_burst\":%d",
+            "\"spawn_burst\":%d",
             inst->preset_name, inst->instrument_name,
             inst->current_preset, inst->octave_transpose, inst->gain,
-            inst->voices, inst->spawn_burst);
+            inst->spawn_burst);
+        if (inst->user_voices_override) {
+            written += snprintf(buf + written, buf_len - written,
+                                ",\"voices\":%d", inst->voices);
+        }
         for (int i = 0; i < inst->knob_count && written < buf_len - 32; i++) {
             ds_knob_t *k = &inst->knobs[i];
             double t = (k->max_value != k->min_value)

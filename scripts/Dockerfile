@@ -17,13 +17,23 @@ ENV CROSS_PREFIX=aarch64-linux-gnu-
 
 # Rust toolchain for the xsynth shim crate (matches xsynth's rust-toolchain
 # pin = nightly). Adds aarch64-unknown-linux-gnu target for cross-compilation.
+#
+# Pinned to a DATED nightly, not the floating "nightly" channel: the vendored
+# Cargo.lock (fundsp 0.21.0, last touched 2026-05-18) stopped compiling under
+# a later nightly's trait resolution for `An<X>: Mul<...>` in fundsp's
+# combinator/net impls — the crate never changed, the compiler did. A fresh
+# image build with a floating channel silently picks up whatever nightly is
+# current that day, so this can break again with no local change to point
+# at. Bump this pin deliberately (with a Cargo.lock update) if it needs to
+# move, rather than letting it float.
+ENV RUST_NIGHTLY_DATE=2026-05-18
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --default-toolchain nightly --profile minimal \
+        | sh -s -- -y --default-toolchain "nightly-${RUST_NIGHTLY_DATE}" --profile minimal \
                    --target aarch64-unknown-linux-gnu \
-    && rustup component add rust-src --toolchain nightly \
+    && rustup component add rust-src --toolchain "nightly-${RUST_NIGHTLY_DATE}" \
     && chmod -R a+w /usr/local/rustup /usr/local/cargo
 
 # Cargo cross-compile config: use aarch64-linux-gnu-gcc as the linker for the

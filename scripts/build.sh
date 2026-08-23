@@ -47,7 +47,10 @@ if [ ! -f "$SHIM_DIR/Cargo.toml" ]; then
     echo "Error: xsynth_shim crate missing. Did you run 'git submodule update --init'?"
     exit 1
 fi
-( cd "$SHIM_DIR" && cargo +nightly build --release --target aarch64-unknown-linux-gnu )
+# Pinned nightly date — see scripts/Dockerfile for why this isn't the
+# floating "nightly" channel.
+RUST_NIGHTLY_DATE="${RUST_NIGHTLY_DATE:-2026-05-18}"
+( cd "$SHIM_DIR" && cargo "+nightly-${RUST_NIGHTLY_DATE}" build --release --target aarch64-unknown-linux-gnu )
 XSHIM_A="$SHIM_DIR/target/aarch64-unknown-linux-gnu/release/libxsynth_shim.a"
 if [ ! -f "$XSHIM_A" ]; then
     echo "Error: shim staticlib missing at $XSHIM_A"

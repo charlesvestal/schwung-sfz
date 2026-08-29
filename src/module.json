@@ -64,6 +64,7 @@
             },
             {
               "key": "knob_preset",
+              "short_name": "Preset",
               "label": "Knob Preset",
               "type": "int",
               "min": 0,

@@ -66,7 +66,10 @@ fn set_last_error<S: Into<String>>(msg: S) {
 
 use xsynth_core::{
     AudioPipe, AudioStreamParams, ChannelCount,
-    channel::{ChannelAudioEvent, ChannelEvent, ChannelConfigEvent, ChannelInitOptions, ControlEvent, SoundfontDropSink},
+    channel::{
+        build_spawner_matrix, ChannelAudioEvent, ChannelEvent, ChannelConfigEvent, ChannelInitOptions,
+        ControlEvent, MatrixDropSink, PrebuiltMatrix, ProgramDescriptor, SoundfontDropSink,
+    },
     channel_group::{
         ChannelGroup, ChannelGroupConfig, ParallelismOptions, SynthEvent, SynthFormat,
         ThreadCount,
@@ -84,13 +87,30 @@ struct LoadWorker {
     handle: Option<thread::JoinHandle<()>>,
     status: Arc<AtomicU32>,
     cancel: Arc<AtomicBool>,
-    result: Arc<Mutex<Option<SampleSoundfont>>>,
+    result: Arc<Mutex<Option<LoadedSf>>>,
+}
+
+/// MOVE FORK / 2026-10-03: everything `xshim_load_apply` needs, prepared on
+/// the load worker so the apply -- which runs in render, on the audio thread
+/// -- is a handful of stores and one event. Before, the apply wrapped the
+/// soundfont, walked the 128 x 128 spawner matrix (`SetSoundfonts` ->
+/// `rebuild_matrix`) and joined the worker, all inside one render block:
+/// ~41 ms measured on a Move for a 57 MB SFZ.
+struct LoadedSf {
+    sf: Arc<dyn SoundfontBase>,
+    prebuilt: PrebuiltMatrix,
+    peak: f32,
+    stacking: u32,
+    polyphony: u32,
 }
 
 pub struct XSynthHandle {
     group: ChannelGroup,
     worker: Option<LoadWorker>,
     drop_sink: SoundfontDropSink,
+    /// Spawner matrices a prebuilt install replaced; freed by the next load
+    /// worker (or with the handle), never on the audio thread.
+    matrix_retired: MatrixDropSink,
     /// MOVE: NoteOns since the last `xshim_take_noteon_count` call. Used by
     /// the plugin's render-perf log to separate spawn-heavy blocks (chord
     /// burst from a sequence) from sustain-heavy blocks (lots of voices
@@ -180,6 +200,7 @@ pub unsafe extern "C" fn xshim_create(sample_rate: u32, channels: u32) -> *mut X
             group,
             worker: None,
             drop_sink,
+            matrix_retired: Arc::new(Mutex::new(Vec::new())),
             noteon_count: AtomicU32::new(0),
             estimated_voice_peak: AtomicU32::new(0),
             max_region_stacking: AtomicU32::new(1),
@@ -534,16 +555,26 @@ pub unsafe extern "C" fn xshim_load_sfz_async(handle: *mut XSynthHandle, path: *
 
     let status = Arc::new(AtomicU32::new(STATUS_LOADING));
     let cancel = Arc::new(AtomicBool::new(false));
-    let result: Arc<Mutex<Option<SampleSoundfont>>> = Arc::new(Mutex::new(None));
+    let result: Arc<Mutex<Option<LoadedSf>>> = Arc::new(Mutex::new(None));
 
     let status_t = status.clone();
     let cancel_t = cancel.clone();
     let result_t = result.clone();
     let drop_sink_t = h.drop_sink.clone();
+    let retired_t = h.matrix_retired.clone();
 
     let join_handle = thread::Builder::new()
         .name("xshim-load".into())
         .spawn(move || {
+            // Free spawner matrices a previous install retired (off the
+            // audio thread, which is the point of retiring them).
+            {
+                let old_m = match retired_t.lock() {
+                    Ok(mut q) => std::mem::take(&mut *q),
+                    Err(_) => Vec::new(),
+                };
+                drop(old_m);
+            }
             // Drop any pending old soundfont(s) FIRST so we don't have OLD +
             // NEW resident at the same time.
             let t_drain = std::time::Instant::now();
@@ -607,7 +638,21 @@ pub unsafe extern "C" fn xshim_load_sfz_async(handle: *mut XSynthHandle, path: *
             }));
             match load_res {
                 Ok(Ok(sf)) => {
-                    *result_t.lock().unwrap() = Some(sf);
+                    // Read what the concrete type knows before it is wrapped
+                    // in the trait Arc (the trait does not expose these).
+                    let peak = sf.estimated_voice_peak();
+                    let stacking = sf.max_region_stacking();
+                    let polyphony = sf.declared_polyphony();
+                    let arc: Arc<dyn SoundfontBase> = Arc::new(sf);
+                    // Build the spawner matrix HERE, for the program the
+                    // channel has (this player never changes it); the apply
+                    // swaps it in, and falls back to an in-place rebuild only
+                    // if the program differs.
+                    let program = ProgramDescriptor::default();
+                    let matrix = build_spawner_matrix(std::slice::from_ref(&arc), program);
+                    let prebuilt = PrebuiltMatrix::new(matrix, program, retired_t.clone());
+                    *result_t.lock().unwrap() =
+                        Some(LoadedSf { sf: arc, prebuilt, peak, stacking, polyphony });
                     status_t.store(STATUS_READY, Ordering::Release);
                 }
                 Ok(Err(e)) => {
@@ -665,23 +710,31 @@ pub unsafe extern "C" fn xshim_load_apply(handle: *mut XSynthHandle) -> c_int {
     let h = &mut *handle;
     let Some(w) = h.worker.as_mut() else { return -1; };
     if w.status.load(Ordering::Acquire) != STATUS_READY { return -1; }
-    let sf_opt = w.result.lock().unwrap().take();
-    let Some(sf) = sf_opt else { return -1; };
-    // MOVE FORK / 2026-05-17: capture per-preset peak for auto-gain
-    // before the soundfont gets wrapped in the trait Arc (the trait
-    // doesn't expose estimated_voice_peak).
-    let peak = sf.estimated_voice_peak();
-    h.estimated_voice_peak.store(peak.to_bits(), Ordering::Release);
-    h.max_region_stacking.store(sf.max_region_stacking(), Ordering::Release);
-    h.declared_polyphony.store(sf.declared_polyphony(), Ordering::Release);
-    let arc: Arc<dyn SoundfontBase> = Arc::new(sf);
+    let loaded = match w.result.try_lock() {
+        Ok(mut g) => g.take(),
+        Err(_) => return -1,           // the worker is still storing it: next block
+    };
+    let Some(loaded) = loaded else { return -1; };
+    // MOVE FORK / 2026-05-17: per-preset peak for auto-gain (read by the
+    // worker, before the soundfont was wrapped in the trait Arc).
+    h.estimated_voice_peak.store(loaded.peak.to_bits(), Ordering::Release);
+    h.max_region_stacking.store(loaded.stacking, Ordering::Release);
+    h.declared_polyphony.store(loaded.polyphony, Ordering::Release);
     // MOVE FORK: channel 0 only — broadcast forces rebuild_matrix on
     // all 16 idle channels which spikes audio thread to ~94 ms.
+    // MOVE FORK / 2026-10-03: with the matrix PREBUILT by the worker, so
+    // this is a swap rather than a rebuild.
     h.group.send_event(SynthEvent::Channel(
         0,
-        ChannelEvent::Config(ChannelConfigEvent::SetSoundfonts(vec![arc])),
+        ChannelEvent::Config(ChannelConfigEvent::SetSoundfontsPrebuilt(
+            vec![loaded.sf],
+            loaded.prebuilt,
+        )),
     ));
-    if let Some(jh) = w.handle.take() { let _ = jh.join(); }
+    // DETACH, never join, on this thread: the worker has published its
+    // result and is only returning. `join` here was a wait on the audio
+    // thread for another thread to finish.
+    drop(w.handle.take());
     h.worker = None;
     0
 }

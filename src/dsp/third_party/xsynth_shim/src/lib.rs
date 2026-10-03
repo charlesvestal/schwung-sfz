@@ -69,6 +69,7 @@ use xsynth_core::{
     channel::{ChannelAudioEvent, ChannelEvent, ChannelConfigEvent, ChannelInitOptions, ControlEvent, SoundfontDropSink},
     channel_group::{
         ChannelGroup, ChannelGroupConfig, ParallelismOptions, SynthEvent, SynthFormat,
+        ThreadCount,
     },
     soundfont::{Interpolator, SampleSoundfont, SoundfontBase, SoundfontInitOptions},
 };
@@ -157,7 +158,20 @@ pub unsafe extern "C" fn xshim_create(sample_rate: u32, channels: u32) -> *mut X
             // idle-probe cost ~16x.
             format: SynthFormat::Custom { channels: 1 },
             audio_params: AudioStreamParams::new(sample_rate, cc),
-            parallelism: ParallelismOptions::AUTO_PER_CHANNEL,
+            // NO THREAD POOL. With one channel, AUTO_PER_CHANNEL dispatched
+            // the whole render onto a single rayon worker and made the
+            // caller -- the SPI audio callback -- block until it finished:
+            // no parallelism, just a hand-off. And that worker was created
+            // in create_instance, so it inherited whatever thread built the
+            // module: SCHED_FIFO 70 on a host that loads on the callback,
+            // SCHED_OTHER on one that loads on a background thread
+            // (Schwung's slot loader), where it would underrun under load
+            // while the callback waited on it. Rendering inline costs the
+            // same CPU minus the dispatch, at the callback's own priority.
+            parallelism: ParallelismOptions {
+                channel: ThreadCount::None,
+                key: ThreadCount::None,
+            },
         };
         let mut group = ChannelGroup::new(cfg);
         let drop_sink: SoundfontDropSink = Arc::new(Mutex::new(Vec::new()));
